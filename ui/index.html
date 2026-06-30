@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DigiTracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800&family=Inter:wght@400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Barra de título (frameless / arrastável) -->
+    <div class="titlebar pywebview-drag-region">
+      <span class="dot"></span>
+      <span class="brand">DIGI<span>TRACKER</span></span>
+      <span class="spacer"></span>
+      <span class="sync-tag" id="sync-tag"></span>
+      <div class="win-btns">
+        <button class="win-btn pin" id="btn-pin" title="Sempre por cima">📌</button>
+        <button class="win-btn" id="btn-min" title="Minimizar">—</button>
+        <button class="win-btn close" id="btn-close" title="Fechar">✕</button>
+      </div>
+    </div>
+
+    <div id="demo-banner" class="demo-banner hidden">MODO DEMONSTRAÇÃO — dados fictícios. Configure suas credenciais para usar dados reais.</div>
+
+    <!-- Conteúdo trocado por JS -->
+    <div class="body" id="root"></div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

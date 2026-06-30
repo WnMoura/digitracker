@@ -1,0 +1,21 @@
+# Segredos do usuário (username + Web API Key)
+config/secrets.json
+
+# Cache local
+config/cache/
+assets/badges/
+
+# Jogos criados pelo usuário em runtime (mantém só os de exemplo versionados, se houver)
+# Descomente se quiser ignorar jogos locais:
+# config/games/*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
