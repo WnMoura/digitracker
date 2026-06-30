@@ -15,7 +15,6 @@ __pycache__/
 .venv/
 venv/
 
-# PyInstaller
+# PyInstaller (digitracker.spec é versionado de propósito)
 build/
 dist/
-*.spec
