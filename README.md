@@ -23,6 +23,7 @@ editar código.
 digitracker/
 ├── engine.py            # janela, js_api, sync 30s, cálculo de progresso
 ├── ra_api.py            # cliente da API da RetroAchievements
+├── guide_parser.py      # parsing do PDF do guia (ordem, modos, dicas)
 ├── requirements.txt
 ├── config/
 │   ├── secrets.json     # username + Web API Key (gitignored)
@@ -58,15 +59,49 @@ para visualizar a interface com dados fictícios, sem credenciais.
 ## Adicionar um jogo (wizard de 2 passos)
 
 1. **Buscar** — digite o nome; o app consulta a RetroAchievements, baixa a
-   lista completa de conquistas e cacheia os ícones. (A API não tem busca por
+   lista completa de conquistas, cacheia os ícones das conquistas e o **ícone
+   do jogo** (mostrado na lateral e no cabeçalho). (A API não tem busca por
    nome, então na primeira vez o app monta um índice local dos jogos com
    conquistas — pode levar ~1 min.)
-2. **Organizar walkthrough** — crie etapas e mova cada conquista para a etapa
-   certa na ordem do seu guia, marcando o modo (**N**ormal / **H**ard) de cada
-   uma. "Salvar" grava `config/games/{slug}.json`.
+2. **Organizar walkthrough** — o passo 2 **já abre pré-ordenado pela ordem
+   nativa do RetroAchievements** (campo `DisplayOrder`, que já é uma ordem
+   lógica/curatorial), com o modo **Normal/Hard** inferido da descrição de cada
+   conquista. Ou seja: **basta clicar em "Salvar"** — sem arrastar nada. Se
+   quiser, ainda dá para arrastar para reordenar e trocar os modos (N/H) à mão.
+   "Salvar" grava `config/games/{slug}.json`.
 
-A curadoria da ordem é **manual/curatorial** por design — não há parsing
-automático de PDF.
+   Como **alternativa**, há o botão **"📄 Ordenar pelo PDF do guia"**: escolha o PDF
+   do walkthrough e o app faz o **parsing estruturado** do guia
+   ([`guide_parser.py`](guide_parser.py)) e automaticamente:
+   - **ordena as conquistas** na ordem da seção de conquistas do guia;
+   - **sugere o modo (Normal/Hard)** de cada uma a partir das subseções
+     (ex.: "Modo Normal" / "Modo Hard" / "Super Hard") e de sufixos no nome
+     (ex.: `(Normal)`, `(Hard)`, `(VH)`);
+   - **captura as dicas e tutoriais** do PDF (mecânicas, chefes, side quests,
+     grinding…) para a aba **Dicas & Tutoriais** (ver abaixo).
+
+   O casamento conquista↔guia é tolerante: nome exato → sem sufixo de
+   dificuldade → similaridade (fuzzy) → com os **pontos** como desempate. Ao
+   aplicar o PDF, as conquistas reconhecidas vão para o topo na ordem do guia e
+   **as demais continuam logo abaixo na ordem do RA — nada é perdido**. A
+   leitura usa `pypdf` (só PDFs com texto; digitalizados/imagem não têm).
+
+   > Atenção: alguns guias usam nomes **aproximados/traduzidos** das conquistas,
+   > que podem não bater com os títulos oficiais do RA. Por isso o **padrão é a
+   > ordem nativa do RetroAchievements**; o PDF é um ajuste opcional (e a maior
+   > utilidade dele costuma ser a aba **Dicas & Tutoriais**).
+
+A ordem final continua **curatorial**: você pode revisar, reordenar e ajustar
+os modos como quiser.
+
+## Dicas & Tutoriais
+
+Cada jogo tem duas abas no painel: **Walkthrough** (a ordem das conquistas) e
+**Dicas & Tutoriais**. A segunda mostra o conteúdo de guia extraído do PDF —
+mecânicas básicas, escolha de personagem, estratégias de chefe, side quests,
+evoluções, itens e dicas avançadas — formatado em seções, passos, notas e
+cartões de chefe. É só preencher uma vez (ao usar "Ordenar pelo PDF"); o guia
+fica salvo junto do jogo em `config/games/{slug}.json`.
 
 ## Sincronização
 

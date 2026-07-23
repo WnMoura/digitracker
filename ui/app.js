@@ -13,7 +13,9 @@ const S = {
   view: "loading",
   library: [],
   activeSlug: null,
+  tab: "walk",           // aba do painel: 'walk' | 'tips'
   onTop: true,
+  compact: false,        // modo mini-overlay (progresso de conquistas)
   poll: null,
   W: null,               // estado do wizard
 };
@@ -54,6 +56,18 @@ const backend = {
   async saveGame(p) {
     if (S.mode === "demo") return { ok: true, slug: null, demo: true };
     return window.pywebview.api.save_game(p);
+  },
+  async orderByPdfData(b64, name) {
+    if (S.mode === "demo") return { ok: false, demo: true };
+    return window.pywebview.api.order_by_pdf_data(b64, name);
+  },
+  async extractGuidePdf(b64, name) {
+    if (S.mode === "demo") return { ok: false, demo: true };
+    return window.pywebview.api.extract_guide_pdf(b64, name);
+  },
+  async attachGuidePdf(slug, b64, name) {
+    if (S.mode === "demo") return { ok: false, demo: true };
+    return window.pywebview.api.attach_guide_pdf(slug, b64, name);
   },
 };
 
@@ -177,9 +191,75 @@ function stopPolling() { if (S.poll) { clearInterval(S.poll); S.poll = null; } }
 
 async function renderDashboard() {
   const game = S.activeSlug ? await backend.game(S.activeSlug) : null;
-  root.innerHTML = `${sidebarHTML()}${mainHTML(game)}`;
-  bindSidebar();
+  document.getElementById("app").classList.toggle("compact", S.compact);
+  if (S.compact) {
+    root.innerHTML = compactHTML(game);
+    bindCompact();
+  } else {
+    root.innerHTML = `${sidebarHTML()}${mainHTML(game)}`;
+    bindSidebar();
+  }
   $("#sync-tag").textContent = S.mode === "demo" ? "DEMO" : "● SYNC 30s";
+}
+
+/* ========================= MODO COMPACTO (OVERLAY) ======================= */
+/* Mini-quadro tipo o popup de conquistas do RetroArch: progresso do jogo
+   ativo, última conquista obtida e a próxima a ser destravada. */
+function compactHTML(game) {
+  if (!game) {
+    return `<div class="cw-empty">Nenhum jogo selecionado.<br>Volte ao modo completo para adicionar um.</div>`;
+  }
+  const { t, e, pct } = totals(game.modes);
+  const le = game.last_earned;
+  const nextId = (game.next_ids || [])[0];
+  const nextAch = nextId != null ? game.achievements.find((a) => a.id === nextId) : null;
+
+  const badge = (url, fallback) => url
+    ? `<div class="cw-badge${fallback === "🔒" ? " locked" : ""}" style="background-image:url('${esc(url)}')"></div>`
+    : `<div class="cw-badge${fallback === "🔒" ? " locked" : ""}">${fallback}</div>`;
+
+  const card = (label, a, locked) => a ? `<div class="cw-sec">
+    <p class="cw-sec-label">${label}</p>
+    <div class="cw-row">
+      ${badge(a.badge_url, locked ? "🔒" : "🏆")}
+      <div class="cw-info">
+        <p class="cw-name">${esc(a.name)}</p>
+        <p class="cw-desc">${esc(a.desc || "")}</p>
+      </div>
+    </div>
+  </div>` : "";
+
+  return `<div class="cw">
+    <div class="cw-head">
+      <button class="cw-nav" id="cw-prev" title="Jogo anterior">‹</button>
+      <div class="cw-title" title="${esc(game.title)}">${esc(game.title)}</div>
+      <button class="cw-nav" id="cw-next" title="Próximo jogo">›</button>
+    </div>
+    <div class="cw-top">
+      <span class="cw-top-label">PROGRESSO DO JOGO</span>
+      <span class="cw-pills">
+        <span class="cw-pill">${e} / ${t}</span>
+        <span class="cw-pill" style="color:${game.accent};border-color:${game.accent}">${pct}%</span>
+      </span>
+    </div>
+    <div class="cw-bar"><div class="cw-fill" style="width:${pct}%;background:${game.accent}"></div></div>
+    ${card("ÚLTIMA CONQUISTA OBTIDA", le, false)}
+    ${card("PRÓXIMA CONQUISTA", nextAch, true)}
+    ${!le && !nextAch ? (t > 0 && e >= t ? `<div class="cw-done">✓ 100% concluído</div>` : `<p class="cw-empty-sm">Sem conquistas registradas ainda.</p>`) : ""}
+  </div>`;
+}
+
+function bindCompact() {
+  $("#cw-prev")?.addEventListener("click", () => switchCompactGame(-1));
+  $("#cw-next")?.addEventListener("click", () => switchCompactGame(1));
+}
+
+function switchCompactGame(dir) {
+  if (!S.library.length) return;
+  const idx = S.library.findIndex((g) => g.slug === S.activeSlug);
+  const next = (idx + dir + S.library.length) % S.library.length;
+  S.activeSlug = S.library[next].slug;
+  renderDashboard();
 }
 
 function sidebarHTML() {
@@ -189,9 +269,12 @@ function sidebarHTML() {
   const tile = (g) => {
     const { pct } = totals(g.modes);
     const active = g.slug === S.activeSlug;
+    const core = g.icon
+      ? `<div class="ring-core" style="background-image:url('${esc(g.icon)}');background-size:cover;background-position:center"></div>`
+      : `<div class="ring-core" style="background:linear-gradient(145deg, ${g.accent}33, var(--panel))">${esc(initials(g.title))}</div>`;
     return `<button class="tile ${active ? "active" : ""}" data-slug="${esc(g.slug)}" style="border-color:${active ? g.accent : "transparent"}">
       <div class="ring-wrap">${ring(pct, 48, 4, g.accent)}
-        <div class="ring-core" style="background:linear-gradient(145deg, ${g.accent}33, var(--panel))">${esc(initials(g.title))}</div>
+        ${core}
       </div>
       <div class="meta">
         <div class="name">${esc(g.title)}</div>
@@ -224,9 +307,42 @@ function mainHTML(game) {
     </div></main>`;
   }
   const { t, e, pct } = totals(game.modes);
-  const nextIds = game.next_ids || [];
   const le = game.last_earned;
+  const tips = (game.guide || []).length;
 
+  return `<main class="main">
+    <div class="panel-head" style="background:linear-gradient(180deg, ${game.accent}14, transparent)">
+      <div class="head-top">
+        <div class="head-ring">${ring(pct, 72, 5, game.accent)}${game.icon ? `<div class="head-icon" style="background-image:url('${esc(game.icon)}')"></div>` : `<span class="ico">🎮</span>`}</div>
+        <div class="head-info">
+          <h1>${esc(game.title)}</h1>
+          <p class="plat">${esc(game.platform)}</p>
+          <p class="total" style="color:${game.accent}">${e} / ${t} CONQUISTAS NO TOTAL · ${pct}%</p>
+        </div>
+      </div>
+      <div class="chips-row">
+        ${Object.entries(game.modes).map(([k, v]) => modeChip(k, v.earned, v.total)).join("")}
+      </div>
+      ${le ? `<div class="last-earned">
+        <span class="spark">✦</span>
+        <div class="le-body">
+          <p class="le-label">ÚLTIMA CONQUISTA OBTIDA</p>
+          <p class="le-name">${esc(le.name)}</p>
+          <p class="le-desc">${esc(le.desc)}</p>
+        </div>
+        <span class="le-date">${esc(le.date)}</span>
+      </div>` : ""}
+      <div class="panel-tabs">
+        <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk" style="--tab-accent:${game.accent}">⛳ WALKTHROUGH</button>
+        <button class="ptab ${S.tab === "tips" ? "active" : ""}" data-tab="tips" style="--tab-accent:${game.accent}">📖 DICAS & TUTORIAIS${tips ? ` · ${tips}` : ""}</button>
+      </div>
+    </div>
+    ${S.tab === "tips" ? guideHTML(game) : walkHTML(game)}
+  </main>`;
+}
+
+function walkHTML(game) {
+  const nextIds = game.next_ids || [];
   const badge = (a) => a.badge_url
     ? `<div class="ach-badge ${a.earned ? "" : "locked"}" style="background-image:url('${esc(a.badge_url)}')"></div>`
     : `<div class="ach-badge ${a.earned ? "" : "locked"}">${a.earned ? "🏆" : "🔒"}</div>`;
@@ -252,41 +368,57 @@ function mainHTML(game) {
       ${a.earned ? `<span class="ach-check">✓</span>` : ""}
     </div>`;
   }
+  return `<div class="list-wrap">
+    <p class="list-title">ORDEM DO WALKTHROUGH</p>
+    ${rows || `<p style="color:var(--text-low);font-size:11px">Sem conquistas no walkthrough.</p>`}
+  </div>`;
+}
 
-  return `<main class="main">
-    <div class="panel-head" style="background:linear-gradient(180deg, ${game.accent}14, transparent)">
-      <div class="head-top">
-        <div class="head-ring">${ring(pct, 72, 5, game.accent)}<span class="ico">🎮</span></div>
-        <div class="head-info">
-          <h1>${esc(game.title)}</h1>
-          <p class="plat">${esc(game.platform)}</p>
-          <p class="total" style="color:${game.accent}">${e} / ${t} CONQUISTAS NO TOTAL · ${pct}%</p>
-        </div>
-      </div>
-      <div class="chips-row">
-        ${Object.entries(game.modes).map(([k, v]) => modeChip(k, v.earned, v.total)).join("")}
-      </div>
-      ${le ? `<div class="last-earned">
-        <span class="spark">✦</span>
-        <div class="le-body">
-          <p class="le-label">ÚLTIMA CONQUISTA OBTIDA</p>
-          <p class="le-name">${esc(le.name)}</p>
-          <p class="le-desc">${esc(le.desc)}</p>
-        </div>
-        <span class="le-date">${esc(le.date)}</span>
-      </div>` : ""}
+/* Renderiza as seções de dicas/tutoriais extraídas do PDF do guia. */
+function guideHTML(game) {
+  const secs = game.guide || [];
+  const importBtn = S.mode === "demo" ? "" :
+    `<button class="pdf-order-btn" id="guide-import">📄 ${secs.length ? "Substituir dicas (PDF)" : "Importar dicas do PDF"}</button>`;
+  if (!secs.length) {
+    return `<div class="list-wrap"><p class="list-title">DICAS & TUTORIAIS</p>
+      <p class="guide-empty">Nenhuma dica importada para este jogo.<br>
+      Importe um PDF de guia abaixo — só as dicas/tutoriais, <b>sem alterar os troféus</b>.</p>
+      ${importBtn}
+    </div>`;
+  }
+  const block = (b) => {
+    switch (b.type) {
+      case "boss":    return `<div class="g-boss">⚔️ CHEFE: ${esc(b.text)}</div>`;
+      case "step":    return `<div class="g-step"><span class="g-step-n">#${b.n}</span> ${esc(b.text)}</div>`;
+      case "subhead": return `<div class="g-sub">${esc(b.text)}</div>`;
+      case "note":    return `<div class="g-note">${esc(b.text)}</div>`;
+      case "label":   return `<div class="g-row"><span class="g-lbl">${esc(b.label)}</span> ${esc(b.text)}</div>`;
+      case "li":      return `<div class="g-li">${esc(b.text)}</div>`;
+      default:        return `<p class="g-p">${esc(b.text)}</p>`;
+    }
+  };
+  const section = (s) => `<section class="g-section">
+    <p class="g-title">▸ ${esc(s.num)}. ${esc(s.title)}</p>
+    ${(s.blocks || []).map(block).join("")}
+  </section>`;
+  return `<div class="list-wrap guide-wrap">
+    <div class="guide-head">
+      <p class="list-title" style="margin:0">DICAS & TUTORIAIS DO GUIA</p>
+      ${importBtn}
     </div>
-    <div class="list-wrap">
-      <p class="list-title">ORDEM DO WALKTHROUGH</p>
-      ${rows || `<p style="color:var(--text-low);font-size:11px">Sem conquistas no walkthrough.</p>`}
-    </div>
-  </main>`;
+    ${secs.map(section).join("")}
+  </div>`;
 }
 
 function bindSidebar() {
   root.querySelectorAll(".tile").forEach((b) => {
     b.onclick = async () => { S.activeSlug = b.dataset.slug; await renderDashboard(); };
   });
+  root.querySelectorAll(".ptab").forEach((b) => {
+    b.onclick = () => { S.tab = b.dataset.tab; renderDashboard(); };
+  });
+  const gimport = $("#guide-import");
+  if (gimport) gimport.onclick = attachGuide;
   const add = $("#btn-add");
   if (add) add.onclick = () => enterWizard1();
 }
@@ -371,8 +503,11 @@ function enterWizard2(imported) {
   S.W = {
     title: imported.title,
     platform: imported.platform,
+    icon: imported.icon || "",
     items, order,
-    steps: [{ area: "", ids: [] }],
+    // Já vem pré-ordenado pela ordem nativa do RetroAchievements (sem arrastar).
+    steps: [{ area: "Ordem RetroAchievements", ids: order.slice() }],
+    guide: null,            // seções de dicas/tutoriais (preenchido ao ler o PDF)
   };
   renderWizard2();
 }
@@ -428,8 +563,13 @@ function renderWizard2() {
   root.innerHTML = `<div class="view">
     ${wizHeadHTML(2)}
     <div class="wiz-body">
-      <p style="color:var(--text-mid);font-size:12px;margin-bottom:4px"><b style="color:var(--text-hi)">${esc(W.title)}</b> — arraste as conquistas para as etapas, na ordem do seu walkthrough.</p>
-      <p style="color:var(--text-low);font-size:10.5px;margin-bottom:16px">A ordem é curatorial — segue o seu guia, não é gerada automaticamente. Marque o modo (N/ormal · H/ard) de cada conquista.</p>
+      <p style="color:var(--text-mid);font-size:12px;margin-bottom:4px"><b style="color:var(--text-hi)">${esc(W.title)}</b> — as conquistas já vêm na <b style="color:var(--cyan)">ordem do RetroAchievements</b> e os modos N/H foram inferidos. É só <b style="color:var(--gold)">Salvar</b>.</p>
+      <p style="color:var(--text-low);font-size:10.5px;margin-bottom:12px">Quer ajustar? Arraste para reordenar, troque N/H, ou use "Ordenar pelo PDF do guia" abaixo (também traz as dicas/tutoriais).</p>
+      <div class="pdf-order-row">
+        <button class="pdf-order-btn" id="pdf-order">📄 Ordenar pelo PDF do guia</button>
+        <button class="pdf-order-btn ghost" id="pdf-tips">📖 Só as dicas (não reordena)</button>
+        <span class="pdf-order-hint">Ordene as conquistas pelo guia, ou importe apenas as dicas/tutoriais sem alterar as conquistas.</span>
+      </div>
       <div class="wiz2-cols">
         <div class="wiz2-col dropzone" data-zone="unsorted">
           <p class="col-label">Conquistas (${unsorted.length})</p>
@@ -544,8 +684,125 @@ function bindWizard2() {
     if (W.steps.length <= 1) return toast("Mantenha ao menos uma etapa.", true);
     W.steps.splice(+b.dataset.delstep, 1); renderWizard2();
   });
+  // ordenar pelo PDF do guia / importar só as dicas
+  $("#pdf-order").onclick = orderByPdf;
+  $("#pdf-tips").onclick = tipsOnlyPdf;
   // salvar
   $("#wiz-save").onclick = saveWizard;
+}
+
+/* Abre o seletor nativo de arquivo (via WebView2), lê o PDF como base64 e
+   chama `onPick(b64, nome)`. Reaproveitado por todas as ações de PDF. */
+function pickPdf(onPick) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "application/pdf,.pdf";
+  input.style.display = "none";
+  document.body.appendChild(input);
+  input.onchange = async () => {
+    const file = input.files && input.files[0];
+    document.body.removeChild(input);
+    if (!file) return;                                      // cancelado
+    try {
+      const b64 = await fileToBase64(file);
+      await onPick(b64, file.name);
+    } catch (e) {
+      toast("Erro ao ler o arquivo: " + e, true);
+    }
+  };
+  input.click();                                            // abre o seletor (gesto do usuário)
+}
+
+/* Lê o PDF do guia e pré-ordena as conquistas + captura as dicas. O que não
+   casar fica logo abaixo na ordem do RA — nada é perdido. */
+function orderByPdf() {
+  if (S.mode === "demo") {
+    toast("Ordenação por PDF só funciona no app real (não na demonstração).", true);
+    return;
+  }
+  pickPdf(async (b64, name) => {
+    const btn = $("#pdf-order");
+    if (btn) { btn.disabled = true; btn.textContent = "📄 Lendo PDF…"; }
+    try {
+      const res = await backend.orderByPdfData(b64, name);
+      if (!res || !res.ok) return toast((res && res.error) || "Falha ao analisar o PDF.", true);
+
+      S.W.guide = res.guide || [];                          // guarda dicas/tutoriais p/ salvar
+      applyPdfOrder(res.ordered_ids || [], res.modes || {});// ordem + modos; re-renderiza
+
+      const matched = res.matched_by_name != null ? res.matched_by_name : res.found;
+      const unplaced = (res.total || 0) - (res.found || 0);
+      const tips = (res.guide || []).length;
+      if (res.found === 0)
+        toast("Nenhuma conquista do jogo foi reconhecida no guia. Confira se o PDF é deste jogo.", true);
+      else
+        toast(`${matched}/${res.total} conquistas reconhecidas · modos N/H aplicados · ${tips} seções de dicas${unplaced ? ` · ${unplaced} no pool` : ""}.`);
+    } catch (e) {
+      toast("Erro ao analisar o PDF: " + e, true);
+    } finally {
+      const b = $("#pdf-order");
+      if (b) { b.disabled = false; b.textContent = "📄 Ordenar pelo PDF do guia"; }
+    }
+  });
+}
+
+/* Importa SÓ as dicas/tutoriais do PDF (não reordena/altera conquistas) — no
+   wizard, guarda em S.W.guide para salvar junto. */
+function tipsOnlyPdf() {
+  if (S.mode === "demo") { toast("Disponível só no app real.", true); return; }
+  pickPdf(async (b64, name) => {
+    const btn = $("#pdf-tips");
+    if (btn) { btn.disabled = true; btn.textContent = "📖 Lendo…"; }
+    try {
+      const res = await backend.extractGuidePdf(b64, name);
+      if (!res || !res.ok) return toast((res && res.error) || "Falha ao ler as dicas.", true);
+      S.W.guide = res.guide || [];
+      toast(`${(res.guide || []).length} seções de dicas capturadas (conquistas não alteradas).`);
+    } catch (e) {
+      toast("Erro ao ler o PDF: " + e, true);
+    } finally {
+      const b = $("#pdf-tips");
+      if (b) { b.disabled = false; b.textContent = "📖 Só as dicas (não reordena)"; }
+    }
+  });
+}
+
+/* Anexa as dicas de um PDF a um jogo JÁ SALVO (dashboard), sem tocar nos
+   troféus. */
+function attachGuide() {
+  if (S.mode === "demo") { toast("Disponível só no app real.", true); return; }
+  const slug = S.activeSlug;
+  if (!slug) return;
+  pickPdf(async (b64, name) => {
+    toast("Lendo PDF…");
+    const res = await backend.attachGuidePdf(slug, b64, name);
+    if (!res || !res.ok) return toast((res && res.error) || "Falha ao importar as dicas.", true);
+    toast(`${res.sections} seções de dicas importadas (troféus intactos).`);
+    await renderDashboard();
+  });
+}
+
+/* Lê um File como base64 (sem o prefixo data:…;base64,). */
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",", 2)[1] || "");
+    r.onerror = () => reject(r.error || new Error("falha ao ler arquivo"));
+    r.readAsDataURL(file);
+  });
+}
+
+/* Aplica a ordem vinda do PDF SEM perder conquistas: as casadas vêm primeiro,
+   na ordem do guia (com o modo N/H sugerido), e as demais seguem logo abaixo
+   na ordem atual (RetroAchievements). */
+function applyPdfOrder(orderedIds, modes) {
+  const W = S.W;
+  const matched = orderedIds.filter((id) => W.items[id]);
+  const seen = new Set(matched);
+  const rest = W.order.filter((id) => !seen.has(id));   // mantém o restante (ordem RA)
+  if (modes) matched.forEach((id) => { if (modes[id]) W.items[id].mode = modes[id]; });
+  W.steps = [{ area: "Ordem do guia (PDF)", ids: matched.concat(rest) }];
+  renderWizard2();
 }
 
 async function saveWizard() {
@@ -561,7 +818,7 @@ async function saveWizard() {
   if (!walkthrough.length) return toast("Adicione conquistas a pelo menos uma etapa.", true);
 
   try {
-    const res = await backend.saveGame({ walkthrough });
+    const res = await backend.saveGame({ walkthrough, guide: W.guide || [] });
     if (!res.ok) return toast(res.error || "Falha ao salvar.", true);
     if (res.slug) S.activeSlug = res.slug;
     toast(res.demo ? "Demonstração — jogo não persistido." : "Jogo salvo!");
@@ -579,6 +836,31 @@ function bindWindowControls() {
     if (hasBackend()) window.pywebview.api.toggle_on_top(S.onTop);
   });
   $("#btn-pin")?.classList.add("active");
+  $("#btn-compact")?.addEventListener("click", async (e) => {
+    S.compact = !S.compact;
+    e.currentTarget.classList.toggle("active", S.compact);
+    e.currentTarget.title = S.compact ? "Sair do modo compacto" : "Modo compacto (overlay de progresso)";
+    if (hasBackend()) window.pywebview.api.set_compact(S.compact);
+    if (S.view === "dashboard") await renderDashboard();
+  });
+  $("#btn-exit-demo")?.addEventListener("click", exitDemo);
+}
+
+/* Sai do modo demonstração: volta para a tela de conexão (ou, se já houver
+   credenciais salvas, direto para o dashboard com dados reais). */
+async function exitDemo() {
+  if (!hasBackend()) { toast("Backend indisponível — reinicie o app.", true); return; }
+  stopPolling();
+  S.mode = "real";
+  S.activeSlug = null;
+  document.getElementById("demo-banner").classList.add("hidden");
+  try {
+    const st = await backend.appState();
+    if (!st.configured) renderSetup();
+    else enterDashboard();
+  } catch (e) {
+    renderSetup();
+  }
 }
 
 async function boot() {
@@ -618,7 +900,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
 /* ============================ DADOS DEMO ============================== */
 function DEMO_LIB() {
-  return DEMO.map((g) => ({ slug: g.slug, title: g.title, platform: g.platform, accent: g.accent, modes: g.modes }));
+  return DEMO.map((g) => ({ slug: g.slug, title: g.title, platform: g.platform, accent: g.accent, modes: g.modes, icon: g.icon || "" }));
 }
 function DEMO_GAME(slug) { return DEMO.find((g) => g.slug === slug) || null; }
 function DEMO_SEARCH() {
@@ -654,6 +936,26 @@ const DEMO = [
       { id: 4, name: "Ferryman's Mercy", desc: "Rescue all 10 Digi-Elves at Numenume River.", mode: "normal", earned: false, badge_url: "", step: 2, area: "Goburimon Fortress" },
       { id: 6, name: "Death Valley, Twice Over", desc: "Complete Death Valley on Hard difficulty.", mode: "hard", earned: false, badge_url: "", step: 3, area: "Death Valley (Hard)" },
       { id: 8, name: "302 and Counting", desc: "Clear Undead Yard on Hard mode.", mode: "hard", earned: false, badge_url: "", step: 3, area: "Death Valley (Hard)" },
+    ],
+    guide: [
+      { num: "1", title: "INTRODUÇÃO & MECÂNICAS BÁSICAS", blocks: [
+        { type: "p", text: "Action-RPG da Bandai (GameCube/PS2, 2005). Suporta até 4 jogadores e tem sistema de evolução, armas e técnicas de MP." },
+        { type: "li", text: "Toque em inimigos causa dano — evite contato desnecessário." },
+        { type: "li", text: "Usar sempre o mesmo tipo de arma aumenta a skill naquele tipo." },
+        { type: "note", text: "Nunca saia de um dungeon sem salvar! O Save Keeper fica apenas no HomeServer." },
+      ]},
+      { num: "4", title: "WALKTHROUGH — SEQUÊNCIA TEMPORAL", blocks: [
+        { type: "subhead", text: "4.1 Death Valley" },
+        { type: "step", n: 3, text: "Goblin Pass" },
+        { type: "label", label: "Objetivo", text: "Atravesse as pontes; na 2ª, vire à esquerda e siga ao sul." },
+        { type: "label", label: "Dica", text: "Entre e saia repetidamente para respawnar itens e ganhar EXP." },
+        { type: "boss", text: "BLOSSOMOM" },
+        { type: "p", text: "Use arma de ataque a distância (Shot). Mantenha distância máxima e atire de longe." },
+      ]},
+      { num: "9", title: "DICAS AVANÇADAS & GRINDING", blocks: [
+        { type: "li", text: "Goblin Pass: entre e saia para farmar inimigos e itens." },
+        { type: "note", text: "Algumas conquistas do RetroAchievements são incompatíveis com multiplayer — jogue solo." },
+      ]},
     ],
   },
   {

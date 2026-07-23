@@ -1,2 +1,10 @@
-pywebview>=5.0
+pywebview==5.4
 requests>=2.31
+# Leitura do PDF do guia para ordenar o walkthrough automaticamente.
+pypdf>=4.0
+# No Windows o backend EdgeChromium usa pythonnet. Fixamos um combo estavel e
+# testado de ponta a ponta; com pywebview 6.x + pythonnet 3.1.x a introspecao
+# da js_api chega a estourar a recursao ao percorrer window.native.
+# (A causa raiz do bridge vazio foi corrigida no engine.py tornando o atributo
+#  window privado; este pin e uma garantia extra.)
+pythonnet==3.0.5 ; sys_platform == "win32"

@@ -179,12 +179,17 @@ class RAClient:
             date_hc = a.get("DateEarnedHardcore")
             date_sc = a.get("DateEarned")
             earned_date = date_hc or date_sc
+            try:
+                display_order = int(a.get("DisplayOrder"))
+            except (TypeError, ValueError):
+                display_order = 10_000_000   # sem ordem definida -> vai para o fim
             out[aid] = {
                 "id": aid,
                 "title": a.get("Title") or "",
                 "desc": a.get("Description") or "",
                 "badge": a.get("BadgeName") or "",
                 "points": a.get("Points") or 0,
+                "display_order": display_order,   # ordem canônica/lógica do set no RA
                 "earned": bool(earned_date),
                 "hardcore": bool(date_hc),
                 "date": earned_date or "",
@@ -203,6 +208,25 @@ class RAClient:
             return True
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         url = f"{MEDIA_BASE}/Badge/{badge_name}.png"
+        try:
+            resp = self.session.get(url, timeout=20)
+            if resp.status_code == 200 and resp.content:
+                dest_path.write_bytes(resp.content)
+                return True
+        except requests.RequestException:
+            return False
+        return False
+
+    def download_image(self, image_path: str, dest_path: Path) -> bool:
+        """Baixa uma imagem arbitrária do RA (ex.: ícone do jogo `ImageIcon`),
+        cacheando localmente. `image_path` costuma vir como '/Images/123.png'."""
+        if not image_path:
+            return False
+        dest_path = Path(dest_path)
+        if dest_path.exists() and dest_path.stat().st_size > 0:
+            return True
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        url = image_path if image_path.startswith("http") else MEDIA_BASE + image_path
         try:
             resp = self.session.get(url, timeout=20)
             if resp.status_code == 200 and resp.content:

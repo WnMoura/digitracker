@@ -8,6 +8,8 @@ RetroAchievements a cada 30s e mantém o estado de cada jogo em memória.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import posixpath
 import re
@@ -21,6 +23,7 @@ from urllib.parse import unquote
 
 import webview
 
+import guide_parser
 from ra_api import RAClient, RAError, fmt_date
 
 
@@ -49,10 +52,15 @@ GAMES_DIR = CONFIG_DIR / "games"
 CACHE_DIR = CONFIG_DIR / "cache"
 SECRETS_PATH = CONFIG_DIR / "secrets.json"
 BADGES_DIR = DATA_DIR / "assets" / "badges"
+ICONS_DIR = DATA_DIR / "assets" / "icons"   # ícones dos jogos (RA ImageIcon)
 
 SYNC_INTERVAL = 30  # segundos
 
 ACCENTS = ["#D62839", "#F5C518", "#2DE2E6", "#27AE60"]
+
+NORMAL_SIZE = (1040, 680)
+COMPACT_SIZE = (300, 232)   # janela mini/overlay com o progresso do jogo
+COMPACT_MARGIN = 24         # distância do canto da tela ao entrar em modo compacto
 
 
 # ---------------------------------------------------------------------------- #
@@ -80,31 +88,49 @@ def load_game_file(path: Path) -> dict | None:
         return None
 
 
+def _normalize_text(text: str) -> str:
+    """Normaliza para casamento de texto: sem acentos, minúsculo, espaços
+    colapsados. Usado para achar títulos de conquistas dentro do PDF."""
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def extract_pdf_text(source) -> str:
+    """Extrai todo o texto de um PDF (página a página). `source` pode ser um
+    caminho ou um stream binário (ex.: io.BytesIO). Requer `pypdf`."""
+    from pypdf import PdfReader  # import tardio: só carrega ao usar o recurso
+
+    reader = PdfReader(source)
+    return "\n".join((page.extract_text() or "") for page in reader.pages)
+
+
 # ---------------------------------------------------------------------------- #
 # API exposta ao frontend (pywebview js_api)
 # ---------------------------------------------------------------------------- #
 class Api:
     def __init__(self):
-        self.window = None
-        self.client: RAClient | None = None
+        self._window = None
+        self._client: RAClient | None = None
         self.state: dict[str, dict] = {}      # slug -> detalhe computado
         self.pending_import: dict | None = None
         self.index_building = False
+        self._compact = False
+        self._pre_compact_pos: tuple[int, int] | None = None
         self._lock = threading.Lock()
 
-        for d in (GAMES_DIR, CACHE_DIR, BADGES_DIR):
+        for d in (GAMES_DIR, CACHE_DIR, BADGES_DIR, ICONS_DIR):
             d.mkdir(parents=True, exist_ok=True)
 
         secrets = load_secrets()
         if secrets and secrets.get("username") and secrets.get("api_key"):
-            self.client = RAClient(secrets["username"], secrets["api_key"], CACHE_DIR)
+            self._client = RAClient(secrets["username"], secrets["api_key"], CACHE_DIR)
 
     # ------------------------ status / configuração ------------------------- #
     def get_app_state(self) -> dict:
         return {
-            "configured": self.client is not None,
-            "username": self.client.username if self.client else "",
-            "index_ready": bool(self.client and self.client.index_is_fresh()),
+            "configured": self._client is not None,
+            "username": self._client.username if self._client else "",
+            "index_ready": bool(self._client and self._client.index_is_fresh()),
             "index_building": self.index_building,
         }
 
@@ -122,7 +148,7 @@ class Api:
             json.dumps({"username": username, "api_key": api_key}, indent=2),
             encoding="utf-8",
         )
-        self.client = client
+        self._client = client
         self._kick_sync()
         self._ensure_index_async()
         return {"ok": True}
@@ -138,6 +164,7 @@ class Api:
                     "slug": g["slug"],
                     "title": g["title"],
                     "platform": g["platform"],
+                    "icon": g.get("icon", ""),
                     "accent": g["accent"],
                     "modes": g["modes"],
                 }
@@ -159,23 +186,23 @@ class Api:
 
     # --------------------------- busca (wizard p1) -------------------------- #
     def search_games(self, query: str) -> dict:
-        if not self.client:
+        if not self._client:
             return {"ready": False, "building": False, "results": [], "error": "Não configurado."}
-        if not self.client.index_is_fresh():
+        if not self._client.index_is_fresh():
             self._ensure_index_async()
             return {"ready": False, "building": True, "results": []}
-        return {"ready": True, "building": False, "results": self.client.search_games(query)}
+        return {"ready": True, "building": False, "results": self._client.search_games(query)}
 
     def _ensure_index_async(self):
-        if self.index_building or not self.client:
+        if self.index_building or not self._client:
             return
-        if self.client.index_is_fresh():
+        if self._client.index_is_fresh():
             return
         self.index_building = True
 
         def build():
             try:
-                self.client.build_games_index()
+                self._client.build_games_index()
             except RAError:
                 pass
             finally:
@@ -186,33 +213,49 @@ class Api:
     # --------------------------- importar (wizard) -------------------------- #
     def import_game(self, game_id: int) -> dict:
         """Passo 1 -> 2: baixa a lista completa de conquistas e cacheia ícones."""
-        if not self.client:
+        if not self._client:
             return {"ok": False, "error": "Não configurado."}
         try:
-            progress = self.client.get_game_info_and_user_progress(int(game_id))
+            progress = self._client.get_game_info_and_user_progress(int(game_id))
         except RAError as exc:
             return {"ok": False, "error": str(exc)}
 
         title = progress.get("Title", "Jogo")
         platform = progress.get("ConsoleName", "")
         slug = slugify(title)
-        achievements = self.client.parse_achievements(progress)
+        achievements = self._client.parse_achievements(progress)
 
-        # baixa badges para o cache local (em ordem de display da API)
-        ach_list = sorted(achievements.values(), key=lambda a: a["id"])
+        # ORDEM NATIVA DO RA (DisplayOrder) — já é uma ordem lógica/curatorial.
+        ach_list = sorted(
+            achievements.values(),
+            key=lambda a: (a.get("display_order", 10_000_000), a["id"]),
+        )
+        # baixa badges para o cache local
         for a in ach_list:
             if a["badge"]:
-                self.client.download_badge(
+                self._client.download_badge(
                     a["badge"], BADGES_DIR / slug / f"{a['badge']}.png"
                 )
+
+        # ícone do jogo (cache local) para exibir na lateral
+        icon_url = ""
+        icon_path = progress.get("ImageIcon") or ""
+        if icon_path and self._client.download_image(icon_path, ICONS_DIR / f"{slug}.png"):
+            icon_url = f"/assets/icons/{slug}.png"
 
         self.pending_import = {
             "slug": slug,
             "title": title,
             "platform": platform,
+            "icon": icon_url,
             "retroachievements_game_id": int(game_id),
             "achievements_meta": {
-                str(a["id"]): {"title": a["title"], "desc": a["desc"], "badge": a["badge"]}
+                str(a["id"]): {
+                    "title": a["title"],
+                    "desc": a["desc"],
+                    "badge": a["badge"],
+                    "points": a.get("points", 0),   # usado p/ casar com o PDF do guia
+                }
                 for a in ach_list
             },
         }
@@ -221,13 +264,17 @@ class Api:
             "slug": slug,
             "title": title,
             "platform": platform,
+            "icon": icon_url,
             "achievements": [
                 {
                     "id": a["id"],
                     "title": a["title"],
                     "desc": a["desc"],
                     "badge_url": self._badge_url(slug, a["badge"]),
-                    "mode": "normal",
+                    # modo inferido da própria descrição do RA (Hard/Very Hard -> hard)
+                    "mode": guide_parser.mode_from_difficulty(
+                        f"{a['title']} {a['desc']}"
+                    ),
                 }
                 for a in ach_list
             ],
@@ -249,10 +296,12 @@ class Api:
             "slug": slug,
             "title": self.pending_import["title"],
             "platform": self.pending_import["platform"],
+            "icon": self.pending_import.get("icon", ""),
             "accent": payload.get("accent", accent),
             "retroachievements_game_id": self.pending_import["retroachievements_game_id"],
             "walkthrough": steps,
             "achievements_meta": self.pending_import["achievements_meta"],
+            "guide": payload.get("guide") or [],   # dicas/tutoriais extraídos do PDF
         }
         (GAMES_DIR / f"{slug}.json").write_text(
             json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -261,19 +310,138 @@ class Api:
         self._sync_game(game)  # popula o estado imediatamente
         return {"ok": True, "slug": slug}
 
+    # --------------------- ordenar walkthrough pelo PDF --------------------- #
+    # O PDF chega como base64 vindo de um <input type=file> do frontend — assim
+    # quem abre o seletor de arquivos é o próprio WebView2 (na thread de UI).
+    # Evitamos o diálogo nativo do pywebview (`create_file_dialog`), que no
+    # Windows TRAVA ao ser chamado de dentro do contexto do bridge js_api.
+    def order_by_pdf_data(self, b64: str, filename: str = "") -> dict:
+        """Recebe o conteúdo do PDF (base64), faz o parsing estruturado do guia e
+        devolve: as conquistas na ordem do guia (seção de conquistas) + o modo
+        sugerido (N/H) de cada uma + as seções de dicas/tutoriais para exibir no
+        app. O que não casar volta em `missing_ids` para ajuste manual."""
+        if not self.pending_import:
+            return {"ok": False, "error": "Nenhuma importação em andamento."}
+        try:
+            raw = base64.b64decode((b64 or "").split(",", 1)[-1])
+            text = extract_pdf_text(io.BytesIO(raw))
+        except Exception as exc:  # base64 inválido, pypdf ausente, PDF corrompido…
+            return {"ok": False, "error": f"Não foi possível ler o PDF: {exc}"}
+
+        if not _normalize_text(text):
+            return {
+                "ok": False,
+                "error": "O PDF não tem texto extraível (parece ser digitalizado/imagem).",
+            }
+
+        parsed = guide_parser.parse_guide(text)
+        order = guide_parser.order_from_guide(
+            parsed, self.pending_import["achievements_meta"], text
+        )
+        # Seções de dicas/tutoriais (exclui a seção 8, que é a lista de conquistas
+        # já mostrada no walkthrough).
+        guide_sections = [s for s in parsed["sections"] if s["num"] != "8"]
+
+        order["ok"] = True
+        order["filename"] = filename
+        order["guide"] = guide_sections
+        return order
+
+    def _read_guide_sections(self, b64: str):
+        """(ok, erro, seções) — extrai do PDF só as seções de dicas/tutoriais
+        (remove a seção 8, que é a lista de conquistas)."""
+        try:
+            raw = base64.b64decode((b64 or "").split(",", 1)[-1])
+            text = extract_pdf_text(io.BytesIO(raw))
+        except Exception as exc:
+            return False, f"Não foi possível ler o PDF: {exc}", []
+        if not _normalize_text(text):
+            return False, "O PDF não tem texto extraível (parece ser digitalizado/imagem).", []
+        parsed = guide_parser.parse_guide(text)
+        guide = [s for s in parsed["sections"] if s["num"] != "8"]
+        if not guide:
+            return False, "Não encontrei seções de dicas/tutoriais neste PDF.", []
+        return True, "", guide
+
+    def extract_guide_pdf(self, b64: str, filename: str = "") -> dict:
+        """Lê um PDF e devolve SÓ as dicas/tutoriais (não mexe em conquistas).
+        Usado no wizard para anexar o guia sem reordenar nada."""
+        ok, err, guide = self._read_guide_sections(b64)
+        if not ok:
+            return {"ok": False, "error": err}
+        return {"ok": True, "filename": filename, "guide": guide}
+
+    def attach_guide_pdf(self, slug: str, b64: str, filename: str = "") -> dict:
+        """Anexa as dicas/tutoriais de um PDF a um jogo JÁ SALVO, sem tocar nas
+        conquistas/ordem/modos. Atualiza config/games/{slug}.json e o estado."""
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        ok, err, guide = self._read_guide_sections(b64)
+        if not ok:
+            return {"ok": False, "error": err}
+        game["guide"] = guide
+        (GAMES_DIR / f"{slug}.json").write_text(
+            json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        # atualiza o estado em memória sem re-sincronizar progresso (sem rede)
+        with self._lock:
+            detail = self.state.get(slug)
+            if detail is not None:
+                detail["guide"] = guide
+        if detail is None:
+            self._sync_game(game)
+        return {"ok": True, "sections": len(guide), "filename": filename}
+
     # ------------------------- controles da janela -------------------------- #
+    # IMPORTANTE: as operacoes de janela do pywebview (destroy/minimize/on_top)
+    # NAO surtem efeito quando executadas de dentro do contexto do bridge
+    # js_api — e por isso os botoes Fechar/Minimizar "nao funcionavam". Rodar
+    # cada operacao numa thread propria resolve.
+    @staticmethod
+    def _window_op(fn):
+        threading.Thread(target=fn, daemon=True).start()
+
     def minimize(self):
-        if self.window:
-            self.window.minimize()
+        if self._window:
+            self._window_op(self._window.minimize)
 
     def close(self):
-        if self.window:
-            self.window.destroy()
+        if self._window:
+            self._window_op(self._window.destroy)
 
     def toggle_on_top(self, value: bool) -> dict:
-        if self.window:
-            self.window.on_top = bool(value)
-        return {"ok": True, "on_top": bool(value)}
+        val = bool(value)
+        if self._window:
+            self._window_op(lambda: setattr(self._window, "on_top", val))
+        return {"ok": True, "on_top": val}
+
+    def set_compact(self, value: bool) -> dict:
+        """Alterna entre o dashboard completo e um mini-overlay (quadradinho)
+        com o progresso do jogo ativo — pensado para ficar por cima do
+        emulador enquanto se joga, tipo o popup de conquistas do RetroArch."""
+        value = bool(value)
+        self._compact = value
+        win = self._window
+
+        def op():
+            if value:
+                self._pre_compact_pos = (win.x, win.y)
+                w, h = COMPACT_SIZE
+                win.resize(w, h)
+                try:
+                    scr = webview.screens()[0]
+                    win.move(scr.x + scr.width - w - COMPACT_MARGIN, scr.y + COMPACT_MARGIN)
+                except Exception:
+                    pass
+            else:
+                win.resize(*NORMAL_SIZE)
+                if self._pre_compact_pos:
+                    win.move(*self._pre_compact_pos)
+
+        if win:
+            self._window_op(op)
+        return {"ok": True, "compact": value}
 
     # ----------------------------- helpers ---------------------------------- #
     @staticmethod
@@ -288,16 +456,16 @@ class Api:
         meta = game.get("achievements_meta", {})
 
         earned_map: dict[int, dict] = {}
-        if self.client:
+        if self._client:
             try:
-                progress = self.client.get_game_info_and_user_progress(
+                progress = self._client.get_game_info_and_user_progress(
                     game["retroachievements_game_id"]
                 )
-                earned_map = self.client.parse_achievements(progress)
+                earned_map = self._client.parse_achievements(progress)
                 # garante badges em cache (jogo pode ter sido editado)
                 for a in earned_map.values():
                     if a["badge"]:
-                        self.client.download_badge(
+                        self._client.download_badge(
                             a["badge"], BADGES_DIR / slug / f"{a['badge']}.png"
                         )
             except RAError:
@@ -346,11 +514,13 @@ class Api:
             "slug": slug,
             "title": game["title"],
             "platform": game["platform"],
+            "icon": game.get("icon", ""),
             "accent": game.get("accent", ACCENTS[0]),
             "modes": modes,
             "achievements": ordered,
             "next_ids": next_ids,
             "last_earned": last_earned,
+            "guide": game.get("guide", []),   # seções de dicas/tutoriais do PDF
         }
         with self._lock:
             self.state[slug] = detail
@@ -406,15 +576,15 @@ def main():
         "DigiTracker",
         url=url,
         js_api=api,
-        width=1040,
-        height=680,
-        min_size=(820, 560),
+        width=NORMAL_SIZE[0],
+        height=NORMAL_SIZE[1],
+        min_size=COMPACT_SIZE,   # permite encolher até o modo compacto (overlay)
         frameless=True,
         easy_drag=False,      # arrasto via .pywebview-drag-region
         on_top=True,
         background_color="#08080F",
     )
-    api.window = window
+    api._window = window
 
     threading.Thread(target=api.sync_loop, daemon=True).start()
     webview.start()

@@ -36,6 +36,9 @@ for pkg in ("webview",):
 # pythonnet (clr) é usado pelo backend EdgeChromium no Windows.
 hiddenimports += ["clr", "clr_loader", "pythonnet", "proxy_tools"]
 
+# pypdf: leitura do PDF do guia (ordenar walkthrough). Garante os submódulos.
+hiddenimports += collect_submodules("pypdf")
+
 
 a = Analysis(
     ["engine.py"],

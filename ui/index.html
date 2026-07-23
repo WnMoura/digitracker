@@ -18,13 +18,17 @@
       <span class="spacer"></span>
       <span class="sync-tag" id="sync-tag"></span>
       <div class="win-btns">
+        <button class="win-btn compact-btn" id="btn-compact" title="Modo compacto (overlay de progresso)">▣</button>
         <button class="win-btn pin" id="btn-pin" title="Sempre por cima">📌</button>
         <button class="win-btn" id="btn-min" title="Minimizar">—</button>
         <button class="win-btn close" id="btn-close" title="Fechar">✕</button>
       </div>
     </div>
 
-    <div id="demo-banner" class="demo-banner hidden">MODO DEMONSTRAÇÃO — dados fictícios. Configure suas credenciais para usar dados reais.</div>
+    <div id="demo-banner" class="demo-banner hidden">
+      <span class="demo-banner-txt">MODO DEMONSTRAÇÃO — dados fictícios. Configure suas credenciais para usar dados reais.</span>
+      <button id="btn-exit-demo" class="exit-demo-btn" title="Sair da demonstração">Sair da demonstração</button>
+    </div>
 
     <!-- Conteúdo trocado por JS -->
     <div class="body" id="root"></div>
