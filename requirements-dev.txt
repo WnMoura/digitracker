@@ -1,0 +1,2 @@
+# Dependências só para rodar os testes (`python -m pytest tests/ -q`).
+pytest>=8.0

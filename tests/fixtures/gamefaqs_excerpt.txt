@@ -1,0 +1,81 @@
+====================
+---Starter Digimon--
+====================
+Agumon: A great character if you prefer to use melee attacks.  
+Strengths: Very high strength, high hp, blunt weapons
+Weaknesses: Low mp, low wisdom, low spirit
+Digivolutions (Normal Mode)
+War Greymon X: Defeat all 279 digimon in Undead Yard
+Hercules Kabuterimon X: Complete Item Road
+
+Dorumon: Balanced digimon that does not specialize in one area
+Strengths: Very high defense, high mp, high spirit, bash weapons
+Weaknesses: Very low speed, average wisdom
+Digivolutions: (Normal Mode)
+WereGarurumon X: Defeat all 279 digimon in Undead Yard
+Clavis Angemon: Complete Item Road
+
+Guilmon: A great character if you like to use mp and stab weapons.
+Strengths: Very high mp, very high spirit/wisdom, very high speed
+Weaknesses: Very low strength, average hp and defense
+Digivolutions: (Normal Mode)
+Hercules Kabuterimon X: Defeat all 279 digimon in Undead Yard
+War Greymon X: Complete Item Road
+
+Veemon: A speedy character with great defense.
+Strengths: Very high speed, Very high defense, slash weapons
+Weaknesses: Average strength, low mp, low spirit
+Digivolutions: (Normal Mode)
+Clavis Angemon: Defeat all 279 digimon in Undead Yard
+WereGarurumon X: Complete Item Road
+
+====================
+------Glossary------
+====================
+
+Hp- Hit Points (life meter)
+Mp- Magic Points (Used to execute mp techniques)
+Tech.- Short for techniques
+Exp.- Experience points won from a fight
+Upgrade- Improve your weapons and armor
+
+
+=====================
+----3.Walkthrough----
+===================== 
+
+++++++++++++++The Beginning++++++++++++++++++++
+
+Don't you love the feeling of popping in a new game and waiting for the 
+"Start Screen" to come on?  When the "Bandai" logo appears press Start 
+and you will be looking at the main screen.  Select Game Start and you 
+are on your way. Choose "Create Digimon" and you will get a selection 
+of four Digimon: Guilmon, Dorumon, Agumon, or Veemon.  After choosing 
+your digimon you will be prompted to name your character, you can press 
+up to get lowercase letters and up again for symbols and spaces. After 
+selecting your Digimon you will be transported to the Terminal Area 
+where your adventure begins!  You will be prompted to talk to Ophanimon 
+and he will tell you of the troubles facing the Digital World and you 
+are the only one who can save it! (Like we have never heard that one 
+before!) After you are told about your rescue mission you are given 
+control of your digimon in the Commander's Room. Inside there are digi-
+elves who offer plenty of tidbits of information about weapons, 
+digivolution tech., hp/mp etc. You should read what they have 
+to say, and it is ok if you don't understand everything now, you will 
+learn as you play the game.  Once finished talking to the elves, leave 
+the Commander's Room through the portal and you will find yourself back 
+at the Termial Area.  You will probably want to visit the "Save Keeper" 
+before heading out (In the central area).  After saving, enter the Gate 
+Circle and prepare for your first mission!  You will begin a practice 
+mission, which will get you used to the game's mechanics.  You can't 
+lose any health so make sure to try and get a few good swings, practice 
+mp attacks, because you will need to have an understanding of the 
+fighting as the first mission is difficult.
+
+*************************************
+Death Valley (Recommended Level 1-15) (dvly)
+*************************************
+Goburimon: Hits with club (60-100hp, 10-39 exp.)
+Numemon: Spits slime and attacks with tongue (60-100hp, 12-32 exp.) 
+Ogremon: Hits with club (120-140 hp, 32-40 exp.)
+Sukamon: Spits fire and uses a "spin" attack (80-180hp, 24-40 exp.) 

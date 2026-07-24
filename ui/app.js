@@ -4,9 +4,27 @@
    Cai em "modo demonstração" quando rodando sem o backend pywebview.
    =========================================================================== */
 
-const MODE_COLOR = { normal: "var(--cyan)", hard: "var(--red)" };
-const MODE_LABEL = { normal: "NORMAL", hard: "HARD" };
+/* Como a RetroAchievements classifica cada desbloqueio — não é dificuldade do
+   jogo. Hardcore (sem savestate) é o único que vale Mastery, por isso o dourado.
+   Qualquer modo desconhecido que venha do backend ganha uma cor da paleta extra
+   e o nome em caixa alta. */
+const MODE_COLOR = { hardcore: "#F5C518", softcore: "#2DE2E6" };
+const MODE_LABEL = { hardcore: "HARDCORE", softcore: "SOFTCORE" };
+const MODE_ICON = { hardcore: "⚡", softcore: "○" };
+const EXTRA_MODE_COLORS = ["#F5C518", "#27AE60", "#A855F7", "#FF8A3D"];
 const C_LINE = "#23233a", C_LOCKED = "#2C2C42";
+
+const modeColor = (key) => MODE_COLOR[key]
+  || EXTRA_MODE_COLORS[Math.abs([...String(key)].reduce((h, c) => h + c.charCodeAt(0), 0)) % EXTRA_MODE_COLORS.length];
+const modeLabel = (key) => MODE_LABEL[key] || String(key).toUpperCase();
+const modeIcon = (key) => MODE_ICON[key] || "●";
+
+/* '#RRGGBB' + alfa -> 'rgba(r,g,b,a)'. Usado nos fundos translúcidos dos chips
+   (antes o código comparava a string da cor para escolher o rgba fixo). */
+function tint(hex, alpha) {
+  const n = parseInt(String(hex).replace("#", ""), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
 
 const S = {
   mode: "real",          // 'real' | 'demo'
@@ -17,7 +35,15 @@ const S = {
   onTop: true,
   compact: false,        // modo mini-overlay (progresso de conquistas)
   poll: null,
+  sig: null,             // assinatura do último render (evita redesenhar à toa)
+  screenKey: null,       // identidade da tela atual (p/ decidir se mantém o scroll)
   W: null,               // estado do wizard
+  I: null,               // estado da importação em lote
+  autoImport: true,      // espelhar a conta (jogo novo entra sozinho)
+  autoOverlay: true,     // grudar no emulador quando ele abrir
+  aiReady: false,        // há chave salva para o provedor de IA escolhido
+  G: null,               // estado do painel do GameFAQs
+  AI: null,              // estado do painel de configuração da IA
 };
 
 const root = document.getElementById("root");
@@ -69,6 +95,63 @@ const backend = {
     if (S.mode === "demo") return { ok: false, demo: true };
     return window.pywebview.api.attach_guide_pdf(slug, b64, name);
   },
+  async playedGames() {
+    if (S.mode === "demo") return { ok: true, games: DEMO_PLAYED() };
+    return window.pywebview.api.list_played_games();
+  },
+  async startBulkImport(ids) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.start_bulk_import(ids);
+  },
+  async bulkStatus() {
+    if (S.mode === "demo") return { running: false };
+    return window.pywebview.api.get_bulk_status();
+  },
+  async setAutoImport(v) {
+    if (S.mode === "demo") return { ok: true, auto_import: v };
+    return window.pywebview.api.set_auto_import(v);
+  },
+  async setAutoOverlay(v) {
+    if (S.mode === "demo") return { ok: true, auto_overlay: v };
+    return window.pywebview.api.set_auto_overlay(v);
+  },
+  async gamefaqsList(url) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.gamefaqs_list(url);
+  },
+  async gamefaqsImport(url) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.gamefaqs_import(url);
+  },
+  async gamefaqsAttach(slug, url) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.gamefaqs_attach(slug, url);
+  },
+  async refineGuideAi() {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.refine_guide_ai();
+  },
+  async getAiConfig() {
+    if (S.mode === "demo") return { ok: false };
+    return window.pywebview.api.get_ai_config();
+  },
+  async setAiConfig(cfg) {
+    if (S.mode === "demo") return { ok: false };
+    return window.pywebview.api.set_ai_config(cfg.provider, cfg.api_key, cfg.model, cfg.base_url);
+  },
+};
+
+/* O backend entra/sai do modo compacto sozinho quando detecta um emulador —
+   ele chama esta função para a interface acompanhar na hora. */
+window.onOverlayChanged = async (compact) => {
+  S.compact = !!compact;
+  const btn = document.getElementById("btn-compact");
+  if (btn) {
+    btn.classList.toggle("active", S.compact);
+    btn.title = S.compact ? "Sair do modo compacto" : "Modo compacto (overlay de progresso)";
+  }
+  if (S.view === "dashboard") await renderDashboard({ force: true });
+  if (S.compact) toast("Emulador detectado — overlay grudado na janela.");
 };
 
 /* ------------------------------- toast ---------------------------------- */
@@ -98,34 +181,45 @@ function ring(percent, size = 52, stroke = 4, color = "var(--cyan)") {
 function modeChip(key, earned, total) {
   const pct = total ? Math.round((earned / total) * 100) : 0;
   const done = pct >= 100;
-  const col = MODE_COLOR[key];
-  return `<div class="mode-chip" style="border-color:${done ? col : C_LINE}">
-    <span class="pip" style="background:${done ? col : C_LOCKED}"></span>
-    <span class="txt" style="color:${done ? col : "var(--text-mid)"}">${MODE_LABEL[key]} ${earned}/${total} · ${pct}%</span>
+  const col = modeColor(key);
+  const lit = done || earned > 0;
+  return `<div class="mode-chip" style="border-color:${lit ? col : C_LINE}">
+    <span class="pip" style="background:${lit ? col : C_LOCKED}"></span>
+    <span class="txt" style="color:${lit ? col : "var(--text-mid)"}">${modeIcon(key)} ${esc(modeLabel(key))} ${earned}/${total} · ${pct}%</span>
   </div>`;
 }
 
+/* Selo de como a conquista foi destravada. Só faz sentido em conquista obtida —
+   bloqueada ainda não tem modo. */
 function modeTag(mode) {
-  const col = MODE_COLOR[mode];
-  return `<span class="mode-tag" style="color:${col};background:${col === "var(--cyan)" ? "rgba(45,226,230,.12)" : "rgba(214,40,57,.12)"};border-color:${col}">${MODE_LABEL[mode]}</span>`;
+  const col = modeColor(mode);
+  return `<span class="mode-tag" style="color:${col};background:${tint(col, .12)};border-color:${col}">${modeIcon(mode)} ${esc(modeLabel(mode))}</span>`;
 }
 
+/* Marcadores na lateral: quantas conquistas você já tem em cada modo. Aceso
+   quando há pelo menos uma; cheio quando o modo está completo (Mastery). */
 function modeDots(modes) {
   return `<div class="mode-dots">` + Object.entries(modes).map(([k, v]) => {
-    const done = v.earned >= v.total && v.total > 0;
-    const col = MODE_COLOR[k];
-    return `<span class="mode-dot" style="border-color:${done ? col : C_LINE};background:${done ? (col === "var(--cyan)" ? "rgba(45,226,230,.1)" : "rgba(214,40,57,.1)") : "transparent"}">
-      <span class="pip" style="background:${done ? col : C_LOCKED}"></span>
-      <span class="lbl" style="color:${done ? col : "var(--text-low)"}">${k[0].toUpperCase()}</span>
+    const full = v.total > 0 && v.earned >= v.total;
+    const lit = v.earned > 0;
+    const col = modeColor(k);
+    return `<span class="mode-dot" title="${esc(modeLabel(k))} ${v.earned}/${v.total}"
+      style="border-color:${full ? col : lit ? tint(col, .45) : C_LINE};background:${lit ? tint(col, .1) : "transparent"}">
+      <span class="pip" style="background:${lit ? col : C_LOCKED}"></span>
+      <span class="lbl" style="color:${lit ? col : "var(--text-low)"}">${modeIcon(k)}${v.earned}</span>
     </span>`;
   }).join("") + `</div>`;
 }
 
-const totals = (modes) => {
-  const t = Object.values(modes).reduce((s, m) => s + m.total, 0);
-  const e = Object.values(modes).reduce((s, m) => s + m.earned, 0);
+/* Total do jogo. Vem do bloco `mastery`: somar os modos daria o dobro, porque
+   hardcore e softcore têm o mesmo denominador (toda conquista conta nos dois). */
+const totals = (g) => {
+  const m = (g && g.mastery) || {};
+  const t = m.total || 0, e = m.earned || 0;
   return { t, e, pct: t ? Math.round((e / t) * 100) : 0 };
 };
+/* Concluído = Mastery, isto é, 100% em hardcore. */
+const isMastered = (g) => !!(g && g.mastery && g.mastery.complete);
 const initials = (title) => title.split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase();
 
 /* ============================== SETUP VIEW =============================== */
@@ -173,7 +267,7 @@ async function enterDashboard() {
   S.view = "dashboard";
   S.library = await backend.library();
   if (!S.activeSlug && S.library.length) S.activeSlug = S.library[0].slug;
-  await renderDashboard();
+  await renderDashboard({ force: true });
   startPolling();
 }
 
@@ -184,13 +278,61 @@ function startPolling() {
     try {
       S.library = await backend.library();
       await renderDashboard();
+      await checkAutoImported();
     } catch (_) {}
   }, 5000);
 }
+
+/* Avisa quando a importação automática trouxe jogos novos — eles simplesmente
+   aparecem na lateral, então sem o aviso a mudança passaria despercebida. */
+async function checkAutoImported() {
+  if (S.mode === "demo") return;
+  const st = await backend.bulkStatus();
+  const novos = st.auto_imported || [];
+  if (novos.length) {
+    const nomes = novos.map((slug) => {
+      const g = S.library.find((x) => x.slug === slug);
+      return g ? g.title : slug;
+    });
+    toast(nomes.length === 1
+      ? `Jogo novo importado: ${nomes[0]}`
+      : `${nomes.length} jogos novos importados: ${nomes.slice(0, 2).join(", ")}${nomes.length > 2 ? "…" : ""}`);
+    S.library = await backend.library();
+    await renderDashboard({ force: true });
+  }
+}
 function stopPolling() { if (S.poll) { clearInterval(S.poll); S.poll = null; } }
 
-async function renderDashboard() {
+/* Guarda/restaura o scroll dos painéis roláveis (marcados com data-scroll).
+   Sem isso, todo redesenho joga a lista de conquistas de volta ao topo. */
+function captureScroll() {
+  const map = {};
+  root.querySelectorAll("[data-scroll]").forEach((el) => { map[el.dataset.scroll] = el.scrollTop; });
+  return map;
+}
+function restoreScroll(map) {
+  root.querySelectorAll("[data-scroll]").forEach((el) => {
+    const y = map[el.dataset.scroll];
+    if (y) el.scrollTop = y;
+  });
+}
+
+/* O polling roda a cada 5s, mas o conteúdo muda raramente. Redesenhamos só
+   quando a assinatura (estado de UI + dados) muda de fato — assim a leitura da
+   lista não é interrompida. `force` para transições de tela. */
+async function renderDashboard({ force = false } = {}) {
   const game = S.activeSlug ? await backend.game(S.activeSlug) : null;
+  const sig = JSON.stringify([S.mode, S.compact, S.tab, S.activeSlug, S.library, game]);
+  if (!force && sig === S.sig) return;
+  S.sig = sig;
+
+  // Só faz sentido preservar o scroll se continuamos na MESMA tela; ao trocar
+  // de jogo ou de aba o conteúdo é outro e deve começar do topo.
+  const screenKey = `${S.compact}|${S.tab}|${S.activeSlug}`;
+  const sameScreen = screenKey === S.screenKey;
+  S.screenKey = screenKey;
+
+  const scroll = captureScroll();
   document.getElementById("app").classList.toggle("compact", S.compact);
   if (S.compact) {
     root.innerHTML = compactHTML(game);
@@ -199,6 +341,7 @@ async function renderDashboard() {
     root.innerHTML = `${sidebarHTML()}${mainHTML(game)}`;
     bindSidebar();
   }
+  if (sameScreen) restoreScroll(scroll);
   $("#sync-tag").textContent = S.mode === "demo" ? "DEMO" : "● SYNC 30s";
 }
 
@@ -209,7 +352,7 @@ function compactHTML(game) {
   if (!game) {
     return `<div class="cw-empty">Nenhum jogo selecionado.<br>Volte ao modo completo para adicionar um.</div>`;
   }
-  const { t, e, pct } = totals(game.modes);
+  const { t, e, pct } = totals(game);
   const le = game.last_earned;
   const nextId = (game.next_ids || [])[0];
   const nextAch = nextId != null ? game.achievements.find((a) => a.id === nextId) : null;
@@ -238,6 +381,8 @@ function compactHTML(game) {
     <div class="cw-top">
       <span class="cw-top-label">PROGRESSO DO JOGO</span>
       <span class="cw-pills">
+        <span class="cw-pill" title="Hardcore — conta para o Mastery"
+          style="color:${MODE_COLOR.hardcore};border-color:${tint(MODE_COLOR.hardcore, .5)}">⚡${(game.mastery || {}).hardcore || 0}</span>
         <span class="cw-pill">${e} / ${t}</span>
         <span class="cw-pill" style="color:${game.accent};border-color:${game.accent}">${pct}%</span>
       </span>
@@ -263,11 +408,10 @@ function switchCompactGame(dir) {
 }
 
 function sidebarHTML() {
-  const isDone = (g) => Object.values(g.modes).every((m) => m.total > 0 && m.earned >= m.total);
-  const done = S.library.filter(isDone);
-  const prog = S.library.filter((g) => !isDone(g));
+  const done = S.library.filter(isMastered);
+  const prog = S.library.filter((g) => !isMastered(g));
   const tile = (g) => {
-    const { pct } = totals(g.modes);
+    const { pct } = totals(g);
     const active = g.slug === S.activeSlug;
     const core = g.icon
       ? `<div class="ring-core" style="background-image:url('${esc(g.icon)}');background-size:cover;background-position:center"></div>`
@@ -288,13 +432,14 @@ function sidebarHTML() {
       <h2>BIBLIOTECA</h2>
       <p>${S.library.length} ${S.library.length === 1 ? "jogo" : "jogos"} no ecossistema</p>
     </div>
-    <div class="sidebar-list">
-      ${done.length ? `<p class="section-label done">✓ CONCLUÍDOS</p>${done.map(tile).join("")}<div style="height:8px"></div>` : ""}
+    <div class="sidebar-list" data-scroll="sidebar">
+      ${done.length ? `<p class="section-label done">★ MASTERY</p>${done.map(tile).join("")}<div style="height:8px"></div>` : ""}
       <p class="section-label progress">◎ EM PROGRESSO</p>
       ${prog.length ? prog.map(tile).join("") : `<p style="color:var(--text-low);font-size:11px;padding:4px">Nenhum jogo ainda.</p>`}
     </div>
     <div class="sidebar-foot">
       <button class="add-btn" id="btn-add">＋ Adicionar Jogo</button>
+      <button class="import-btn" id="btn-import-all" title="Trazer de uma vez todos os jogos em que você já tem conquistas">⤓ Importar meus jogos</button>
     </div>
   </aside>`;
 }
@@ -306,11 +451,12 @@ function mainHTML(game) {
       <p>Use "Adicionar Jogo" para importar seu primeiro título da RetroAchievements.</p>
     </div></main>`;
   }
-  const { t, e, pct } = totals(game.modes);
+  const { t, e, pct } = totals(game);
   const le = game.last_earned;
   const tips = (game.guide || []).length;
+  const mst = game.mastery || {};
 
-  return `<main class="main">
+  return `<main class="main" data-scroll="main">
     <div class="panel-head" style="background:linear-gradient(180deg, ${game.accent}14, transparent)">
       <div class="head-top">
         <div class="head-ring">${ring(pct, 72, 5, game.accent)}${game.icon ? `<div class="head-icon" style="background-image:url('${esc(game.icon)}')"></div>` : `<span class="ico">🎮</span>`}</div>
@@ -334,11 +480,66 @@ function mainHTML(game) {
       </div>` : ""}
       <div class="panel-tabs">
         <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk" style="--tab-accent:${game.accent}">⛳ WALKTHROUGH</button>
+        <button class="ptab ${S.tab === "mastery" ? "active" : ""}" data-tab="mastery" style="--tab-accent:${game.accent}">⚡ MASTERY${mst.softcore_only ? ` · ${mst.softcore_only}` : ""}</button>
         <button class="ptab ${S.tab === "tips" ? "active" : ""}" data-tab="tips" style="--tab-accent:${game.accent}">📖 DICAS & TUTORIAIS${tips ? ` · ${tips}` : ""}</button>
       </div>
     </div>
-    ${S.tab === "tips" ? guideHTML(game) : walkHTML(game)}
+    ${S.tab === "tips" ? guideHTML(game) : S.tab === "mastery" ? masteryHTML(game) : walkHTML(game)}
   </main>`;
+}
+
+/* ============================ ABA MASTERY ============================== */
+/* O Mastery da RetroAchievements exige 100% em hardcore — savestate, rewind e
+   cheat desqualificam o desbloqueio. Esta aba mostra o quanto falta e, mais
+   útil, QUAIS conquistas você tem só em softcore e precisaria refazer. */
+function masteryHTML(game) {
+  const m = game.mastery || {};
+  const total = m.total || 0;
+  const bar = (label, value, color, extra = "") => {
+    const pct = total ? Math.round((value / total) * 100) : 0;
+    return `<div class="ms-row">
+      <div class="ms-row-head">
+        <span class="ms-label">${label}</span>
+        <span class="ms-num" style="color:${color}">${value}/${total} · ${pct}%</span>
+      </div>
+      <div class="ms-bar"><div class="ms-fill" style="width:${pct}%;background:${color}"></div></div>
+      ${extra ? `<p class="ms-note">${extra}</p>` : ""}
+    </div>`;
+  };
+
+  const softIds = new Set(m.softcore_ids || []);
+  const softRows = (game.achievements || []).filter((a) => softIds.has(a.id));
+  const badge = (a) => a.badge_url
+    ? `<div class="ach-badge soft" style="background-image:url('${esc(a.badge_url)}')"></div>`
+    : `<div class="ach-badge soft">🏆</div>`;
+
+  const header = m.complete
+    ? `<div class="ms-done">★ MASTERY COMPLETO — ${total}/${total} em hardcore</div>`
+    : `<div class="ms-remaining">FALTAM <b>${m.remaining || 0}</b> ${(m.remaining === 1) ? "CONQUISTA" : "CONQUISTAS"} PARA O MASTERY</div>`;
+
+  const list = softRows.length ? `
+    <p class="list-title" style="margin-top:22px">○ SÓ EM SOFTCORE (${softRows.length})</p>
+    <p class="ms-hint">Destravadas com savestate/rewind. Para o Mastery precisam ser refeitas em hardcore.</p>
+    ${softRows.map((a) => `<div class="ach-row soft">
+      ${badge(a)}
+      <div class="ach-body">
+        <div class="ach-titleline">
+          <span class="ach-name">${esc(a.name)}</span>
+          ${modeTag("softcore")}
+        </div>
+        <div class="ach-desc">${esc(a.desc)}</div>
+      </div>
+      <span class="ach-date">${esc(a.date || "")}</span>
+    </div>`).join("")}` : "";
+
+  return `<div class="list-wrap">
+    <p class="list-title">PROGRESSO DE MASTERY</p>
+    ${bar("⚡ HARDCORE", m.hardcore || 0, MODE_COLOR.hardcore)}
+    ${bar("○ SÓ EM SOFTCORE", m.softcore_only || 0, MODE_COLOR.softcore)}
+    ${header}
+    ${list}
+    ${!softRows.length && !m.complete ? `<p class="ms-hint" style="margin-top:16px">Nenhuma conquista presa em softcore — tudo o que você destravou já vale Mastery.</p>` : ""}
+  </div>`;
 }
 
 function walkHTML(game) {
@@ -360,12 +561,12 @@ function walkHTML(game) {
       <div class="ach-body">
         <div class="ach-titleline">
           <span class="ach-name">${esc(a.name)}</span>
-          ${modeTag(a.mode)}
+          ${a.earned ? modeTag(a.mode) : ""}
           ${isNext ? `<span class="next-tag">PRÓXIMO</span>` : ""}
         </div>
         <div class="ach-desc">${esc(a.desc)}</div>
       </div>
-      ${a.earned ? `<span class="ach-check">✓</span>` : ""}
+      ${a.earned ? `<span class="ach-check" style="color:${modeColor(a.mode)}">✓</span>` : ""}
     </div>`;
   }
   return `<div class="list-wrap">
@@ -377,8 +578,9 @@ function walkHTML(game) {
 /* Renderiza as seções de dicas/tutoriais extraídas do PDF do guia. */
 function guideHTML(game) {
   const secs = game.guide || [];
-  const importBtn = S.mode === "demo" ? "" :
-    `<button class="pdf-order-btn" id="guide-import">📄 ${secs.length ? "Substituir dicas (PDF)" : "Importar dicas do PDF"}</button>`;
+  const importBtn = S.mode === "demo" ? "" : `
+    <button class="pdf-order-btn gf" id="guide-gamefaqs">🌐 ${secs.length ? "Substituir pelo GameFAQs" : "Importar do GameFAQs"}</button>
+    <button class="pdf-order-btn" id="guide-import">📄 ${secs.length ? "Substituir dicas (PDF)" : "Importar dicas do PDF"}</button>`;
   if (!secs.length) {
     return `<div class="list-wrap"><p class="list-title">DICAS & TUTORIAIS</p>
       <p class="guide-empty">Nenhuma dica importada para este jogo.<br>
@@ -419,8 +621,442 @@ function bindSidebar() {
   });
   const gimport = $("#guide-import");
   if (gimport) gimport.onclick = attachGuide;
+  const gfaqs = $("#guide-gamefaqs");
+  if (gfaqs) gfaqs.onclick = () => {
+    if (S.mode === "demo") return toast("Disponível só no app real.", true);
+    const jogo = S.library.find((g) => g.slug === S.activeSlug);
+    openGameFaqs({
+      title: jogo ? jogo.title : "",
+      attachTo: S.activeSlug,
+      onDone: async (res) => {
+        toast(`${res.sections} seções de dicas importadas (conquistas intactas).`);
+        await renderDashboard({ force: true });
+      },
+    });
+  };
   const add = $("#btn-add");
   if (add) add.onclick = () => enterWizard1();
+  const imp = $("#btn-import-all");
+  if (imp) imp.onclick = () => enterImportAll();
+}
+
+/* ========================= IMPORTAR DO GAMEFAQS ========================= */
+/* Cole a URL do jogo (ou de um guia) no GameFAQs: o app lista os guias, baixa o
+   escolhido, ordena as conquistas pela ordem do texto e preenche as dicas.
+   `onDone` decide o que fazer com o resultado (wizard x dashboard). */
+function openGameFaqs({ title, onDone, attachTo = null }) {
+  S.G = { faqs: [], url: "", busy: false, error: "", step: "url", attachTo, onDone, title };
+  renderGameFaqs();
+}
+
+function closeGameFaqs() {
+  S.G = null;
+  const el = $("#gf-modal");
+  if (el) el.remove();
+}
+
+function renderGameFaqs() {
+  const G = S.G;
+  if (!G) return;
+  let el = $("#gf-modal");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "gf-modal";
+    el.className = "gf-backdrop";
+    document.body.appendChild(el);
+  }
+
+  const lista = G.faqs.map((f) => `
+    <button class="gf-faq" data-url="${esc(f.url)}">
+      <span class="gf-faq-title">${esc(f.title)}</span>
+      <span class="gf-faq-id">#${esc(f.id)}</span>
+    </button>`).join("");
+
+  el.innerHTML = `<div class="gf-panel">
+    <div class="gf-head">
+      <div>
+        <div class="gf-title">🌐 IMPORTAR DO GAMEFAQS</div>
+        <div class="gf-sub">${esc(G.title || "")}</div>
+      </div>
+      <button class="gf-close" id="gf-x">✕</button>
+    </div>
+
+    <div class="gf-body">
+      ${G.busy ? `<div class="status-msg">⏳ ${esc(G.busyMsg || "Falando com o GameFAQs…")}</div>` : ""}
+      ${G.error ? `<div class="gf-error">${esc(G.error)}</div>` : ""}
+
+      ${G.step === "url" && !G.busy ? `
+        <p class="gf-lead">Cole o endereço da aba <b>FAQs/Guides</b> do jogo — ou de um guia específico.</p>
+        <div class="search-box">
+          <span style="color:var(--text-low)">🔗</span>
+          <input id="gf-url" placeholder="https://gamefaqs.gamespot.com/ps2/580782-digimon-world-4/faqs"
+                 autocomplete="off" spellcheck="false" value="${esc(G.url)}" />
+        </div>
+        <p class="gf-note">O GameFAQs limita a velocidade de acesso: listar leva alguns segundos e baixar um guia grande pode levar um minuto.</p>
+      ` : ""}
+
+      ${G.step === "list" && !G.busy ? `
+        <p class="gf-lead">${G.faqs.length} guia${G.faqs.length === 1 ? "" : "s"} disponíve${G.faqs.length === 1 ? "l" : "is"} — escolha um:</p>
+        ${lista}
+      ` : ""}
+    </div>
+
+    <div class="gf-foot">
+      ${G.step === "list" && !G.busy
+        ? `<button class="btn-ghost" id="gf-back">← Outra URL</button>`
+        : `<span></span>`}
+      ${G.step === "url" && !G.busy
+        ? `<button class="btn-primary gold" id="gf-go">Listar guias →</button>`
+        : `<span></span>`}
+    </div>
+  </div>`;
+
+  $("#gf-x").onclick = closeGameFaqs;
+  const go = $("#gf-go");
+  if (go) go.onclick = gfListar;
+  const back = $("#gf-back");
+  if (back) back.onclick = () => { G.step = "url"; G.faqs = []; renderGameFaqs(); };
+  const input = $("#gf-url");
+  if (input) {
+    input.focus();
+    input.onkeydown = (e) => { if (e.key === "Enter") gfListar(); };
+  }
+  el.querySelectorAll(".gf-faq").forEach((b) => {
+    b.onclick = () => gfBaixar(b.dataset.url);
+  });
+}
+
+async function gfListar() {
+  const G = S.G;
+  G.url = ($("#gf-url")?.value || "").trim();
+  if (!G.url) return;
+  G.busy = true; G.busyMsg = "Procurando os guias…"; G.error = "";
+  renderGameFaqs();
+  try {
+    const res = await backend.gamefaqsList(G.url);
+    G.busy = false;
+    if (!res.ok) { G.error = res.error || "Não consegui listar os guias."; }
+    else { G.faqs = res.faqs || []; G.step = "list"; }
+  } catch (e) {
+    G.busy = false;
+    G.error = "Erro: " + e;
+  }
+  renderGameFaqs();
+}
+
+async function gfBaixar(url) {
+  const G = S.G;
+  G.busy = true;
+  G.busyMsg = "Baixando o guia… isso pode levar um minuto.";
+  G.error = "";
+  renderGameFaqs();
+  try {
+    const res = G.attachTo
+      ? await backend.gamefaqsAttach(G.attachTo, url)
+      : await backend.gamefaqsImport(url);
+    G.busy = false;
+    if (!res.ok) { G.error = res.error || "Falha ao baixar o guia."; renderGameFaqs(); return; }
+    closeGameFaqs();
+    G.onDone(res);
+  } catch (e) {
+    G.busy = false;
+    G.error = "Erro: " + e;
+    renderGameFaqs();
+  }
+}
+
+/* Refina o guia recém-importado com a IA (opcional, custa por uso). */
+async function refinarComIa() {
+  if (!S.aiReady) return pedirChaveIa();
+  const btn = $("#wiz-ai");
+  if (btn) { btn.disabled = true; btn.textContent = "✨ Refinando com IA…"; }
+  try {
+    const res = await backend.refineGuideAi();
+    if (!res.ok) return toast(res.error || "Falha ao refinar.", true);
+    S.W.guide = res.guide || [];
+    applyPdfOrder(res.ordered_ids || []);
+    toast(`IA reordenou ${res.matched_by_name}/${res.total} conquistas · ${(res.guide || []).length} seções de dicas.`);
+  } catch (e) {
+    toast("Erro ao refinar: " + e, true);
+  } finally {
+    const b = $("#wiz-ai");
+    if (b) { b.disabled = false; b.textContent = "✨ Refinar com IA"; }
+  }
+}
+
+/* ---- Configuração do provedor de IA (Claude, Gemini, OpenAI-compatível) ---- */
+async function pedirChaveIa() {
+  const cfg = await backend.getAiConfig();
+  if (!cfg || !cfg.ok) return toast("Configuração de IA indisponível.", true);
+  S.AI = cfg;
+  renderAiConfig();
+}
+
+function renderAiConfig() {
+  const cfg = S.AI;
+  let el = $("#ai-modal");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "ai-modal";
+    el.className = "gf-backdrop";
+    document.body.appendChild(el);
+  }
+  const atual = cfg.providers.find((p) => p.id === cfg.provider) || cfg.providers[0];
+
+  el.innerHTML = `<div class="gf-panel">
+    <div class="gf-head">
+      <div>
+        <div class="gf-title">✨ REFINAR GUIA COM IA</div>
+        <div class="gf-sub">opcional · cobrado pelo provedor que você escolher</div>
+      </div>
+      <button class="gf-close" id="ai-x">✕</button>
+    </div>
+    <div class="gf-body">
+      <div class="field">
+        <label>Provedor</label>
+        <div class="ai-providers">
+          ${cfg.providers.map((p) => `
+            <button class="ai-prov ${p.id === cfg.provider ? "on" : ""}" data-prov="${esc(p.id)}">
+              <span class="ai-prov-name">${esc(p.label)}</span>
+              ${p.has_key ? `<span class="ai-prov-ok">✓ chave salva</span>` : ""}
+            </button>`).join("")}
+        </div>
+      </div>
+      <div class="field">
+        <label>API key ${atual.has_key ? "(já salva — deixe em branco para manter)" : ""}</label>
+        <input id="ai-key" type="password" autocomplete="off" spellcheck="false"
+               placeholder="${atual.has_key ? "••••••••••••" : "cole a chave aqui"}" />
+        <p class="hint">Fica só em <code>config/secrets.json</code>, nesta máquina. Obter em
+          <span class="ai-link">${esc(atual.key_url || "")}</span></p>
+      </div>
+      <div class="field">
+        <label>Modelo (opcional)</label>
+        <input id="ai-model" autocomplete="off" spellcheck="false"
+               value="${esc(cfg.model || "")}" placeholder="${esc(atual.default_model)}" />
+      </div>
+      ${atual.needs_base_url ? `
+      <div class="field">
+        <label>Endpoint (para OpenRouter, Ollama, LM Studio…)</label>
+        <input id="ai-base" autocomplete="off" spellcheck="false"
+               value="${esc(cfg.base_url || "")}" placeholder="${esc(atual.default_base_url || "")}" />
+      </div>` : ""}
+    </div>
+    <div class="gf-foot">
+      <button class="btn-ghost" id="ai-clear">Remover chave</button>
+      <button class="btn-primary gold" id="ai-save">Salvar</button>
+    </div>
+  </div>`;
+
+  $("#ai-x").onclick = () => el.remove();
+  el.querySelectorAll(".ai-prov").forEach((b) => {
+    b.onclick = () => { S.AI.provider = b.dataset.prov; S.AI.model = ""; renderAiConfig(); };
+  });
+  $("#ai-save").onclick = () => salvarAiConfig(null);
+  $("#ai-clear").onclick = () => salvarAiConfig("");
+}
+
+async function salvarAiConfig(forcarChave) {
+  const el = $("#ai-modal");
+  const digitada = ($("#ai-key")?.value || "").trim();
+  // null = mantém a chave salva; "" = apaga
+  const api_key = forcarChave !== null ? forcarChave : (digitada || null);
+  const res = await backend.setAiConfig({
+    provider: S.AI.provider,
+    api_key,
+    model: ($("#ai-model")?.value || "").trim(),
+    base_url: ($("#ai-base")?.value || "").trim(),
+  });
+  if (!res || !res.ok) return toast("Não foi possível salvar.", true);
+  S.aiReady = !!res.ai_ready;
+  if (el) el.remove();
+  toast(S.aiReady
+    ? `IA pronta via ${res.providers.find((p) => p.id === res.provider).label}.`
+    : "Chave removida — o refino por IA fica desligado.");
+  if (S.view === "wizard2") renderWizard2();
+}
+
+/* ====================== IMPORTAR BIBLIOTECA (LOTE) ====================== */
+/* Traz de uma vez todos os jogos em que você já tem conquistas na RA, em vez de
+   cadastrar um a um pelo wizard. Cada jogo entra na ordem nativa do RA. */
+async function enterImportAll() {
+  S.view = "importAll";
+  stopPolling();
+  S.I = { games: [], sel: new Set(), loading: true, error: "" };
+  renderImportAll();
+
+  try {
+    const res = await backend.playedGames();
+    S.I.loading = false;
+    if (!res.ok) S.I.error = res.error || "Não foi possível listar seus jogos.";
+    else {
+      S.I.games = res.games || [];
+      // pré-seleciona o que ainda não está na biblioteca
+      S.I.games.forEach((g) => { if (!g.imported) S.I.sel.add(g.id); });
+    }
+  } catch (e) {
+    S.I.loading = false;
+    S.I.error = "Erro ao consultar a RetroAchievements: " + e;
+  }
+  renderImportAll();
+}
+
+const AWARD_LABEL = {
+  "mastered": "★ MASTERY",
+  "completed": "✓ 100% SOFTCORE",
+  "beaten-hardcore": "⚡ ZERADO HARDCORE",
+  "beaten-softcore": "○ ZERADO SOFTCORE",
+};
+
+function renderImportAll() {
+  const I = S.I;
+  const body = I.loading
+    ? `<div class="status-msg">⏳ Consultando seus jogos na RetroAchievements…</div>`
+    : I.error
+      ? `<div class="status-msg">${esc(I.error)}</div>`
+      : I.games.length
+        ? importListHTML(I)
+        : `<div class="status-msg">Nenhum jogo com conquistas encontrado nesta conta.</div>`;
+
+  const selCount = I.sel.size;
+  root.innerHTML = `<div class="view">
+    <div class="wiz-head">
+      <button class="back" id="imp-back">←</button>
+      <div><div class="t">IMPORTAR MEUS JOGOS</div><div class="s">TUDO QUE VOCÊ JÁ COMEÇOU NA RETROACHIEVEMENTS</div></div>
+    </div>
+    <div class="wiz-body">${body}</div>
+    <div class="wiz-foot">
+      <button class="btn-ghost" id="imp-back2">← Voltar</button>
+      <label class="auto-toggle" title="Verifica a cada 5 minutos e traz sozinho os jogos que você começar">
+        <input type="checkbox" id="imp-auto" ${S.autoImport ? "checked" : ""} />
+        <span>Importar jogos novos automaticamente</span>
+      </label>
+      <label class="auto-toggle" title="Ao abrir um emulador, vira overlay e gruda no canto da janela dele">
+        <input type="checkbox" id="imp-overlay" ${S.autoOverlay ? "checked" : ""} />
+        <span>Grudar no emulador automaticamente</span>
+      </label>
+      <span class="imp-count">${selCount} selecionado${selCount === 1 ? "" : "s"}</span>
+      <button class="btn-primary gold" id="imp-go" ${selCount ? "" : "disabled"}>⤓ Importar ${selCount || ""}</button>
+    </div>
+  </div>`;
+
+  $("#imp-back").onclick = enterDashboard;
+  $("#imp-back2").onclick = enterDashboard;
+  $("#imp-go").onclick = runBulkImport;
+  $("#imp-auto").onchange = async (e) => {
+    S.autoImport = e.target.checked;
+    await backend.setAutoImport(S.autoImport);
+    toast(S.autoImport
+      ? "Jogos novos passarão a entrar sozinhos."
+      : "Importação automática desligada.");
+  };
+  $("#imp-overlay").onchange = async (e) => {
+    S.autoOverlay = e.target.checked;
+    await backend.setAutoOverlay(S.autoOverlay);
+    toast(S.autoOverlay
+      ? "O app vai grudar no emulador quando ele abrir."
+      : "Overlay automático desligado.");
+  };
+  $("#imp-all")?.addEventListener("click", () => {
+    const livres = I.games.filter((g) => !g.imported);
+    const todos = livres.every((g) => I.sel.has(g.id));
+    livres.forEach((g) => todos ? I.sel.delete(g.id) : I.sel.add(g.id));
+    renderImportAll();
+  });
+  root.querySelectorAll("[data-gid]").forEach((el) => {
+    el.onclick = () => {
+      const id = +el.dataset.gid;
+      if (I.sel.has(id)) I.sel.delete(id); else I.sel.add(id);
+      renderImportAll();
+    };
+  });
+}
+
+function importListHTML(I) {
+  const novos = I.games.filter((g) => !g.imported).length;
+  const row = (g) => {
+    const on = I.sel.has(g.id);
+    const pct = g.total ? Math.round((g.earned / g.total) * 100) : 0;
+    const award = AWARD_LABEL[g.award] || "";
+    return `<button class="imp-row ${on ? "on" : ""} ${g.imported ? "already" : ""}"
+        ${g.imported ? "" : `data-gid="${g.id}"`}>
+      <span class="imp-check">${g.imported ? "✓" : on ? "☑" : "☐"}</span>
+      <span class="imp-info">
+        <span class="imp-title">${esc(g.title)}</span>
+        <span class="imp-sub">${esc(g.console)} · ${g.earned}/${g.total} · ${pct}%${award ? ` · ${award}` : ""}</span>
+      </span>
+      <span class="imp-modes">
+        ${g.hardcore ? `<span class="imp-pill" style="color:${MODE_COLOR.hardcore};border-color:${tint(MODE_COLOR.hardcore, .5)}">⚡${g.hardcore}</span>` : ""}
+        ${g.softcore_only ? `<span class="imp-pill" style="color:${MODE_COLOR.softcore};border-color:${tint(MODE_COLOR.softcore, .5)}">○${g.softcore_only}</span>` : ""}
+      </span>
+      ${g.imported ? `<span class="imp-already">JÁ NA BIBLIOTECA</span>` : ""}
+    </button>`;
+  };
+  return `
+    <div class="imp-head">
+      <p class="imp-lead">${I.games.length} jogo${I.games.length === 1 ? "" : "s"} com conquistas nesta conta${novos ? ` · ${novos} fora da biblioteca` : " · todos já importados"}.</p>
+      ${novos ? `<button class="pdf-order-btn ghost" id="imp-all">Marcar/desmarcar todos</button>` : ""}
+    </div>
+    <p class="imp-note">Cada jogo entra com as conquistas na ordem nativa do RetroAchievements — a mesma coisa que o wizard faria. Dá para reordenar depois pelo PDF do guia.</p>
+    ${I.games.map(row).join("")}`;
+}
+
+async function runBulkImport() {
+  const ids = [...S.I.sel];
+  if (!ids.length) return;
+  const res = await backend.startBulkImport(ids);
+  if (!res.ok) return toast(res.error || "Não foi possível iniciar.", true);
+
+  S.view = "importRun";
+  renderImportProgress({ running: true, done: 0, total: ids.length, current: "", phase: "games", errors: [] });
+
+  const poll = setInterval(async () => {
+    let st;
+    try { st = await backend.bulkStatus(); } catch (_) { return; }
+    renderImportProgress(st);
+    if (!st.running) {
+      clearInterval(poll);
+      const n = (st.imported || []).length;
+      toast(st.errors && st.errors.length
+        ? `${n} jogo(s) importado(s), ${st.errors.length} com erro.`
+        : `${n} jogo(s) importado(s)!`, !!(st.errors && st.errors.length));
+      setTimeout(() => { S.activeSlug = null; enterDashboard(); }, 1200);
+    }
+  }, 600);
+}
+
+function renderImportProgress(st) {
+  const games = st.total ? Math.round((st.done / st.total) * 100) : 0;
+  const badges = st.badges_total ? Math.round((st.badges_done / st.badges_total) * 100) : 0;
+  const naBadges = st.phase === "badges" || st.phase === "done";
+
+  root.innerHTML = `<div class="view">
+    <div class="wiz-head">
+      <div><div class="t">IMPORTANDO…</div><div class="s">NÃO FECHE O APP</div></div>
+    </div>
+    <div class="wiz-body">
+      <div class="ms-row">
+        <div class="ms-row-head">
+          <span class="ms-label">JOGOS</span>
+          <span class="ms-num" style="color:var(--gold)">${st.done || 0}/${st.total || 0}</span>
+        </div>
+        <div class="ms-bar"><div class="ms-fill" style="width:${games}%;background:var(--gold)"></div></div>
+        ${st.current ? `<p class="ms-note">${esc(st.current)}</p>` : ""}
+      </div>
+      ${naBadges ? `<div class="ms-row">
+        <div class="ms-row-head">
+          <span class="ms-label">ÍCONES DAS CONQUISTAS</span>
+          <span class="ms-num" style="color:var(--cyan)">${st.badges_done || 0}/${st.badges_total || 0}</span>
+        </div>
+        <div class="ms-bar"><div class="ms-fill" style="width:${badges}%;background:var(--cyan)"></div></div>
+        <p class="ms-note">São centenas de arquivos pequenos — os jogos já estão utilizáveis.</p>
+      </div>` : ""}
+      ${(st.errors || []).length ? `<div class="imp-errors">
+        <p class="ms-label">ERROS</p>
+        ${st.errors.map((e) => `<p class="ms-note">${esc(e)}</p>`).join("")}
+      </div>` : ""}
+      ${!st.running ? `<div class="ms-done">✓ IMPORTAÇÃO CONCLUÍDA</div>` : ""}
+    </div>
+  </div>`;
 }
 
 /* ============================== WIZARD ================================= */
@@ -525,20 +1161,11 @@ function renderWizard2() {
   const assigned = assignedSet();
   const unsorted = W.order.filter((id) => !assigned.has(id));
 
-  const modeToggle = (id) => {
-    const m = W.items[id].mode;
-    return `<div class="mode-toggle" data-id="${id}">
-      <button class="${m === "normal" ? "on-normal" : ""}" data-mode="normal" draggable="false">N</button>
-      <button class="${m === "hard" ? "on-hard" : ""}" data-mode="hard" draggable="false">H</button>
-    </div>`;
-  };
-
   const item = (id, inStep) => {
     const a = W.items[id];
     return `<div class="dnd-item" draggable="true" data-id="${id}">
       <span class="grip" title="Arraste">⠿</span>
       <span class="nm" title="${esc(a.title)}">${esc(a.title)}</span>
-      ${modeToggle(id)}
       ${inStep ? `<button class="mini-btn rm" data-remove="${id}" title="Remover da etapa" draggable="false">×</button>` : ""}
     </div>`;
   };
@@ -563,12 +1190,15 @@ function renderWizard2() {
   root.innerHTML = `<div class="view">
     ${wizHeadHTML(2)}
     <div class="wiz-body">
-      <p style="color:var(--text-mid);font-size:12px;margin-bottom:4px"><b style="color:var(--text-hi)">${esc(W.title)}</b> — as conquistas já vêm na <b style="color:var(--cyan)">ordem do RetroAchievements</b> e os modos N/H foram inferidos. É só <b style="color:var(--gold)">Salvar</b>.</p>
-      <p style="color:var(--text-low);font-size:10.5px;margin-bottom:12px">Quer ajustar? Arraste para reordenar, troque N/H, ou use "Ordenar pelo PDF do guia" abaixo (também traz as dicas/tutoriais).</p>
+      <p style="color:var(--text-mid);font-size:12px;margin-bottom:4px"><b style="color:var(--text-hi)">${esc(W.title)}</b> — as conquistas já vêm na <b style="color:var(--cyan)">ordem do RetroAchievements</b>. É só <b style="color:var(--gold)">Salvar</b>.</p>
+      <p style="color:var(--text-low);font-size:10.5px;margin-bottom:12px">Quer ajustar? Arraste para reordenar, ou use "Ordenar pelo PDF do guia" abaixo (também traz as dicas/tutoriais). Softcore/hardcore vem da RetroAchievements — nada para marcar aqui.</p>
       <div class="pdf-order-row">
+        <button class="pdf-order-btn gf" id="wiz-gamefaqs">🌐 Importar do GameFAQs</button>
         <button class="pdf-order-btn" id="pdf-order">📄 Ordenar pelo PDF do guia</button>
         <button class="pdf-order-btn ghost" id="pdf-tips">📖 Só as dicas (não reordena)</button>
-        <span class="pdf-order-hint">Ordene as conquistas pelo guia, ou importe apenas as dicas/tutoriais sem alterar as conquistas.</span>
+        ${S.W.guide && S.W.guide.length ? `<button class="pdf-order-btn ai" id="wiz-ai">✨ Refinar com IA</button>` : ""}
+        <button class="pdf-order-btn ghost" id="wiz-ai-cfg" title="Escolher provedor de IA (Claude, Gemini, OpenAI…)">⚙</button>
+        <span class="pdf-order-hint">Cole a URL do guia no GameFAQs e o app baixa, ordena as conquistas e traz as dicas — sem precisar montar PDF.</span>
       </div>
       <div class="wiz2-cols">
         <div class="wiz2-col dropzone" data-zone="unsorted">
@@ -628,13 +1258,6 @@ function bindWizard2() {
   $("#wiz-back").onclick = enterWizard1;
   $("#new-step").onclick = () => { W.steps.push({ area: "", ids: [] }); renderWizard2(); };
 
-  // toggles de modo (não devem disparar drag)
-  root.querySelectorAll(".mode-toggle").forEach((tg) => {
-    tg.querySelectorAll("button").forEach((b) => b.onclick = (e) => {
-      e.stopPropagation();
-      W.items[tg.dataset.id].mode = b.dataset.mode; renderWizard2();
-    });
-  });
   // remover da etapa (botão ×)
   root.querySelectorAll("[data-remove]").forEach((b) => b.onclick = (e) => {
     e.stopPropagation();
@@ -687,6 +1310,26 @@ function bindWizard2() {
   // ordenar pelo PDF do guia / importar só as dicas
   $("#pdf-order").onclick = orderByPdf;
   $("#pdf-tips").onclick = tipsOnlyPdf;
+  // importar direto do GameFAQs (sem PDF) e refinar com IA
+  $("#wiz-gamefaqs").onclick = () => {
+    if (S.mode === "demo") return toast("Disponível só no app real.", true);
+    openGameFaqs({
+      title: S.W.title,
+      onDone: (res) => {
+        S.W.guide = res.guide || [];
+        applyPdfOrder(res.ordered_ids || []);
+        const achadas = res.matched_by_name != null ? res.matched_by_name : res.found;
+        toast(`${achadas}/${res.total} conquistas posicionadas pelo guia · ${(res.guide || []).length} seções de dicas.`);
+      },
+    });
+  };
+  const ai = $("#wiz-ai");
+  if (ai) ai.onclick = refinarComIa;
+  const aiCfg = $("#wiz-ai-cfg");
+  if (aiCfg) aiCfg.onclick = () => {
+    if (S.mode === "demo") return toast("Disponível só no app real.", true);
+    pedirChaveIa();
+  };
   // salvar
   $("#wiz-save").onclick = saveWizard;
 }
@@ -728,7 +1371,7 @@ function orderByPdf() {
       if (!res || !res.ok) return toast((res && res.error) || "Falha ao analisar o PDF.", true);
 
       S.W.guide = res.guide || [];                          // guarda dicas/tutoriais p/ salvar
-      applyPdfOrder(res.ordered_ids || [], res.modes || {});// ordem + modos; re-renderiza
+      applyPdfOrder(res.ordered_ids || []);                 // ordem do guia; re-renderiza
 
       const matched = res.matched_by_name != null ? res.matched_by_name : res.found;
       const unplaced = (res.total || 0) - (res.found || 0);
@@ -736,7 +1379,7 @@ function orderByPdf() {
       if (res.found === 0)
         toast("Nenhuma conquista do jogo foi reconhecida no guia. Confira se o PDF é deste jogo.", true);
       else
-        toast(`${matched}/${res.total} conquistas reconhecidas · modos N/H aplicados · ${tips} seções de dicas${unplaced ? ` · ${unplaced} no pool` : ""}.`);
+        toast(`${matched}/${res.total} conquistas reconhecidas · ${tips} seções de dicas${unplaced ? ` · ${unplaced} no pool` : ""}.`);
     } catch (e) {
       toast("Erro ao analisar o PDF: " + e, true);
     } finally {
@@ -778,7 +1421,7 @@ function attachGuide() {
     const res = await backend.attachGuidePdf(slug, b64, name);
     if (!res || !res.ok) return toast((res && res.error) || "Falha ao importar as dicas.", true);
     toast(`${res.sections} seções de dicas importadas (troféus intactos).`);
-    await renderDashboard();
+    await renderDashboard({ force: true });
   });
 }
 
@@ -793,14 +1436,13 @@ function fileToBase64(file) {
 }
 
 /* Aplica a ordem vinda do PDF SEM perder conquistas: as casadas vêm primeiro,
-   na ordem do guia (com o modo N/H sugerido), e as demais seguem logo abaixo
-   na ordem atual (RetroAchievements). */
-function applyPdfOrder(orderedIds, modes) {
+   na ordem do guia, e as demais seguem logo abaixo na ordem atual
+   (RetroAchievements). */
+function applyPdfOrder(orderedIds) {
   const W = S.W;
   const matched = orderedIds.filter((id) => W.items[id]);
   const seen = new Set(matched);
   const rest = W.order.filter((id) => !seen.has(id));   // mantém o restante (ordem RA)
-  if (modes) matched.forEach((id) => { if (modes[id]) W.items[id].mode = modes[id]; });
   W.steps = [{ area: "Ordem do guia (PDF)", ids: matched.concat(rest) }];
   renderWizard2();
 }
@@ -811,7 +1453,7 @@ async function saveWizard() {
     .map((st, i) => ({
       step: i + 1,
       area: st.area || `Etapa ${i + 1}`,
-      achievements: st.ids.map((id) => ({ id, mode: W.items[id].mode })),
+      achievements: st.ids.map((id) => ({ id })),
     }))
     .filter((st) => st.achievements.length > 0);
 
@@ -875,6 +1517,9 @@ async function boot() {
   }
   try {
     const st = await backend.appState();
+    if (st.auto_import !== undefined) S.autoImport = st.auto_import;
+    if (st.auto_overlay !== undefined) S.autoOverlay = st.auto_overlay;
+    if (st.ai_ready !== undefined) S.aiReady = st.ai_ready;
     if (S.mode === "real" && !st.configured) renderSetup();
     else enterDashboard();
   } catch (e) {
@@ -900,9 +1545,20 @@ window.addEventListener("DOMContentLoaded", () => {
 
 /* ============================ DADOS DEMO ============================== */
 function DEMO_LIB() {
-  return DEMO.map((g) => ({ slug: g.slug, title: g.title, platform: g.platform, accent: g.accent, modes: g.modes, icon: g.icon || "" }));
+  return DEMO.map((g) => ({
+    slug: g.slug, title: g.title, platform: g.platform, accent: g.accent,
+    modes: g.modes, mastery: g.mastery, icon: g.icon || "",
+  }));
 }
 function DEMO_GAME(slug) { return DEMO.find((g) => g.slug === slug) || null; }
+function DEMO_PLAYED() {
+  return [
+    { id: 1, title: "Digimon World", console: "PlayStation", total: 219, earned: 219, hardcore: 0, softcore_only: 219, award: "completed", imported: false },
+    { id: 2, title: "Digimon World 2003", console: "PlayStation", total: 137, earned: 137, hardcore: 0, softcore_only: 137, award: "completed", imported: false },
+    { id: 3, title: "Digimon World 4", console: "GameCube", total: 108, earned: 55, hardcore: 55, softcore_only: 0, award: "beaten-hardcore", imported: true },
+    { id: 4, title: "Digimon: Digital Card Battle", console: "PlayStation", total: 115, earned: 68, hardcore: 0, softcore_only: 68, award: "beaten-softcore", imported: false },
+  ];
+}
 function DEMO_SEARCH() {
   return [
     { id: "survive", title: "Digimon Survive", console: "PlayStation 4", count: 64 },
@@ -914,11 +1570,11 @@ function DEMO_IMPORT() {
   return {
     ok: true, slug: "demo_novo", title: "Digimon Survive", platform: "PlayStation 4",
     achievements: [
-      { id: 101, title: "First Partner", desc: "Recrute seu primeiro parceiro.", badge_url: "", mode: "normal" },
-      { id: 102, title: "Jogress Evolution", desc: "Realize uma DNA digivolution.", badge_url: "", mode: "normal" },
-      { id: 103, title: "Kaiser's Fall", desc: "Derrote o chefe no modo Hard.", badge_url: "", mode: "hard" },
-      { id: 104, title: "Perfect Survivors", desc: "Termine sem perder nenhum aliado.", badge_url: "", mode: "hard" },
-      { id: 105, title: "Card Master", desc: "Colete todas as cartas.", badge_url: "", mode: "normal" },
+      { id: 101, title: "First Partner", desc: "Recrute seu primeiro parceiro.", badge_url: "" },
+      { id: 102, title: "Jogress Evolution", desc: "Realize uma DNA digivolution.", badge_url: "" },
+      { id: 103, title: "Kaiser's Fall", desc: "Derrote o chefe final.", badge_url: "" },
+      { id: 104, title: "Perfect Survivors", desc: "Termine sem perder nenhum aliado.", badge_url: "" },
+      { id: 105, title: "Card Master", desc: "Colete todas as cartas.", badge_url: "" },
     ],
   };
 }
@@ -926,16 +1582,17 @@ function DEMO_IMPORT() {
 const DEMO = [
   {
     slug: "digimon_world_4", title: "Digimon World 4", platform: "GameCube", accent: "#D62839",
-    modes: { normal: { total: 4, earned: 1 }, hard: { total: 2, earned: 0 } },
-    next_ids: [2, 3, 6],
-    last_earned: { name: "Extravagant Petals", desc: "Complete Humid Cave on Normal difficulty.", date: "04/03/2026 · 22:08" },
+    modes: { hardcore: { total: 6, earned: 1 }, softcore: { total: 6, earned: 2 } },
+    mastery: { total: 6, hardcore: 1, earned: 3, softcore_only: 2, remaining: 5, percent: 17, complete: false, softcore_ids: [2, 4] },
+    next_ids: [3, 6, 8],
+    last_earned: { name: "Ferryman's Mercy", desc: "Rescue all 10 Digi-Elves at Numenume River.", date: "04/03/2026 · 22:08" },
     achievements: [
-      { id: 1, name: "Extravagant Petals", desc: "Complete Humid Cave on Normal difficulty.", mode: "normal", earned: true, badge_url: "", step: 1, area: "Death Valley - Humid Cave" },
-      { id: 2, name: "Tusks of Ash", desc: "Defeat Mammothmon in Cliff Dungeon.", mode: "normal", earned: false, badge_url: "", step: 1, area: "Death Valley - Humid Cave" },
-      { id: 3, name: "Two Keys, One Fortress", desc: "Unlock the Goburimon Fortress with both IDs.", mode: "normal", earned: false, badge_url: "", step: 2, area: "Goburimon Fortress" },
-      { id: 4, name: "Ferryman's Mercy", desc: "Rescue all 10 Digi-Elves at Numenume River.", mode: "normal", earned: false, badge_url: "", step: 2, area: "Goburimon Fortress" },
-      { id: 6, name: "Death Valley, Twice Over", desc: "Complete Death Valley on Hard difficulty.", mode: "hard", earned: false, badge_url: "", step: 3, area: "Death Valley (Hard)" },
-      { id: 8, name: "302 and Counting", desc: "Clear Undead Yard on Hard mode.", mode: "hard", earned: false, badge_url: "", step: 3, area: "Death Valley (Hard)" },
+      { id: 1, name: "Extravagant Petals", desc: "Complete Humid Cave on Normal difficulty.", mode: "hardcore", earned: true, hardcore: true, date: "28/02/2026 · 20:11", badge_url: "", step: 1, area: "Death Valley - Humid Cave" },
+      { id: 2, name: "Tusks of Ash", desc: "Defeat Mammothmon in Cliff Dungeon.", mode: "softcore", earned: true, hardcore: false, date: "01/03/2026 · 18:40", badge_url: "", step: 1, area: "Death Valley - Humid Cave" },
+      { id: 3, name: "Two Keys, One Fortress", desc: "Unlock the Goburimon Fortress with both IDs.", mode: "softcore", earned: false, hardcore: false, date: "", badge_url: "", step: 2, area: "Goburimon Fortress" },
+      { id: 4, name: "Ferryman's Mercy", desc: "Rescue all 10 Digi-Elves at Numenume River.", mode: "softcore", earned: true, hardcore: false, date: "04/03/2026 · 22:08", badge_url: "", step: 2, area: "Goburimon Fortress" },
+      { id: 6, name: "Death Valley, Twice Over", desc: "Complete Death Valley on Hard difficulty.", mode: "softcore", earned: false, hardcore: false, date: "", badge_url: "", step: 3, area: "Death Valley (Hard)" },
+      { id: 8, name: "302 and Counting", desc: "Clear Undead Yard on Hard mode.", mode: "softcore", earned: false, hardcore: false, date: "", badge_url: "", step: 3, area: "Death Valley (Hard)" },
     ],
     guide: [
       { num: "1", title: "INTRODUÇÃO & MECÂNICAS BÁSICAS", blocks: [
@@ -960,23 +1617,25 @@ const DEMO = [
   },
   {
     slug: "digimon_world_2", title: "Digimon World 2", platform: "PlayStation", accent: "#F5C518",
-    modes: { normal: { total: 1, earned: 1 }, hard: { total: 1, earned: 1 } },
+    modes: { hardcore: { total: 2, earned: 2 }, softcore: { total: 2, earned: 0 } },
+    mastery: { total: 2, hardcore: 2, earned: 2, softcore_only: 0, remaining: 0, percent: 100, complete: true, softcore_ids: [] },
     next_ids: [],
     last_earned: { name: "Master Tamer", desc: "Complete every battle on the final set.", date: "12/02/2026 · 19:41" },
     achievements: [
-      { id: 1, name: "Digivolution Archivist", desc: "Record all DNA digivolution chains.", mode: "normal", earned: true, badge_url: "", step: 1, area: "Campanha" },
-      { id: 2, name: "Master Tamer", desc: "Complete every battle on the final set.", mode: "hard", earned: true, badge_url: "", step: 2, area: "Pós-jogo" },
+      { id: 1, name: "Digivolution Archivist", desc: "Record all DNA digivolution chains.", mode: "hardcore", earned: true, hardcore: true, date: "10/02/2026 · 21:02", badge_url: "", step: 1, area: "Campanha" },
+      { id: 2, name: "Master Tamer", desc: "Complete every battle on the final set.", mode: "hardcore", earned: true, hardcore: true, date: "12/02/2026 · 19:41", badge_url: "", step: 2, area: "Pós-jogo" },
     ],
   },
   {
     slug: "digimon_digital_card_battle", title: "Digimon Digital Card Battle", platform: "PlayStation", accent: "#2DE2E6",
-    modes: { normal: { total: 1, earned: 1 }, hard: { total: 2, earned: 0 } },
+    modes: { hardcore: { total: 3, earned: 0 }, softcore: { total: 3, earned: 1 } },
+    mastery: { total: 3, hardcore: 0, earned: 1, softcore_only: 1, remaining: 3, percent: 0, complete: false, softcore_ids: [1] },
     next_ids: [2, 3],
     last_earned: { name: "Full Deck", desc: "Collect every card in the Omega set.", date: "28/01/2026 · 21:15" },
     achievements: [
-      { id: 1, name: "Full Deck", desc: "Collect every card in the Omega set.", mode: "normal", earned: true, badge_url: "", step: 1, area: "Coleção" },
-      { id: 2, name: "Arena Veteran", desc: "Win 20 ranked duels in a row.", mode: "hard", earned: false, badge_url: "", step: 2, area: "Arena" },
-      { id: 3, name: "Black Card Hunter", desc: "Obtain all Black-rarity cards.", mode: "hard", earned: false, badge_url: "", step: 2, area: "Arena" },
+      { id: 1, name: "Full Deck", desc: "Collect every card in the Omega set.", mode: "softcore", earned: true, hardcore: false, date: "28/01/2026 · 21:15", badge_url: "", step: 1, area: "Coleção" },
+      { id: 2, name: "Arena Veteran", desc: "Win 20 ranked duels in a row.", mode: "softcore", earned: false, hardcore: false, date: "", badge_url: "", step: 2, area: "Arena" },
+      { id: 3, name: "Black Card Hunter", desc: "Obtain all Black-rarity cards.", mode: "softcore", earned: false, hardcore: false, date: "", badge_url: "", step: 2, area: "Arena" },
     ],
   },
 ];

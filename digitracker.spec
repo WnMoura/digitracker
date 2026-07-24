@@ -39,6 +39,17 @@ hiddenimports += ["clr", "clr_loader", "pythonnet", "proxy_tools"]
 # pypdf: leitura do PDF do guia (ordenar walkthrough). Garante os submódulos.
 hiddenimports += collect_submodules("pypdf")
 
+# cloudscraper resolve o desafio do Cloudflare do GameFAQs carregando
+# interpretadores de JS por nome — sem collect_all os submódulos somem do bundle.
+for pkg in ("cloudscraper", "bs4"):
+    d, b, h = collect_all(pkg)
+    datas += d
+    binaries += b
+    hiddenimports += h
+
+# anthropic: refinamento opcional do guia por IA.
+hiddenimports += collect_submodules("anthropic")
+
 
 a = Analysis(
     ["engine.py"],

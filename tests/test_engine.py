@@ -1,0 +1,444 @@
+"""Testes do engine — servidor estático e escolha de cor de destaque.
+
+Cobrem as partes de `engine.py` que dá para exercitar sem abrir janela nem
+tocar a rede.
+
+Rodar:  python -m pytest tests/ -q
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import engine  # noqa: E402
+
+
+@pytest.fixture
+def handler():
+    """`translate_path` não usa estado da conexão, então dá para exercitá-lo
+    numa instância sem socket."""
+    return engine._AssetHandler.__new__(engine._AssetHandler)
+
+
+class TestTranslatePath:
+    def test_serve_a_ui_do_bundle(self, handler):
+        assert handler.translate_path("/ui/app.js") == str(engine.BUNDLE_DIR / "ui" / "app.js")
+
+    def test_serve_assets_da_pasta_de_dados(self, handler):
+        got = handler.translate_path("/assets/badges/jogo/12345.png")
+        assert got == str(engine.DATA_DIR / "assets" / "badges" / "jogo" / "12345.png")
+
+    def test_ignora_query_e_fragmento(self, handler):
+        assert handler.translate_path("/ui/style.css?v=2#top") == str(
+            engine.BUNDLE_DIR / "ui" / "style.css"
+        )
+
+    @pytest.mark.parametrize("ataque", [
+        "/../../../../etc/passwd",
+        "/ui/../../../../etc/passwd",
+        "/assets/../../../../etc/passwd",
+        "/%2e%2e/%2e%2e/etc/passwd",
+        "/ui/%2E%2E%2F%2E%2E%2Fetc/passwd",
+        "/./../../etc/shadow",
+        "//../../etc/passwd",
+    ])
+    def test_nao_escapa_das_pastas_servidas(self, handler, ataque):
+        """Antes, `normpath` preservava os `..` iniciais e o caminho saía da
+        árvore servida — qualquer arquivo do usuário ficava legível."""
+        resolvido = Path(handler.translate_path(ataque)).resolve()
+        bases = (engine.BUNDLE_DIR.resolve(), engine.DATA_DIR.resolve())
+        assert any(resolvido == b or b in resolvido.parents for b in bases)
+
+    def test_raiz_nao_quebra(self, handler):
+        assert handler.translate_path("/") == str(engine.BUNDLE_DIR.resolve())
+
+
+class TestPickAccent:
+    @pytest.fixture(autouse=True)
+    def games_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(engine, "GAMES_DIR", tmp_path)
+        return tmp_path
+
+    @staticmethod
+    def _write(dirpath: Path, slug: str, accent: str):
+        (dirpath / f"{slug}.json").write_text(
+            json.dumps({"slug": slug, "accent": accent}), encoding="utf-8"
+        )
+
+    def test_biblioteca_vazia_devolve_cor_da_paleta(self):
+        assert engine.Api._pick_accent("digimon_world_4") in engine.ACCENTS
+
+    def test_escolhe_uma_cor_ainda_nao_usada(self, games_dir):
+        for i, cor in enumerate(engine.ACCENTS[:3]):
+            self._write(games_dir, f"jogo{i}", cor)
+        assert engine.Api._pick_accent("novo_jogo") == engine.ACCENTS[3]
+
+    def test_nao_repete_apos_remover_um_jogo(self, games_dir):
+        """Contar arquivos dava a cor errada aqui: 3 arquivos no disco fariam o
+        próximo jogo receber ACCENTS[3], que já está em uso."""
+        self._write(games_dir, "a", engine.ACCENTS[0])
+        self._write(games_dir, "b", engine.ACCENTS[1])
+        self._write(games_dir, "c", engine.ACCENTS[3])
+        assert engine.Api._pick_accent("novo_jogo") == engine.ACCENTS[2]
+
+    def test_estavel_entre_execucoes(self):
+        """Sem depender do hash aleatório do Python."""
+        primeira = engine.Api._pick_accent("digimon_survive")
+        assert all(engine.Api._pick_accent("digimon_survive") == primeira for _ in range(5))
+
+    def test_reveza_quando_todas_estao_igualmente_usadas(self, games_dir):
+        for i, cor in enumerate(engine.ACCENTS):
+            self._write(games_dir, f"jogo{i}", cor)
+        escolhas = {engine.Api._pick_accent(f"slug_{c}") for c in "abcdefghij"}
+        assert len(escolhas) > 1        # não fixa sempre a mesma cor
+
+    def test_ignora_json_corrompido(self, games_dir):
+        (games_dir / "quebrado.json").write_text("{isso não é json", encoding="utf-8")
+        assert engine.Api._pick_accent("novo") in engine.ACCENTS
+
+
+class TestSyncGameMastery:
+    """O progresso deixou de ser curadoria Normal/Hard: hardcore e softcore vêm
+    da RetroAchievements e são exclusivos entre si."""
+
+    @pytest.fixture
+    def api(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(engine, "GAMES_DIR", tmp_path / "games")
+        monkeypatch.setattr(engine, "CACHE_DIR", tmp_path / "cache")
+        monkeypatch.setattr(engine, "BADGES_DIR", tmp_path / "badges")
+        monkeypatch.setattr(engine, "ICONS_DIR", tmp_path / "icons")
+        monkeypatch.setattr(engine, "SECRETS_PATH", tmp_path / "secrets.json")
+        return engine.Api()
+
+    @staticmethod
+    def _game(ids):
+        return {
+            "slug": "jogo", "title": "Jogo", "platform": "GameCube",
+            "retroachievements_game_id": 1,
+            "walkthrough": [{"step": 1, "area": "A", "achievements": [{"id": i} for i in ids]}],
+            "achievements_meta": {str(i): {"title": f"Ach {i}", "desc": "", "badge": ""} for i in ids},
+        }
+
+    def _sync(self, api, estados):
+        """`estados`: {id: None | 'softcore' | 'hardcore'}. Roda o cálculo real
+        de progresso com um cliente falso no lugar da RetroAchievements."""
+        earned = {
+            aid: {
+                "id": aid, "title": f"Ach {aid}", "desc": "", "badge": "",
+                "earned": estado is not None,
+                "hardcore": estado == "hardcore",
+                "date": "2026-03-04 22:08:11" if estado else "",
+            }
+            for aid, estado in estados.items()
+        }
+
+        class FakeClient:
+            username = "u"
+            get_game_info_and_user_progress = staticmethod(lambda gid: {})
+            parse_achievements = staticmethod(lambda progress: earned)
+            download_badge = staticmethod(lambda *a: True)
+
+        api._client = FakeClient()
+        api._sync_game(self._game(list(estados)))
+        return api.state["jogo"]
+
+    def test_hardcore_e_softcore_sao_exclusivos(self, api):
+        d = self._sync(api, {1: "hardcore", 2: "softcore", 3: None})
+        assert d["modes"]["hardcore"]["earned"] == 1
+        assert d["modes"]["softcore"]["earned"] == 1
+
+    def test_os_dois_modos_compartilham_o_denominador(self, api):
+        d = self._sync(api, {1: "hardcore", 2: "softcore", 3: None})
+        assert d["modes"]["hardcore"]["total"] == 3
+        assert d["modes"]["softcore"]["total"] == 3
+
+    def test_earned_total_soma_os_dois_modos(self, api):
+        d = self._sync(api, {1: "hardcore", 2: "softcore", 3: None})
+        m = d["mastery"]
+        assert m["earned"] == d["modes"]["hardcore"]["earned"] + d["modes"]["softcore"]["earned"]
+        assert m["earned"] == 2
+
+    def test_percentual_de_mastery_conta_so_hardcore(self, api):
+        d = self._sync(api, {1: "hardcore", 2: "softcore", 3: None, 4: None})
+        assert d["mastery"]["percent"] == 25      # 1 de 4, não 2 de 4
+
+    def test_remaining_inclui_as_presas_em_softcore(self, api):
+        d = self._sync(api, {1: "hardcore", 2: "softcore", 3: None})
+        assert d["mastery"]["remaining"] == 2     # a softcore ainda precisa ser refeita
+
+    def test_lista_as_conquistas_so_em_softcore(self, api):
+        d = self._sync(api, {1: "hardcore", 2: "softcore", 5: "softcore"})
+        assert d["mastery"]["softcore_ids"] == [2, 5]
+        assert d["mastery"]["softcore_only"] == 2
+
+    def test_mastery_completo(self, api):
+        d = self._sync(api, {1: "hardcore", 2: "hardcore"})
+        assert d["mastery"]["complete"] is True
+        assert d["mastery"]["percent"] == 100
+        assert d["mastery"]["remaining"] == 0
+
+    def test_tudo_softcore_nao_e_mastery(self, api):
+        d = self._sync(api, {1: "softcore", 2: "softcore"})
+        assert d["mastery"]["complete"] is False
+        assert d["mastery"]["percent"] == 0
+        assert d["mastery"]["earned"] == 2        # mas o jogo está 100% "obtido"
+
+    def test_cada_conquista_carrega_seu_modo(self, api):
+        d = self._sync(api, {1: "hardcore", 2: "softcore", 3: None})
+        por_id = {a["id"]: a for a in d["achievements"]}
+        assert por_id[1]["mode"] == "hardcore" and por_id[1]["hardcore"] is True
+        assert por_id[2]["mode"] == "softcore" and por_id[2]["hardcore"] is False
+        assert por_id[3]["earned"] is False
+
+    def test_jogo_sem_conquistas_nao_divide_por_zero(self, api):
+        d = self._sync(api, {})
+        assert d["mastery"]["percent"] == 0
+        assert d["mastery"]["complete"] is False
+
+
+class TestAutoImport:
+    """A biblioteca espelha a conta: jogo começado entra sozinho, jogo removido
+    à mão não volta."""
+
+    @pytest.fixture
+    def api(self, tmp_path, monkeypatch):
+        for nome, sub in [("GAMES_DIR", "games"), ("CACHE_DIR", "cache"),
+                          ("BADGES_DIR", "badges"), ("ICONS_DIR", "icons")]:
+            monkeypatch.setattr(engine, nome, tmp_path / sub)
+        monkeypatch.setattr(engine, "SECRETS_PATH", tmp_path / "secrets.json")
+        monkeypatch.setattr(engine, "SETTINGS_PATH", tmp_path / "settings.json")
+        api = engine.Api()
+        api._client = object()          # só precisa não ser None
+        return api
+
+    @staticmethod
+    def _played(*jogos):
+        """jogos: (titulo, num_awarded)"""
+        return [
+            {"GameID": 100 + i, "Title": t, "NumAwarded": n, "MaxPossible": 50}
+            for i, (t, n) in enumerate(jogos)
+        ]
+
+    @pytest.fixture
+    def capturado(self, api, monkeypatch):
+        """Substitui a chamada de rede e a importação real; devolve os ids que
+        teriam sido importados."""
+        chamados = {}
+
+        def fake_start(ids, auto=False):
+            chamados["ids"] = list(ids)
+            chamados["auto"] = auto
+            return {"ok": True}
+
+        monkeypatch.setattr(api, "start_bulk_import", fake_start)
+        return chamados
+
+    def _com_jogos(self, api, monkeypatch, jogos):
+        monkeypatch.setattr(
+            api._client, "get_user_completion_progress",
+            lambda: self._played(*jogos), raising=False,
+        )
+
+    def test_importa_jogo_que_nao_esta_na_biblioteca(self, api, capturado, monkeypatch):
+        api._client = type("C", (), {"get_user_completion_progress": lambda s: self._played(("Digimon World", 10))})()
+        assert api._auto_import_scan() == 1
+        assert capturado["ids"] == [100]
+        assert capturado["auto"] is True
+
+    def test_ignora_jogo_sem_nenhuma_conquista(self, api, capturado):
+        api._client = type("C", (), {"get_user_completion_progress": lambda s: self._played(("Só Aberto", 0))})()
+        assert api._auto_import_scan() == 0
+        assert "ids" not in capturado
+
+    def test_ignora_jogo_ja_na_biblioteca(self, api, capturado):
+        engine.GAMES_DIR.mkdir(parents=True, exist_ok=True)
+        (engine.GAMES_DIR / "digimon_world.json").write_text("{}", encoding="utf-8")
+        api._client = type("C", (), {"get_user_completion_progress": lambda s: self._played(("Digimon World", 10))})()
+        assert api._auto_import_scan() == 0
+
+    def test_nao_ressuscita_jogo_removido_a_mao(self, api, capturado):
+        api.settings["dismissed"] = ["digimon_world"]
+        api._client = type("C", (), {"get_user_completion_progress": lambda s: self._played(("Digimon World", 10))})()
+        assert api._auto_import_scan() == 0
+        assert "ids" not in capturado
+
+    def test_respeita_a_preferencia_desligada(self, api, capturado):
+        api.settings["auto_import"] = False
+        api._client = type("C", (), {"get_user_completion_progress": lambda s: self._played(("Digimon World", 10))})()
+        assert api._auto_import_scan() == 0
+
+    def test_nao_atropela_importacao_em_andamento(self, api, capturado):
+        api.bulk = {"running": True}
+        api._client = type("C", (), {"get_user_completion_progress": lambda s: self._played(("Digimon World", 10))})()
+        assert api._auto_import_scan() == 0
+
+    def test_erro_de_api_nao_propaga(self, api, capturado):
+        def explode(self_):
+            raise engine.RAError("sem rede")
+        api._client = type("C", (), {"get_user_completion_progress": explode})()
+        assert api._auto_import_scan() == 0
+
+    def test_marca_o_horario_da_varredura(self, api, capturado):
+        api._client = type("C", (), {"get_user_completion_progress": lambda s: []})()
+        assert api.last_auto_import == 0.0
+        api._auto_import_scan()
+        assert api.last_auto_import > 0
+
+
+class TestDismissed:
+    @pytest.fixture(autouse=True)
+    def paths(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(engine, "GAMES_DIR", tmp_path / "games")
+        monkeypatch.setattr(engine, "SETTINGS_PATH", tmp_path / "settings.json")
+        monkeypatch.setattr(engine, "CACHE_DIR", tmp_path / "cache")
+        monkeypatch.setattr(engine, "BADGES_DIR", tmp_path / "badges")
+        monkeypatch.setattr(engine, "ICONS_DIR", tmp_path / "icons")
+        monkeypatch.setattr(engine, "SECRETS_PATH", tmp_path / "secrets.json")
+        return tmp_path
+
+    def test_apagar_registra_como_dispensado(self):
+        api = engine.Api()
+        api.delete_game("digimon_world")
+        assert "digimon_world" in api.settings["dismissed"]
+
+    def test_dispensado_persiste_em_disco(self):
+        engine.Api().delete_game("digimon_world")
+        assert "digimon_world" in engine.load_settings()["dismissed"]
+
+    def test_restaurar_remove_da_lista(self):
+        api = engine.Api()
+        api.delete_game("digimon_world")
+        api.restore_game("digimon_world")
+        assert api.settings["dismissed"] == []
+
+    def test_apagar_duas_vezes_nao_duplica(self):
+        api = engine.Api()
+        api.delete_game("x")
+        api.delete_game("x")
+        assert api.settings["dismissed"].count("x") == 1
+
+    def test_auto_import_ligado_por_padrao(self):
+        assert engine.load_settings()["auto_import"] is True
+
+    def test_settings_corrompido_cai_no_padrao(self, paths):
+        engine.SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        engine.SETTINGS_PATH.write_text("{quebrado", encoding="utf-8")
+        s = engine.load_settings()
+        assert s["auto_import"] is True and s["dismissed"] == []
+
+    def test_toggle_persiste(self):
+        api = engine.Api()
+        api.set_auto_import(False)
+        assert engine.load_settings()["auto_import"] is False
+
+
+class TestConfigDeIA:
+    """O provedor é trocável (Claude, Gemini, OpenAI-compatível) e cada um
+    guarda a sua própria chave."""
+
+    @pytest.fixture
+    def api(self, tmp_path, monkeypatch):
+        for nome, sub in [("GAMES_DIR", "games"), ("CACHE_DIR", "cache"),
+                          ("BADGES_DIR", "badges"), ("ICONS_DIR", "icons")]:
+            monkeypatch.setattr(engine, nome, tmp_path / sub)
+        monkeypatch.setattr(engine, "SECRETS_PATH", tmp_path / "secrets.json")
+        monkeypatch.setattr(engine, "SETTINGS_PATH", tmp_path / "settings.json")
+        return engine.Api()
+
+    def test_anthropic_e_o_padrao(self, api):
+        assert api.get_ai_config()["provider"] == "anthropic"
+
+    def test_lista_os_provedores_para_a_ui(self, api):
+        ids = {p["id"] for p in api.get_ai_config()["providers"]}
+        assert {"anthropic", "gemini", "openai"} <= ids
+
+    def test_salva_chave_e_libera_a_ia(self, api):
+        cfg = api.set_ai_config("gemini", "chave-gemini")
+        assert cfg["provider"] == "gemini" and cfg["ai_ready"] is True
+
+    def test_nunca_devolve_a_chave(self, api):
+        api.set_ai_config("gemini", "chave-secreta")
+        assert "chave-secreta" not in json.dumps(api.get_ai_config())
+
+    def test_cada_provedor_guarda_a_propria_chave(self, api):
+        """Trocar de provedor não pode apagar a chave do anterior."""
+        api.set_ai_config("anthropic", "chave-claude")
+        api.set_ai_config("gemini", "chave-gemini")
+        api.set_ai_config("anthropic", None)          # volta sem reenviar a chave
+        assert api.get_ai_config()["ai_ready"] is True
+        por_id = {p["id"]: p for p in api.get_ai_config()["providers"]}
+        assert por_id["gemini"]["has_key"] and por_id["anthropic"]["has_key"]
+
+    def test_chave_nula_mantem_a_salva(self, api):
+        api.set_ai_config("gemini", "chave")
+        assert api.set_ai_config("gemini", None, "gemini-2.5-flash")["ai_ready"] is True
+
+    def test_chave_vazia_apaga(self, api):
+        api.set_ai_config("gemini", "chave")
+        assert api.set_ai_config("gemini", "")["ai_ready"] is False
+
+    def test_guarda_modelo_e_endpoint(self, api):
+        api.set_ai_config("openai", "k", "llama3", "http://localhost:11434/v1")
+        cfg = api.get_ai_config()
+        assert cfg["model"] == "llama3"
+        assert cfg["base_url"] == "http://localhost:11434/v1"
+
+    def test_provedor_invalido_e_recusado(self, api):
+        assert api.set_ai_config("skynet", "k")["ok"] is False
+
+    def test_configuracao_persiste_em_disco(self, api):
+        api.set_ai_config("gemini", "k", "gemini-2.5-flash")
+        salvo = engine.load_settings()
+        assert salvo["ai_provider"] == "gemini" and salvo["ai_model"] == "gemini-2.5-flash"
+
+    def test_refino_sem_chave_avisa_o_provedor_certo(self, api):
+        api.set_ai_config("gemini", "")
+        api.pending_import = {"achievements_meta": {"1": {"title": "X"}}}
+        api.last_faq = {"text": "texto"}
+        res = api.refine_guide_ai()
+        assert res["ok"] is False and "Gemini" in res["error"]
+
+    def test_refino_sem_guia_avisa(self, api):
+        api.set_ai_config("anthropic", "k")
+        api.pending_import = {"achievements_meta": {"1": {"title": "X"}}}
+        assert api.refine_guide_ai()["ok"] is False
+
+
+class TestCleanWalkthrough:
+    def test_descarta_o_mode_legado(self):
+        steps = [{"step": 1, "area": "A", "achievements": [{"id": 7, "mode": "hard"}]}]
+        out = engine.Api._clean_walkthrough(steps)
+        assert out == [{"step": 1, "area": "A", "achievements": [{"id": 7}]}]
+
+    def test_ignora_etapa_vazia(self):
+        steps = [{"step": 1, "area": "A", "achievements": []},
+                 {"step": 2, "area": "B", "achievements": [{"id": 1}]}]
+        assert len(engine.Api._clean_walkthrough(steps)) == 1
+
+    def test_nomeia_etapa_sem_area(self):
+        out = engine.Api._clean_walkthrough([{"achievements": [{"id": 1}]}])
+        assert out[0]["area"] == "Etapa 1"
+
+    def test_ignora_entrada_invalida(self):
+        steps = [{"achievements": [{"id": "abc"}, {"sem_id": 1}, {"id": "5"}]}]
+        assert engine.Api._clean_walkthrough(steps)[0]["achievements"] == [{"id": 5}]
+
+    def test_lista_vazia(self):
+        assert engine.Api._clean_walkthrough([]) == []
+
+
+class TestSlugify:
+    @pytest.mark.parametrize("titulo,esperado", [
+        ("Digimon World 4", "digimon_world_4"),
+        ("Digimon Story: Cyber Sleuth", "digimon_story_cyber_sleuth"),
+        ("Pokémon Ruby & Sapphire", "pokemon_ruby_sapphire"),
+        ("   ", "jogo"),
+        ("!!!", "jogo"),
+    ])
+    def test_slugify(self, titulo, esperado):
+        assert engine.slugify(titulo) == esperado

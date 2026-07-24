@@ -21,9 +21,11 @@
   --clip-5: polygon(5px 0, 100% 0, 100% calc(100% - 5px), calc(100% - 5px) 100%, 0 100%, 0 5px);
   --clip-4: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
 
-  --f-head: 'Orbitron', sans-serif;
-  --f-body: 'Inter', sans-serif;
-  --f-mono: 'Share Tech Mono', monospace;
+  /* As três vêm de fonts.css (arquivos locais em ui/fonts/). Os fallbacks
+     cobrem o caso de o woff2 não carregar. */
+  --f-head: 'Orbitron', 'Segoe UI', system-ui, sans-serif;
+  --f-body: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --f-mono: 'Share Tech Mono', 'Cascadia Mono', Consolas, monospace;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -176,6 +178,13 @@ button { font-family: inherit; cursor: pointer; background: none; border: none; 
 }
 .add-btn:hover { color: var(--text-hi); border-color: var(--cyan); }
 
+.import-btn {
+  width: 100%; margin-top: 8px; padding: 8px;
+  font-family: var(--f-mono); font-size: 10.5px; letter-spacing: .3px;
+  color: var(--text-low); border: 1px solid var(--line); clip-path: var(--clip-5);
+}
+.import-btn:hover { color: var(--gold); border-color: var(--gold); }
+
 /* game tile */
 .tile {
   width: 100%; display: flex; align-items: center; gap: 12px;
@@ -301,6 +310,7 @@ button { font-family: inherit; cursor: pointer; background: none; border: none; 
 .ach-row.locked .ach-name { color: var(--text-mid); }
 .ach-desc { color: var(--text-low); font-size: 10.5px; margin-top: 1px; }
 .ach-check { color: var(--green); font-size: 16px; flex-shrink: 0; }
+.ach-date { font-family: var(--f-mono); font-size: 9.5px; color: var(--text-low); flex-shrink: 0; }
 .next-tag { background: var(--gold); color: var(--void); font-size: 8.5px; font-weight: 800; padding: 2px 6px; letter-spacing: .5px; }
 
 /* mode tag (inline) */
@@ -308,6 +318,34 @@ button { font-family: inherit; cursor: pointer; background: none; border: none; 
   font-family: var(--f-mono); font-size: 8px; font-weight: 800;
   padding: 2px 6px; letter-spacing: .5px; border: 1px solid;
 }
+
+/* ─────────────────────────  ABA MASTERY  ─────────────────────────
+   Progresso rumo ao badge dourado da RetroAchievements: só desbloqueio em
+   hardcore conta. */
+.ms-row { margin-bottom: 16px; }
+.ms-row-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
+.ms-label { font-family: var(--f-head); font-size: 10.5px; font-weight: 700; color: var(--text-mid); letter-spacing: .5px; }
+.ms-num { font-family: var(--f-mono); font-size: 11px; font-weight: 700; }
+.ms-bar {
+  height: 9px; background: var(--panel); border: 1px solid var(--line);
+  clip-path: var(--clip-4); overflow: hidden;
+}
+.ms-fill { height: 100%; transition: width .5s ease; }
+.ms-note, .ms-hint { color: var(--text-low); font-size: 10.5px; margin-top: 6px; }
+
+.ms-remaining {
+  font-family: var(--f-mono); font-size: 11.5px; color: var(--text-mid);
+  letter-spacing: .5px; padding: 10px 12px; margin-top: 4px;
+  background: var(--panel); border: 1px solid var(--line); clip-path: var(--clip-5);
+}
+.ms-remaining b { color: var(--gold); font-size: 13px; }
+.ms-done {
+  font-family: var(--f-head); font-size: 12px; font-weight: 800; color: var(--gold);
+  letter-spacing: .5px; padding: 12px; margin-top: 4px; text-align: center;
+  background: rgba(245,197,24,.08); border: 1px solid var(--gold); clip-path: var(--clip-6);
+}
+.ach-row.soft { border-color: rgba(45,226,230,.35); }
+.ach-badge.soft { filter: grayscale(.55) brightness(.85); }
 
 /* ─────────────────────────  SETUP / WIZARD VIEWS  ───────────────────────── */
 .view { display: flex; flex-direction: column; height: 100%; }
@@ -377,6 +415,96 @@ button { font-family: inherit; cursor: pointer; background: none; border: none; 
 
 .status-msg { color: var(--text-low); font-size: 11.5px; padding: 16px 4px; display: flex; align-items: center; gap: 8px; }
 
+/* ───────────────  IMPORTAR BIBLIOTECA INTEIRA (LOTE)  ─────────────── */
+.imp-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+.imp-lead { color: var(--text-mid); font-size: 12px; }
+.imp-note { color: var(--text-low); font-size: 10.5px; margin-bottom: 14px; }
+
+.imp-row {
+  width: 100%; display: flex; align-items: center; gap: 10px; text-align: left;
+  padding: 10px 12px; margin-bottom: 6px;
+  background: var(--panel); border: 1px solid var(--line); clip-path: var(--clip-5);
+}
+.imp-row:hover { border-color: var(--gold); }
+.imp-row.on { border-color: var(--gold); background: rgba(245,197,24,.07); }
+.imp-row.already { opacity: .5; cursor: default; }
+.imp-row.already:hover { border-color: var(--line); }
+.imp-check { font-size: 14px; color: var(--gold); flex-shrink: 0; }
+.imp-row.already .imp-check { color: var(--green); }
+.imp-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.imp-title { font-size: 12.5px; font-weight: 600; color: var(--text-hi); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.imp-sub { font-family: var(--f-mono); font-size: 9.5px; color: var(--text-low); }
+.imp-modes { display: flex; gap: 4px; flex-shrink: 0; }
+.imp-pill {
+  font-family: var(--f-mono); font-size: 9px; font-weight: 700;
+  padding: 2px 5px; border: 1px solid; clip-path: var(--clip-4);
+}
+.imp-already { font-family: var(--f-mono); font-size: 8.5px; color: var(--green); flex-shrink: 0; letter-spacing: .5px; }
+.imp-count { font-family: var(--f-mono); font-size: 11px; color: var(--text-mid); }
+.auto-toggle {
+  display: flex; align-items: center; gap: 7px; cursor: pointer;
+  font-size: 11px; color: var(--text-mid); user-select: none;
+}
+.auto-toggle input { accent-color: var(--gold); cursor: pointer; }
+.auto-toggle:hover { color: var(--text-hi); }
+.imp-errors { margin-top: 18px; padding: 12px; border: 1px solid var(--red); clip-path: var(--clip-5); }
+.imp-errors .ms-label { color: var(--red); margin-bottom: 4px; }
+
+/* ───────────────────  IMPORTAR GUIA DO GAMEFAQS  ─────────────────── */
+.pdf-order-btn.gf { color: var(--cyan); border-color: var(--cyan); }
+.pdf-order-btn.ai { color: var(--gold); border-color: var(--gold); }
+
+.gf-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(8, 8, 15, .78); padding: 24px;
+}
+.gf-panel {
+  width: min(560px, 100%); max-height: 82vh; display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--line); clip-path: var(--clip-8);
+}
+.gf-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 16px; border-bottom: 1px solid var(--line);
+}
+.gf-title { font-family: var(--f-head); font-size: 13px; font-weight: 800; letter-spacing: .5px; color: var(--text-hi); }
+.gf-sub { font-family: var(--f-mono); font-size: 10px; color: var(--text-low); margin-top: 3px; }
+.gf-close { font-size: 15px; color: var(--text-low); padding: 0 4px; }
+.gf-close:hover { color: var(--red); }
+
+.gf-body { flex: 1; overflow-y: auto; padding: 16px; }
+.gf-lead { color: var(--text-mid); font-size: 12px; margin-bottom: 10px; }
+.gf-note { color: var(--text-low); font-size: 10.5px; margin-top: 10px; }
+.gf-error {
+  color: var(--red); font-size: 11.5px; padding: 10px 12px; margin-bottom: 12px;
+  border: 1px solid var(--red); clip-path: var(--clip-5);
+}
+.gf-faq {
+  width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  text-align: left; padding: 10px 12px; margin-bottom: 6px;
+  background: var(--panel-raised); border: 1px solid var(--line); clip-path: var(--clip-5);
+}
+.gf-faq:hover { border-color: var(--cyan); }
+.gf-faq-title { font-size: 12.5px; font-weight: 600; color: var(--text-hi); }
+.gf-faq-id { font-family: var(--f-mono); font-size: 9.5px; color: var(--text-low); flex-shrink: 0; }
+.gf-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px; border-top: 1px solid var(--line);
+}
+
+/* provedor de IA (trocável: Claude, Gemini, OpenAI-compatível) */
+.ai-providers { display: flex; flex-direction: column; gap: 6px; }
+.ai-prov {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%; text-align: left; padding: 9px 12px;
+  background: var(--panel-raised); border: 1px solid var(--line); clip-path: var(--clip-5);
+}
+.ai-prov:hover { border-color: var(--gold); }
+.ai-prov.on { border-color: var(--gold); background: rgba(245,197,24,.08); }
+.ai-prov-name { font-size: 12.5px; color: var(--text-hi); }
+.ai-prov-ok { font-family: var(--f-mono); font-size: 9px; color: var(--green); }
+.ai-link { font-family: var(--f-mono); font-size: 9.5px; color: var(--cyan); word-break: break-all; }
+
 /* wizard step 2 — duas colunas */
 .wiz2-cols { display: flex; gap: 16px; }
 .wiz2-col { flex: 1; min-width: 0; }
@@ -402,10 +530,6 @@ button { font-family: inherit; cursor: pointer; background: none; border: none; 
 .mini-btn { font-size: 10px; padding: 3px 7px; border: 1px solid var(--line); color: var(--text-mid); clip-path: var(--clip-4); }
 .mini-btn:hover { border-color: var(--cyan); color: var(--text-hi); }
 .mini-btn.rm:hover { border-color: var(--red); color: var(--red); }
-.mode-toggle { display: flex; gap: 0; }
-.mode-toggle button { font-family: var(--f-mono); font-size: 8px; font-weight: 800; padding: 3px 6px; border: 1px solid var(--line); color: var(--text-low); }
-.mode-toggle button.on-normal { color: var(--cyan); border-color: var(--cyan); background: rgba(45,226,230,.12); }
-.mode-toggle button.on-hard { color: var(--red); border-color: var(--red); background: rgba(214,40,57,.12); }
 
 .step-block { padding: 12px; margin-bottom: 12px; background: var(--panel-raised); border: 1px dashed var(--line); clip-path: var(--clip-6); }
 .step-block .sb-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }

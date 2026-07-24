@@ -23,9 +23,24 @@ MEDIA_BASE = "https://media.retroachievements.org"
 # Tempo de validade do índice de jogos (usado na busca do wizard).
 INDEX_TTL_SECONDS = 7 * 24 * 3600
 
+# Retentativas para erros transitórios (429 / 5xx / falha de rede).
+MAX_RETRIES = 3
+BACKOFF_BASE = 1.5          # segundos: 1.5, 3, 6…
+BACKOFF_CAP = 30.0
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
 
 class RAError(Exception):
     """Erro de comunicação ou autenticação com a RetroAchievements."""
+
+
+class RARateLimited(RAError):
+    """A API recusou por excesso de requisições (HTTP 429) e as retentativas se
+    esgotaram. Quem chama deve recuar antes de tentar de novo."""
+
+    def __init__(self, message: str, retry_after: float = 0.0):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class RAClient:
@@ -40,22 +55,67 @@ class RAClient:
     # ------------------------------------------------------------------ #
     # Núcleo HTTP
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _retry_after(resp) -> float:
+        """Lê o header Retry-After (segundos), se houver."""
+        try:
+            return max(0.0, float(resp.headers.get("Retry-After", "")))
+        except (TypeError, ValueError):
+            return 0.0
+
     def _get(self, php: str, params: dict, timeout: int = 20) -> dict | list:
+        """GET autenticado com retentativa em erros transitórios (429/5xx/rede).
+
+        O backoff é exponencial e respeita `Retry-After` quando a API o envia.
+        Erros definitivos (401, JSON inválido) sobem na primeira tentativa.
+        """
         q = {"y": self.api_key, **params}
         url = API_BASE + php
-        try:
-            resp = self.session.get(url, params=q, timeout=timeout)
-        except requests.RequestException as exc:
-            raise RAError(f"Falha de rede ao chamar {php}: {exc}") from exc
+        last_status = 0
+        wait = 0.0
 
-        if resp.status_code == 401:
-            raise RAError("Não autorizado (401) — verifique username e Web API Key.")
-        if resp.status_code != 200:
-            raise RAError(f"{php} retornou HTTP {resp.status_code}.")
-        try:
-            return resp.json()
-        except ValueError as exc:
-            raise RAError(f"{php} não retornou JSON válido.") from exc
+        for attempt in range(MAX_RETRIES + 1):
+            if attempt:
+                time.sleep(wait)
+            try:
+                resp = self.session.get(url, params=q, timeout=timeout)
+            except requests.RequestException as exc:
+                if attempt >= MAX_RETRIES:
+                    raise RAError(f"Falha de rede ao chamar {php}: {exc}") from exc
+                wait = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** attempt))
+                continue
+
+            if resp.status_code == 401:
+                raise RAError("Não autorizado (401) — verifique username e Web API Key.")
+
+            if resp.status_code in RETRYABLE_STATUS:
+                last_status = resp.status_code
+                hint = self._retry_after(resp)
+                # Esperar aqui bloqueia a thread de sincronização. Se a API pede
+                # uma pausa longa, desistimos já e devolvemos o prazo para quem
+                # chamou recuar no próprio ritmo, em vez de congelar o app.
+                if hint > BACKOFF_CAP:
+                    raise RARateLimited(
+                        f"{php}: a API pediu {hint:.0f}s de pausa.", retry_after=hint
+                    )
+                wait = hint or min(BACKOFF_CAP, BACKOFF_BASE * (2 ** attempt))
+                if attempt < MAX_RETRIES:
+                    continue
+                if last_status == 429:
+                    raise RARateLimited(
+                        f"{php}: limite de requisições da RetroAchievements atingido.",
+                        retry_after=wait,
+                    )
+                raise RAError(f"{php} retornou HTTP {last_status} após {MAX_RETRIES} tentativas.")
+
+            if resp.status_code != 200:
+                raise RAError(f"{php} retornou HTTP {resp.status_code}.")
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise RAError(f"{php} não retornou JSON válido.") from exc
+
+        raise RAError(f"{php}: não foi possível completar a requisição.")
 
     # ------------------------------------------------------------------ #
     # Validação de credenciais
@@ -147,6 +207,35 @@ class RAClient:
         hits = [g for g in index if q in (g.get("title") or "").lower()]
         hits.sort(key=lambda g: (len(g.get("title") or ""), g.get("title") or ""))
         return hits[:limit]
+
+    # ------------------------------------------------------------------ #
+    # Jogos que o usuário já jogou
+    # ------------------------------------------------------------------ #
+    def get_user_completion_progress(self, target_user: str | None = None) -> list[dict]:
+        """Todos os jogos em que o usuário tem alguma conquista.
+
+        A API pagina em no máximo 500 por página (`c`) com deslocamento (`o`) e
+        informa o `Total`, então seguimos pedindo até completar.
+        """
+        user = (target_user or self.username).strip()
+        page_size = 500
+        offset = 0
+        out: list[dict] = []
+        while True:
+            data = self._get(
+                "API_GetUserCompletionProgress.php",
+                {"u": user, "c": page_size, "o": offset},
+            )
+            if not isinstance(data, dict):
+                raise RAError("Resposta inesperada de GetUserCompletionProgress.")
+            results = data.get("Results") or []
+            out.extend(results)
+            total = data.get("Total") or 0
+            offset += len(results)
+            if not results or offset >= total:
+                break
+            time.sleep(0.3)      # gentileza com o rate limit
+        return out
 
     # ------------------------------------------------------------------ #
     # Conquistas + progresso do usuário

@@ -2,6 +2,13 @@ pywebview==5.4
 requests>=2.31
 # Leitura do PDF do guia para ordenar o walkthrough automaticamente.
 pypdf>=4.0
+# Importar guias direto do GameFAQs: cloudscraper resolve o desafio do
+# Cloudflare, BeautifulSoup lê o HTML.
+cloudscraper>=1.2.71
+beautifulsoup4>=4.12
+# Refino opcional do guia por IA. Só o provedor Anthropic precisa de SDK;
+# Gemini e endpoints compatíveis com a OpenAI usam REST via `requests`.
+anthropic>=0.69
 # No Windows o backend EdgeChromium usa pythonnet. Fixamos um combo estavel e
 # testado de ponta a ponta; com pywebview 6.x + pythonnet 3.1.x a introspecao
 # da js_api chega a estourar a recursao ao percorrer window.native.

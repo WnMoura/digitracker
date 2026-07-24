@@ -1,19 +1,25 @@
 # Segredos do usuário (username + Web API Key)
 config/secrets.json
 
+# Preferências locais (auto-import, jogos dispensados)
+config/settings.json
+
 # Cache local
 config/cache/
 assets/badges/
+assets/icons/
 
-# Jogos criados pelo usuário em runtime (mantém só os de exemplo versionados, se houver)
-# Descomente se quiser ignorar jogos locais:
-# config/games/*.json
+# Jogos da SUA conta: desde a importação automática, estes arquivos são gerados
+# a partir da RetroAchievements (progresso pessoal + texto de guias de terceiros),
+# não exemplos curados. Não versionar.
+config/games/*.json
 
 # Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
 
 # PyInstaller (digitracker.spec é versionado de propósito)
 build/
