@@ -8,7 +8,7 @@
    jogo. Hardcore (sem savestate) é o único que vale Mastery, por isso o dourado.
    Qualquer modo desconhecido que venha do backend ganha uma cor da paleta extra
    e o nome em caixa alta. */
-const MODE_COLOR = { hardcore: "#F5C518", softcore: "#2DE2E6" };
+const MODE_COLOR = { hardcore: "#E0B341", softcore: "#7FA8C9" };
 const MODE_LABEL = { hardcore: "HARDCORE", softcore: "SOFTCORE" };
 const MODE_ICON = { hardcore: "⚡", softcore: "○" };
 const EXTRA_MODE_COLORS = ["#F5C518", "#27AE60", "#A855F7", "#FF8A3D"];
@@ -24,6 +24,94 @@ const modeIcon = (key) => MODE_ICON[key] || "●";
 function tint(hex, alpha) {
   const n = parseInt(String(hex).replace("#", ""), 16);
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
+/* ─────────────────  A COR DO JOGO VEM DA PRÓPRIA CAPA  ─────────────────
+   Assinatura do design: cada jogo tinge a interface com a cor dominante da
+   sua arte. Fazemos no <canvas>, sem dependência nenhuma, e guardamos em
+   cache porque a capa não muda. Antes o app sorteava entre 4 cores fixas,
+   que repetiam a partir do 5º jogo. */
+const CORES_DA_CAPA = new Map();
+const COR_PADRAO = "#4C9BE8";           // azul Steam, quando não dá para extrair
+
+const rgbParaHsl = (r, g, b) => {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h;
+  if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+  else if (max === g) h = ((b - r) / d + 2) / 6;
+  else h = ((r - g) / d + 4) / 6;
+  return [h, s, l];
+};
+
+const hslParaHex = (h, s, l) => {
+  const f = (n) => {
+    const k = (n + h * 12) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const v = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return Math.round(v * 255).toString(16).padStart(2, "0");
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+};
+
+/* Extrai a cor e a domestica: mantém o matiz (a identidade do jogo), mas
+   limita saturação e luminosidade. Sem isso, uma capa amarela vibrante vira
+   superfície que cansa a vista, e uma capa escura vira accent invisível. */
+function corDaCapa(url) {
+  if (!url) return Promise.resolve(COR_PADRAO);
+  if (CORES_DA_CAPA.has(url)) return Promise.resolve(CORES_DA_CAPA.get(url));
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      let cor = COR_PADRAO;
+      try {
+        const N = 48;
+        const cv = document.createElement("canvas");
+        cv.width = cv.height = N;
+        const ctx = cv.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, N, N);
+        const px = ctx.getImageData(0, 0, N, N).data;
+        let melhor = null, top = 0;
+        for (let i = 0; i < px.length; i += 4) {
+          if (px[i + 3] < 200) continue;
+          const [h, s, l] = rgbParaHsl(px[i], px[i + 1], px[i + 2]);
+          if (l < 0.18 || l > 0.85 || s < 0.30) continue;   // preto, branco, lavado
+          if (s > top) { top = s; melhor = [h, s, l]; }
+        }
+        if (melhor) {
+          const [h, s, l] = melhor;
+          cor = hslParaHex(h, Math.min(s, 0.62), Math.min(Math.max(l, 0.42), 0.62));
+        }
+      } catch (_) { /* canvas bloqueado: fica o padrão */ }
+      CORES_DA_CAPA.set(url, cor);
+      resolve(cor);
+    };
+    img.onerror = () => { CORES_DA_CAPA.set(url, COR_PADRAO); resolve(COR_PADRAO); };
+    img.src = url;
+  });
+}
+
+/* Pré-carrega as cores da biblioteca inteira e re-renderiza quando chegarem. */
+async function carregarCores(jogos) {
+  const novas = (jogos || []).filter((g) => g.art?.box && !CORES_DA_CAPA.has(g.art.box));
+  if (!novas.length) return false;
+  await Promise.all(novas.map((g) => corDaCapa(g.art.box)));
+  return true;
+}
+
+const corDe = (g) => (g && g.art?.box && CORES_DA_CAPA.get(g.art.box)) || (g && g.accent) || COR_PADRAO;
+
+/* Fita de estado na capa. Só aparece quando há algo a dizer: jogo em
+   progresso não recebe fita. */
+function fitaDe(g) {
+  const m = (g && g.mastery) || {};
+  if (m.complete) return { cls: "mastery", txt: "Mastery" };
+  if (m.total && m.earned >= m.total && !m.hardcore) return { cls: "softcore", txt: "Softcore" };
+  return null;
 }
 
 const S = {
@@ -42,8 +130,11 @@ const S = {
   autoImport: true,      // espelhar a conta (jogo novo entra sozinho)
   autoOverlay: true,     // grudar no emulador quando ele abrir
   aiReady: false,        // há chave salva para o provedor de IA escolhido
+  overlayExitFullscreen: false,  // mandar Alt+Enter ao detectar tela cheia exclusiva
+  overlaySecondScreen: false,    // levar o overlay para o monitor livre
   G: null,               // estado do painel do GameFAQs
   AI: null,              // estado do painel de configuração da IA
+  SET: null,             // estado da tela de Configurações
 };
 
 const root = document.getElementById("root");
@@ -114,6 +205,10 @@ const backend = {
   async setAutoOverlay(v) {
     if (S.mode === "demo") return { ok: true, auto_overlay: v };
     return window.pywebview.api.set_auto_overlay(v);
+  },
+  async setOverlayOption(chave, v) {
+    if (S.mode === "demo") return { ok: true };
+    return window.pywebview.api.set_overlay_option(chave, v);
   },
   async gamefaqsList(url) {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
@@ -267,6 +362,7 @@ async function enterDashboard() {
   S.view = "dashboard";
   S.library = await backend.library();
   if (!S.activeSlug && S.library.length) S.activeSlug = S.library[0].slug;
+  await carregarCores(S.library);       // a cor de cada jogo vem da capa dele
   await renderDashboard({ force: true });
   startPolling();
 }
@@ -288,6 +384,9 @@ function startPolling() {
 async function checkAutoImported() {
   if (S.mode === "demo") return;
   const st = await backend.bulkStatus();
+  /* aviso do overlay (ex.: emulador em tela cheia exclusiva, onde nenhum
+     overlay aparece — sem isso o app simplesmente sumiria sem explicação) */
+  if (st.overlay_notice) toast(st.overlay_notice, true);
   const novos = st.auto_imported || [];
   if (novos.length) {
     const nomes = novos.map((slug) => {
@@ -341,7 +440,10 @@ async function renderDashboard({ force = false } = {}) {
     root.innerHTML = `${sidebarHTML()}${mainHTML(game)}`;
     bindSidebar();
   }
+  // Trocou de jogo ou de aba? Começa do topo. Só faz sentido preservar a
+  // rolagem quando o conteúdo é o mesmo (redesenho do polling de 5s).
   if (sameScreen) restoreScroll(scroll);
+  else root.querySelectorAll("[data-scroll]").forEach((el) => { el.scrollTop = 0; });
   $("#sync-tag").textContent = S.mode === "demo" ? "DEMO" : "● SYNC 30s";
 }
 
@@ -372,25 +474,28 @@ function compactHTML(game) {
     </div>
   </div>` : "";
 
-  return `<div class="cw">
-    <div class="cw-head">
-      <button class="cw-nav" id="cw-prev" title="Jogo anterior">‹</button>
-      <div class="cw-title" title="${esc(game.title)}">${esc(game.title)}</div>
-      <button class="cw-nav" id="cw-next" title="Próximo jogo">›</button>
+  const mst = game.mastery || {};
+  const cor = corDe(game);
+  const capa = game.art?.box;
+  return `<div class="cw" style="--jogo:${cor}">
+    ${capa ? `<div class="cw-art" style="background-image:url('${esc(capa)}')"></div>` : ""}
+    <div class="cw-in">
+      <div class="cw-head">
+        <button class="cw-nav" id="cw-prev" title="Jogo anterior">‹</button>
+        <div class="cw-title" title="${esc(game.title)}">${esc(game.title)}</div>
+        <button class="cw-nav" id="cw-next" title="Próximo jogo">›</button>
+      </div>
+      <div class="cw-top">
+        <span class="cw-pills">
+          <span class="cw-pill" title="Em hardcore, o que vale Mastery">${mst.hardcore || 0}<small>/${t}</small></span>
+          <span class="cw-pill">${mst.percent || 0}%</span>
+        </span>
+      </div>
+      <div class="cw-bar"><div class="cw-fill" style="width:${mst.percent || 0}%;background:${cor}"></div></div>
+      ${card("Última conquista", le, false)}
+      ${card("Próxima", nextAch, true)}
+      ${!le && !nextAch ? (t > 0 && e >= t ? `<div class="cw-done">✓ 100% concluído</div>` : `<p class="cw-empty-sm">Sem conquistas registradas ainda.</p>`) : ""}
     </div>
-    <div class="cw-top">
-      <span class="cw-top-label">PROGRESSO DO JOGO</span>
-      <span class="cw-pills">
-        <span class="cw-pill" title="Hardcore — conta para o Mastery"
-          style="color:${MODE_COLOR.hardcore};border-color:${tint(MODE_COLOR.hardcore, .5)}">⚡${(game.mastery || {}).hardcore || 0}</span>
-        <span class="cw-pill">${e} / ${t}</span>
-        <span class="cw-pill" style="color:${game.accent};border-color:${game.accent}">${pct}%</span>
-      </span>
-    </div>
-    <div class="cw-bar"><div class="cw-fill" style="width:${pct}%;background:${game.accent}"></div></div>
-    ${card("ÚLTIMA CONQUISTA OBTIDA", le, false)}
-    ${card("PRÓXIMA CONQUISTA", nextAch, true)}
-    ${!le && !nextAch ? (t > 0 && e >= t ? `<div class="cw-done">✓ 100% concluído</div>` : `<p class="cw-empty-sm">Sem conquistas registradas ainda.</p>`) : ""}
   </div>`;
 }
 
@@ -410,20 +515,25 @@ function switchCompactGame(dir) {
 function sidebarHTML() {
   const done = S.library.filter(isMastered);
   const prog = S.library.filter((g) => !isMastered(g));
+  /* Cápsula de capa: a arte identifica o jogo, a fita diz o que exige ação,
+     e a selecionada brilha com a própria cor. */
   const tile = (g) => {
-    const { pct } = totals(g);
+    const m = g.mastery || {};
     const active = g.slug === S.activeSlug;
-    const core = g.icon
-      ? `<div class="ring-core" style="background-image:url('${esc(g.icon)}');background-size:cover;background-position:center"></div>`
-      : `<div class="ring-core" style="background:linear-gradient(145deg, ${g.accent}33, var(--panel))">${esc(initials(g.title))}</div>`;
-    return `<button class="tile ${active ? "active" : ""}" data-slug="${esc(g.slug)}" style="border-color:${active ? g.accent : "transparent"}">
-      <div class="ring-wrap">${ring(pct, 48, 4, g.accent)}
-        ${core}
+    const cor = corDe(g);
+    const fita = fitaDe(g);
+    const capa = g.art?.box
+      ? `<img src="${esc(g.art.box)}" alt="">`
+      : `<div class="fallback">${esc(initials(g.title))}</div>`;
+    return `<button class="tile ${active ? "active" : ""}" data-slug="${esc(g.slug)}" style="--jogo:${cor}">
+      <div class="cover">
+        ${capa}
+        ${fita ? `<div class="ribbon ${fita.cls}">${fita.txt}</div>` : ""}
       </div>
       <div class="meta">
         <div class="name">${esc(g.title)}</div>
-        <div class="plat">${esc(g.platform)}</div>
-        ${modeDots(g.modes)}
+        <div class="tile-bar"><i style="width:${m.percent || 0}%"></i></div>
+        <div class="tile-num">${m.hardcore || 0} / ${m.total || 0} · ${m.percent || 0}%</div>
       </div>
     </button>`;
   };
@@ -456,14 +566,26 @@ function mainHTML(game) {
   const tips = (game.guide || []).length;
   const mst = game.mastery || {};
 
-  return `<main class="main" data-scroll="main">
-    <div class="panel-head" style="background:linear-gradient(180deg, ${game.accent}14, transparent)">
-      <div class="head-top">
-        <div class="head-ring">${ring(pct, 72, 5, game.accent)}${game.icon ? `<div class="head-icon" style="background-image:url('${esc(game.icon)}')"></div>` : `<span class="ico">🎮</span>`}</div>
-        <div class="head-info">
-          <h1>${esc(game.title)}</h1>
-          <p class="plat">${esc(game.platform)}</p>
-          <p class="total" style="color:${game.accent}">${e} / ${t} CONQUISTAS NO TOTAL · ${pct}%</p>
+  const cor = corDe(game);
+  const arte = game.art || {};
+  return `<main class="main" data-scroll="main" style="--jogo:${cor}">
+    ${arte.ingame ? `<div class="game-bg" style="background-image:url('${esc(arte.ingame)}')"></div>` : ""}
+    <div class="game-glow"></div>
+    <div class="panel-head">
+      <div class="hero">
+        ${arte.title ? `<div class="hero-art" style="background-image:url('${esc(arte.title)}')"></div>` : ""}
+        <div class="hero-scrim"></div>
+        <div class="hero-txt">
+          <div class="head-info">
+            <h1>${esc(game.title)}</h1>
+            <p class="plat">${esc(game.platform)}</p>
+            <p class="total">${e}<small>/${t}</small>
+              <small class="sep">obtidas</small>
+              <span class="mst">${mst.percent || 0}% rumo ao Mastery</span></p>
+          </div>
+          <div class="hero-bar" title="Progresso de Mastery: ${mst.hardcore || 0} de ${t} em hardcore">
+            <i style="width:${mst.percent || 0}%"></i>
+          </div>
         </div>
       </div>
       <div class="chips-row">
@@ -479,9 +601,9 @@ function mainHTML(game) {
         <span class="le-date">${esc(le.date)}</span>
       </div>` : ""}
       <div class="panel-tabs">
-        <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk" style="--tab-accent:${game.accent}">⛳ WALKTHROUGH</button>
-        <button class="ptab ${S.tab === "mastery" ? "active" : ""}" data-tab="mastery" style="--tab-accent:${game.accent}">⚡ MASTERY${mst.softcore_only ? ` · ${mst.softcore_only}` : ""}</button>
-        <button class="ptab ${S.tab === "tips" ? "active" : ""}" data-tab="tips" style="--tab-accent:${game.accent}">📖 DICAS & TUTORIAIS${tips ? ` · ${tips}` : ""}</button>
+        <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk">Walkthrough</button>
+        <button class="ptab ${S.tab === "mastery" ? "active" : ""}" data-tab="mastery">Mastery${mst.softcore_only ? `<span class="count">${mst.softcore_only}</span>` : ""}</button>
+        <button class="ptab ${S.tab === "tips" ? "active" : ""}" data-tab="tips">Dicas${tips ? `<span class="count">${tips}</span>` : ""}</button>
       </div>
     </div>
     ${S.tab === "tips" ? guideHTML(game) : S.tab === "mastery" ? masteryHTML(game) : walkHTML(game)}
@@ -638,6 +760,147 @@ function bindSidebar() {
   if (add) add.onclick = () => enterWizard1();
   const imp = $("#btn-import-all");
   if (imp) imp.onclick = () => enterImportAll();
+}
+
+/* ═══════════════════════════  CONFIGURAÇÕES  ═══════════════════════════
+   Tela própria, aberta pelo ⚙ da barra de título. Antes o provedor de IA só
+   era alcançável dentro do wizard de adicionar jogo — que a importação
+   automática fez você nunca abrir. */
+async function enterSettings() {
+  S.view = "settings";
+  stopPolling();
+  const [estado, ia] = await Promise.all([
+    backend.appState().catch(() => ({})),
+    backend.getAiConfig().catch(() => ({ ok: false })),
+  ]);
+  S.SET = { estado, ia: ia && ia.ok ? ia : null };
+  renderSettings();
+}
+
+function renderSettings() {
+  const { estado, ia } = S.SET;
+  const prov = ia && (ia.providers.find((p) => p.id === ia.provider) || ia.providers[0]);
+
+  const chave = (id, txt, sub, ligado) => `
+    <div class="set-row">
+      <div><div class="set-txt">${esc(txt)}</div><div class="set-sub">${esc(sub)}</div></div>
+      <button class="switch ${ligado ? "on" : ""}" data-toggle="${id}" role="switch"
+              aria-checked="${!!ligado}" aria-label="${esc(txt)}"></button>
+    </div>`;
+
+  root.innerHTML = `<div class="view">
+    <div class="wiz-head">
+      <button class="back" id="set-back" title="Voltar">←</button>
+      <div><div class="t">Configurações</div>
+      <div class="s">Conta, inteligência artificial, biblioteca e overlay</div></div>
+    </div>
+    <div class="settings">
+      <div class="settings-inner">
+
+        <section class="set-section">
+          <h3>Conta</h3>
+          <div class="set-row">
+            <div><div class="set-txt">RetroAchievements</div>
+            <div class="set-sub">${estado.username ? esc(estado.username) : "não conectada"}</div></div>
+            <button class="btn-ghost" id="set-reconnect">Trocar conta</button>
+          </div>
+        </section>
+
+        <section class="set-section">
+          <h3>Inteligência artificial</h3>
+          <p class="set-hint">Opcional. Refina o guia importado do GameFAQs: reordena as
+            conquistas pelo walkthrough e organiza as dicas. Cobrado pelo provedor que você
+            escolher; sem chave, a importação continua funcionando pela heurística.</p>
+          ${ia ? `
+            <div class="ai-providers">
+              ${ia.providers.map((p) => `
+                <button class="ai-prov ${p.id === ia.provider ? "on" : ""}" data-prov="${esc(p.id)}">
+                  <span class="ai-prov-name">${esc(p.label)}</span>
+                  ${p.has_key ? `<span class="ai-prov-ok">✓ chave salva</span>` : ""}
+                </button>`).join("")}
+            </div>
+            <label class="set-label">Chave da API${prov.has_key ? " (salva — deixe em branco para manter)" : ""}</label>
+            <input class="set-field" id="set-key" type="password" autocomplete="off" spellcheck="false"
+                   placeholder="${prov.has_key ? "••••••••••••••••" : "cole a chave aqui"}" />
+            <label class="set-label">Modelo</label>
+            <input class="set-field" id="set-model" autocomplete="off" spellcheck="false"
+                   value="${esc(ia.model || "")}" placeholder="${esc(prov.default_model)}" />
+            ${prov.needs_base_url ? `
+              <label class="set-label">Endpoint (OpenRouter, Ollama, LM Studio…)</label>
+              <input class="set-field" id="set-base" autocomplete="off" spellcheck="false"
+                     value="${esc(ia.base_url || "")}" placeholder="${esc(prov.default_base_url || "")}" />` : ""}
+            <p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.
+              Obter em <span class="ai-link">${esc(prov.key_url || "")}</span></p>
+            <div style="display:flex;gap:8px">
+              <button class="btn-primary" id="set-ai-save">Salvar</button>
+              <button class="btn-ghost" id="set-ai-clear">Remover chave</button>
+            </div>` : `<p class="set-hint">Indisponível no modo demonstração.</p>`}
+        </section>
+
+        <section class="set-section">
+          <h3>Biblioteca</h3>
+          ${chave("auto_import", "Importar jogos novos automaticamente",
+                  "Verifica a cada 5 minutos e traz os jogos em que você começou a jogar",
+                  S.autoImport)}
+        </section>
+
+        <section class="set-section">
+          <h3>Overlay</h3>
+          ${chave("auto_overlay", "Grudar no emulador",
+                  "Vira overlay e acompanha a janela quando um emulador abre", S.autoOverlay)}
+          ${chave("overlay_exit_fullscreen", "Sair do fullscreen exclusivo",
+                  "Manda Alt+Enter para o emulador. Nenhum overlay aparece sobre tela cheia exclusiva, então esta é a única forma de continuar vendo o progresso num monitor só",
+                  S.overlayExitFullscreen)}
+          ${chave("overlay_second_screen", "Usar o segundo monitor",
+                  "Com dois monitores, leva o overlay para a tela que o jogo não ocupa",
+                  S.overlaySecondScreen)}
+        </section>
+
+      </div>
+    </div>
+  </div>`;
+
+  $("#set-back").onclick = enterDashboard;
+  $("#set-reconnect").onclick = () => { S.mode = "real"; renderSetup(); };
+  root.querySelectorAll("[data-toggle]").forEach((b) => {
+    b.onclick = () => alternarPreferencia(b.dataset.toggle, b);
+  });
+  root.querySelectorAll("[data-prov]").forEach((b) => {
+    b.onclick = () => { S.SET.ia.provider = b.dataset.prov; S.SET.ia.model = ""; renderSettings(); };
+  });
+  const salvar = $("#set-ai-save");
+  if (salvar) salvar.onclick = () => salvarIa(null);
+  const limpar = $("#set-ai-clear");
+  if (limpar) limpar.onclick = () => salvarIa("");
+}
+
+async function alternarPreferencia(chave, botao) {
+  const novo = !botao.classList.contains("on");
+  botao.classList.toggle("on", novo);
+  botao.setAttribute("aria-checked", String(novo));
+  if (chave === "auto_import") { S.autoImport = novo; await backend.setAutoImport(novo); }
+  else if (chave === "auto_overlay") { S.autoOverlay = novo; await backend.setAutoOverlay(novo); }
+  else {
+    if (chave === "overlay_exit_fullscreen") S.overlayExitFullscreen = novo;
+    else S.overlaySecondScreen = novo;
+    await backend.setOverlayOption(chave, novo);
+  }
+}
+
+async function salvarIa(forcarChave) {
+  const digitada = ($("#set-key")?.value || "").trim();
+  const res = await backend.setAiConfig({
+    provider: S.SET.ia.provider,
+    api_key: forcarChave !== null ? forcarChave : (digitada || null),
+    model: ($("#set-model")?.value || "").trim(),
+    base_url: ($("#set-base")?.value || "").trim(),
+  });
+  if (!res || !res.ok) return toast("Não foi possível salvar.", true);
+  S.aiReady = !!res.ai_ready;
+  S.SET.ia = res;
+  renderSettings();
+  const nome = res.providers.find((p) => p.id === res.provider).label;
+  toast(S.aiReady ? `IA pronta via ${nome}.` : "Chave removida.");
 }
 
 /* ========================= IMPORTAR DO GAMEFAQS ========================= */
@@ -1486,6 +1749,66 @@ function bindWindowControls() {
     if (S.view === "dashboard") await renderDashboard();
   });
   $("#btn-exit-demo")?.addEventListener("click", exitDemo);
+  $("#btn-settings")?.addEventListener("click", () => {
+    if (S.view === "settings") return enterDashboard();
+    enterSettings();
+  });
+  bindAtalhos();
+}
+
+/* ─────────────────────────  ATALHOS DE TECLADO  ─────────────────────────
+   O rodapé anuncia essas teclas, então elas precisam existir. Também é a
+   navegação por teclado que o app não tinha. */
+const ABAS = ["walk", "mastery", "tips"];
+
+function bindAtalhos() {
+  document.addEventListener("keydown", async (e) => {
+    // não sequestra digitação em campos de texto
+    const alvo = e.target;
+    if (alvo && (alvo.tagName === "INPUT" || alvo.tagName === "TEXTAREA" || alvo.isContentEditable)) {
+      if (e.key === "Escape") alvo.blur();
+      return;
+    }
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+
+    if (e.key === "Escape") {
+      e.preventDefault();
+      if ($("#gf-modal")) return closeGameFaqs();
+      if (S.view !== "dashboard") return enterDashboard();
+      if (S.compact) return toggleCompacto();
+      return;
+    }
+
+    if (e.key === "c" || e.key === "C") { e.preventDefault(); return toggleCompacto(); }
+
+    if (S.view !== "dashboard") return;
+
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      return trocarJogo(e.key === "ArrowDown" ? 1 : -1);
+    }
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const i = ABAS.indexOf(S.tab);
+      S.tab = ABAS[(i + (e.shiftKey ? -1 : 1) + ABAS.length) % ABAS.length];
+      return renderDashboard({ force: true });
+    }
+  });
+}
+
+async function trocarJogo(dir) {
+  if (!S.library.length) return;
+  const i = S.library.findIndex((g) => g.slug === S.activeSlug);
+  S.activeSlug = S.library[(i + dir + S.library.length) % S.library.length].slug;
+  await renderDashboard({ force: true });
+}
+
+async function toggleCompacto() {
+  const btn = $("#btn-compact");
+  S.compact = !S.compact;
+  btn?.classList.toggle("active", S.compact);
+  if (hasBackend()) window.pywebview.api.set_compact(S.compact);
+  if (S.view === "dashboard") await renderDashboard({ force: true });
 }
 
 /* Sai do modo demonstração: volta para a tela de conexão (ou, se já houver
@@ -1520,6 +1843,8 @@ async function boot() {
     if (st.auto_import !== undefined) S.autoImport = st.auto_import;
     if (st.auto_overlay !== undefined) S.autoOverlay = st.auto_overlay;
     if (st.ai_ready !== undefined) S.aiReady = st.ai_ready;
+    if (st.overlay_exit_fullscreen !== undefined) S.overlayExitFullscreen = st.overlay_exit_fullscreen;
+    if (st.overlay_second_screen !== undefined) S.overlaySecondScreen = st.overlay_second_screen;
     if (S.mode === "real" && !st.configured) renderSetup();
     else enterDashboard();
   } catch (e) {

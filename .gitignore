@@ -8,6 +8,7 @@ config/settings.json
 config/cache/
 assets/badges/
 assets/icons/
+assets/art/
 
 # Jogos da SUA conta: desde a importação automática, estes arquivos são gerados
 # a partir da RetroAchievements (progresso pessoal + texto de guias de terceiros),

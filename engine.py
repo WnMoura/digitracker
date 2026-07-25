@@ -57,6 +57,12 @@ SECRETS_PATH = CONFIG_DIR / "secrets.json"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 BADGES_DIR = DATA_DIR / "assets" / "badges"
 ICONS_DIR = DATA_DIR / "assets" / "icons"   # ícones dos jogos (RA ImageIcon)
+ART_DIR = DATA_DIR / "assets" / "art"       # capa, tela de título e screenshot
+
+# Artes que a RetroAchievements devolve por jogo, além do ícone. A capa
+# identifica o jogo na biblioteca; a tela de título vira o cabeçalho; o
+# screenshot vira o fundo ambiente do painel.
+GAME_ART = {"box": "ImageBoxArt", "title": "ImageTitle", "ingame": "ImageIngame"}
 
 SYNC_INTERVAL = 30      # segundos entre ciclos de sincronização
 SYNC_MAX_INTERVAL = 600  # teto do backoff quando a API está limitando
@@ -70,7 +76,9 @@ OVERLAY_INTERVAL = 2.5
 
 DEFAULT_SETTINGS = {
     "auto_import": True,   # espelhar a conta: jogo novo entra sozinho
-    "auto_overlay": True,  # grudar no emulador quando ele abrir
+    "auto_overlay": True,           # grudar no emulador quando ele abrir
+    "overlay_exit_fullscreen": False,  # mandar Alt+Enter ao ver fullscreen exclusivo
+    "overlay_second_screen": False,    # levar o overlay para o monitor livre
     "dismissed": [],       # slugs removidos à mão — não voltam sozinhos
     "emulators": [],       # sobrescreve a lista padrão de emuladores (opcional)
     "ai_provider": "",     # provedor do refino por IA (vazio = padrão)
@@ -121,6 +129,8 @@ def load_settings() -> dict:
     if isinstance(saved, dict):
         settings["auto_import"] = bool(saved.get("auto_import", True))
         settings["auto_overlay"] = bool(saved.get("auto_overlay", True))
+        for chave in ("overlay_exit_fullscreen", "overlay_second_screen"):
+            settings[chave] = bool(saved.get(chave, False))
         for key in ("dismissed", "emulators"):
             value = saved.get(key)
             if isinstance(value, list):
@@ -198,12 +208,13 @@ class Api:
         self._overlay = None                  # OverlayWatcher (grudar no emulador)
         self._tracker = None
         self._own_hwnd = None
+        self.overlay_notice = ""              # aviso pendente para a interface
         self.index_building = False
         self._compact = False
         self._pre_compact_pos: tuple[int, int] | None = None
         self._lock = threading.Lock()
 
-        for d in (GAMES_DIR, CACHE_DIR, BADGES_DIR, ICONS_DIR):
+        for d in (GAMES_DIR, CACHE_DIR, BADGES_DIR, ICONS_DIR, ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
 
         secrets = load_secrets()
@@ -219,6 +230,8 @@ class Api:
             "index_building": self.index_building,
             "auto_import": self.settings["auto_import"],
             "auto_overlay": self.settings["auto_overlay"],
+            "overlay_exit_fullscreen": self.settings["overlay_exit_fullscreen"],
+            "overlay_second_screen": self.settings["overlay_second_screen"],
             "compact": self._compact,
             "ai_ready": bool(self._ai_key()),   # só o fato, nunca a chave
         }
@@ -255,6 +268,7 @@ class Api:
                     "title": g["title"],
                     "platform": g["platform"],
                     "icon": g.get("icon", ""),
+                    "art": g.get("art", {}),
                     "accent": g["accent"],
                     "modes": g["modes"],
                     "mastery": g["mastery"],
@@ -390,6 +404,8 @@ class Api:
             # jogos que entraram sozinhos desde a última consulta da UI
             status["auto_imported"] = self.auto_imported
             self.auto_imported = []
+            status["overlay_notice"] = self.overlay_notice   # ex.: fullscreen exclusivo
+            self.overlay_notice = ""
         return status
 
     # ------------------ importação automática (espelha a conta) ------------- #
@@ -495,6 +511,7 @@ class Api:
             "title": title,
             "platform": progress.get("ConsoleName", ""),
             "icon": icon_url,
+            "art": self._download_art(slug, progress),
             "accent": self._pick_accent(slug),
             "retroachievements_game_id": int(game_id),
             "walkthrough": [{
@@ -558,6 +575,7 @@ class Api:
             "title": title,
             "platform": platform,
             "icon": icon_url,
+            "art": self._download_art(slug, progress),
             "retroachievements_game_id": int(game_id),
             "achievements_meta": {
                 str(a["id"]): {
@@ -602,6 +620,7 @@ class Api:
             "title": self.pending_import["title"],
             "platform": self.pending_import["platform"],
             "icon": self.pending_import.get("icon", ""),
+            "art": self.pending_import.get("art", {}),
             "accent": payload.get("accent", accent),
             "retroachievements_game_id": self.pending_import["retroachievements_game_id"],
             "walkthrough": steps,
@@ -935,6 +954,17 @@ class Api:
             save_settings(self.settings)
         return {"ok": True, "auto_overlay": value}
 
+    def set_overlay_option(self, chave: str, value: bool) -> dict:
+        """Interruptores do comportamento em fullscreen exclusivo. Ambos vêm
+        desligados: o app não injeta tecla nem pula de monitor sem seu aval."""
+        if chave not in ("overlay_exit_fullscreen", "overlay_second_screen"):
+            return {"ok": False, "error": f"Opção desconhecida: {chave}"}
+        value = bool(value)
+        with self._lock:
+            self.settings[chave] = value
+            save_settings(self.settings)
+        return {"ok": True, chave: value}
+
     def _overlay_actions(self) -> dict:
         """Ações que o watcher dispara. Reposicionar é mover a janela para o
         canto de dentro do emulador; o JS é avisado para trocar a tela."""
@@ -958,8 +988,41 @@ class Api:
             if tracker and self._own_hwnd:
                 tracker.make_topmost(self._own_hwnd)
 
+        def on_exclusive(rect, win):
+            """Jogo em fullscreen exclusivo: nenhum overlay aparece por cima.
+            Só agimos com o interruptor ligado — o app não injeta tecla nem
+            muda de tela por conta própria."""
+            with self._lock:
+                usar_2a_tela = self.settings.get("overlay_second_screen", False)
+                mandar_alt_enter = self.settings.get("overlay_exit_fullscreen", False)
+
+            if usar_2a_tela:
+                livre = emulator_tracker.pick_free_screen(rect, self._tracker.screens())
+                if livre:
+                    self.set_compact(True, dock=self._dock_for(livre), from_user=False)
+                    self._notify_ui_compact(True)
+                    self._warn_ui("O jogo está em tela cheia exclusiva; movi o overlay "
+                                  "para o outro monitor.")
+                    return
+
+            if mandar_alt_enter and self._tracker.send_fullscreen_toggle(win.get("hwnd")):
+                self._warn_ui(f"{win.get('title', 'O emulador')} estava em tela cheia "
+                              "exclusiva. Mandei Alt+Enter para sair.")
+                return
+
+            self._warn_ui(
+                f"{win.get('title', 'O emulador')} está em tela cheia exclusiva, e "
+                "nenhum overlay aparece por cima disso. Use o modo janela ou "
+                "borderless, ou ligue uma das opções de overlay nas configurações."
+            )
+
         return {"enter": enter, "follow": follow, "exit": leave,
-                "assert_top": assert_top}
+                "assert_top": assert_top, "on_exclusive": on_exclusive}
+
+    def _warn_ui(self, mensagem: str):
+        """Enfileira um aviso para a interface mostrar no próximo ciclo."""
+        with self._lock:
+            self.overlay_notice = mensagem
 
     @staticmethod
     def _dock_for(rect):
@@ -995,11 +1058,32 @@ class Api:
             try:
                 with self._lock:
                     enabled = self.settings.get("auto_overlay", True)
-                self._overlay.step(enabled=enabled, user_compact=self._compact)
+                exclusivo = enabled and self._tracker.is_exclusive_fullscreen()
+                self._overlay.step(enabled=enabled, user_compact=self._compact,
+                                   exclusive=exclusivo)
             except Exception:
                 pass          # nunca deixa o laço morrer por causa de uma janela
 
     # ----------------------------- helpers ---------------------------------- #
+    def _download_art(self, slug: str, progress: dict) -> dict:
+        """Baixa capa, tela de título e screenshot do jogo (o que existir).
+
+        Devolve `{"box": "/assets/art/slug/box.png", ...}` com apenas as artes
+        que vieram. Jogo sem alguma delas é normal na RetroAchievements — os
+        templates tratam a ausência.
+        """
+        art = {}
+        if not self._client:
+            return art
+        for nome, campo in GAME_ART.items():
+            caminho = progress.get(campo) or ""
+            if not caminho:
+                continue
+            destino = ART_DIR / slug / f"{nome}.png"
+            if self._client.download_image(caminho, destino):
+                art[nome] = f"/assets/art/{slug}/{nome}.png"
+        return art
+
     @staticmethod
     def _clean_walkthrough(steps) -> list[dict]:
         """Normaliza as etapas vindas do frontend: cada conquista guarda só o
@@ -1063,6 +1147,17 @@ class Api:
                         self._client.download_badge(
                             a["badge"], BADGES_DIR / slug / f"{a['badge']}.png"
                         )
+                # jogos salvos antes das artes existirem: completa sem migração
+                if not game.get("art"):
+                    art = self._download_art(slug, progress)
+                    if art:
+                        game["art"] = art
+                        caminho = GAMES_DIR / f"{slug}.json"
+                        if caminho.exists():
+                            caminho.write_text(
+                                json.dumps(game, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
             except RARateLimited:
                 limited = True
                 earned_map = {}
@@ -1150,6 +1245,7 @@ class Api:
             "title": game["title"],
             "platform": game["platform"],
             "icon": game.get("icon", ""),
+            "art": game.get("art", {}),
             "accent": game.get("accent", ACCENTS[0]),
             "modes": modes,
             "mastery": mastery,

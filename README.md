@@ -219,6 +219,28 @@ de sincronização **dobra o próprio intervalo** (até 10 min) e volta ao norma
 assim que a API liberar. Quando uma consulta falha, o último estado bom é
 mantido — o progresso na tela não "zera" por causa de uma oscilação de rede.
 
+## Configurações
+
+O **⚙** na barra de título abre a tela de Configurações, com quatro seções:
+**Conta** (qual conta da RetroAchievements está conectada), **Inteligência
+artificial** (provedor, chave, modelo e endpoint), **Biblioteca** (importação
+automática) e **Overlay** (comportamento sobre o emulador).
+
+> Antes da v0.3.0 o provedor de IA só era configurável dentro do wizard de
+> "Adicionar Jogo" — que a importação automática fez ninguém abrir. Na prática só
+> dava para configurar editando código.
+
+## Atalhos de teclado
+
+A faixa no rodapé mostra os atalhos, e todos funcionam:
+
+| Tecla | O que faz |
+|---|---|
+| `↑` `↓` | Troca de jogo na biblioteca |
+| `Tab` | Alterna entre Walkthrough, Mastery e Dicas (`Shift+Tab` volta) |
+| `C` | Liga e desliga o modo compacto |
+| `Esc` | Fecha um painel, ou volta ao dashboard |
+
 ## Overlay que gruda no emulador
 
 Abriu o emulador, o app **vira overlay sozinho e gruda no canto superior-direito
@@ -240,9 +262,25 @@ Cemu, RPCS3, Project64, DeSmuME e outros; a lista pode ser trocada pelo campo
   até esse emulador fechar.
 - **Desligar:** interruptor *Grudar no emulador automaticamente*, em
   "⤓ Importar meus jogos".
-- **Limite:** sobre **fullscreen exclusivo** nenhum overlay aparece — é uma
-  limitação do modo de vídeo, não do app. Use o emulador em **janela ou
-  borderless** (no Dolphin: *Options → Graphics → desmarcar Fullscreen*).
+### Tela cheia exclusiva
+
+Nesse modo o emulador toma a saída de vídeo e o compositor sai do caminho:
+**nenhuma janela comum é desenhada por cima**, por mais "sempre visível" que
+seja. Steam e Discord só conseguem porque injetam uma DLL dentro do processo do
+jogo — fora do escopo aqui.
+
+O app **detecta** a situação (`SHQueryUserNotificationState`, no Windows) e, em
+vez de sumir sem explicação, avisa. Nas configurações há dois interruptores,
+ambos **desligados por padrão** — o app não mexe no seu jogo sem permissão:
+
+- **Sair do fullscreen exclusivo** — manda `Alt+Enter` para o emulador, uma vez
+  por sessão de tela cheia. Nunca em laço.
+- **Usar o segundo monitor** — com dois monitores, leva o overlay para a tela que
+  o jogo não ocupa. É o único caso em que overlay e tela cheia exclusiva
+  convivem de verdade.
+
+Sem nenhum dos dois, use o emulador em **janela ou borderless** (no Dolphin:
+*Options → Graphics → desmarcar Fullscreen*).
 
 ## Testes
 

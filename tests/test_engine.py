@@ -409,6 +409,99 @@ class TestConfigDeIA:
         assert api.refine_guide_ai()["ok"] is False
 
 
+class TestArtesDoJogo:
+    """Capa, tela de título e screenshot: a API devolve as três, e elas dão
+    identidade a cada jogo na interface."""
+
+    @pytest.fixture
+    def api(self, tmp_path, monkeypatch):
+        for nome, sub in [("GAMES_DIR", "games"), ("CACHE_DIR", "cache"),
+                          ("BADGES_DIR", "badges"), ("ICONS_DIR", "icons"),
+                          ("ART_DIR", "art")]:
+            monkeypatch.setattr(engine, nome, tmp_path / sub)
+        monkeypatch.setattr(engine, "SECRETS_PATH", tmp_path / "secrets.json")
+        monkeypatch.setattr(engine, "SETTINGS_PATH", tmp_path / "settings.json")
+        api = engine.Api()
+
+        baixadas = []
+
+        class FakeClient:
+            @staticmethod
+            def download_image(caminho, destino):
+                baixadas.append((caminho, destino))
+                return True
+
+        api._client = FakeClient()
+        api._baixadas = baixadas
+        return api
+
+    PROGRESSO = {
+        "ImageBoxArt": "/Images/1.png",
+        "ImageTitle": "/Images/2.png",
+        "ImageIngame": "/Images/3.png",
+    }
+
+    def test_baixa_as_tres_artes(self, api):
+        art = api._download_art("jogo", self.PROGRESSO)
+        assert set(art) == {"box", "title", "ingame"}
+
+    def test_urls_apontam_para_a_pasta_servida(self, api):
+        art = api._download_art("digimon_world_4", self.PROGRESSO)
+        assert art["box"] == "/assets/art/digimon_world_4/box.png"
+
+    def test_arte_ausente_e_normal(self, api):
+        """Nem todo jogo na RetroAchievements tem as três."""
+        art = api._download_art("jogo", {"ImageBoxArt": "/Images/1.png"})
+        assert set(art) == {"box"}
+
+    def test_jogo_sem_arte_nenhuma(self, api):
+        assert api._download_art("jogo", {}) == {}
+
+    def test_download_que_falha_nao_entra_no_resultado(self, api):
+        api._client.download_image = staticmethod(lambda c, d: False)
+        assert api._download_art("jogo", self.PROGRESSO) == {}
+
+    def test_sem_cliente_nao_quebra(self, api):
+        api._client = None
+        assert api._download_art("jogo", self.PROGRESSO) == {}
+
+
+class TestOpcoesDeOverlay:
+    """Os dois interruptores do fullscreen exclusivo vêm DESLIGADOS: o app não
+    injeta tecla nem pula de monitor sem o aval do usuário."""
+
+    @pytest.fixture
+    def api(self, tmp_path, monkeypatch):
+        for nome, sub in [("GAMES_DIR", "games"), ("CACHE_DIR", "cache"),
+                          ("BADGES_DIR", "badges"), ("ICONS_DIR", "icons"),
+                          ("ART_DIR", "art")]:
+            monkeypatch.setattr(engine, nome, tmp_path / sub)
+        monkeypatch.setattr(engine, "SECRETS_PATH", tmp_path / "secrets.json")
+        monkeypatch.setattr(engine, "SETTINGS_PATH", tmp_path / "settings.json")
+        return engine.Api()
+
+    def test_desligados_por_padrao(self, api):
+        assert api.settings["overlay_exit_fullscreen"] is False
+        assert api.settings["overlay_second_screen"] is False
+
+    def test_liga_e_persiste(self, api):
+        api.set_overlay_option("overlay_exit_fullscreen", True)
+        assert engine.load_settings()["overlay_exit_fullscreen"] is True
+
+    def test_recusa_chave_desconhecida(self, api):
+        assert api.set_overlay_option("formatar_hd", True)["ok"] is False
+
+    def test_aparecem_no_estado_do_app(self, api):
+        api.set_overlay_option("overlay_second_screen", True)
+        assert api.get_app_state()["overlay_second_screen"] is True
+
+    def test_aviso_do_overlay_e_entregue_uma_vez(self, api):
+        """O aviso de tela cheia exclusiva não pode repetir a cada consulta."""
+        api._warn_ui("emulador em tela cheia exclusiva")
+        assert "exclusiva" in api.get_bulk_status()["overlay_notice"]
+        assert api.get_bulk_status()["overlay_notice"] == ""
+
+
 class TestCleanWalkthrough:
     def test_descarta_o_mode_legado(self):
         steps = [{"step": 1, "area": "A", "achievements": [{"id": 7, "mode": "hard"}]}]

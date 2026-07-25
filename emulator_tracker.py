@@ -40,6 +40,10 @@ DEFAULT_EMULATORS = [
 # KDE, e a própria janela do app não pode se detectar.
 _EXCLUDES = ["org.kde.dolphin", "dolphin file manager", "digitracker"]
 
+# SHQueryUserNotificationState: 3 = app Direct3D em fullscreen EXCLUSIVO, o
+# único caso em que nenhum overlay aparece por cima.
+QUNS_RUNNING_D3D_FULL_SCREEN = 3
+
 
 def is_emulator(title: str, wm_class: str, patterns=None) -> bool:
     """A janela (título + classe) parece um emulador?"""
@@ -70,6 +74,28 @@ def dock_position(rect, size, margin: int = 16):
     return x, ey + margin
 
 
+def _overlap(a, b) -> int:
+    """Área de interseção entre dois retângulos (x, y, w, h)."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    dx = min(ax + aw, bx + bw) - max(ax, bx)
+    dy = min(ay + ah, by + bh) - max(ay, by)
+    return dx * dy if dx > 0 and dy > 0 else 0
+
+
+def pick_free_screen(game_rect, screens):
+    """A tela que o jogo NÃO está ocupando.
+
+    Fullscreen exclusivo captura uma saída de vídeo só; num segundo monitor o
+    overlay continua visível. `screens` é uma lista de (x, y, w, h). Devolve a
+    tela livre com mais área, ou None se o jogo cobre todas.
+    """
+    livres = [s for s in (screens or []) if _overlap(game_rect, s) == 0]
+    if not livres:
+        return None
+    return max(livres, key=lambda s: s[2] * s[3])
+
+
 # ---------------------------------------------------------------------------- #
 # Máquina de estados (pura — testável com um localizador falso)
 # ---------------------------------------------------------------------------- #
@@ -94,6 +120,7 @@ class OverlayWatcher:
         self.active = False        # o overlay atual foi iniciado por nós
         self.muted = False         # usuário dispensou até o emulador fechar
         self._last_rect = None
+        self._fs_tratado = False   # já reagimos a ESTA sessão de fullscreen
 
     def notify_manual_exit(self):
         """Usuário desligou o compacto na mão. Se fomos nós que entramos,
@@ -103,8 +130,14 @@ class OverlayWatcher:
             self.muted = True
             self._last_rect = None
 
-    def step(self, enabled: bool = True, user_compact: bool = False):
-        """Um ciclo de verificação. Chamado pelo laço de polling do engine."""
+    def step(self, enabled: bool = True, user_compact: bool = False,
+             exclusive: bool = False):
+        """Um ciclo de verificação. Chamado pelo laço de polling do engine.
+
+        `exclusive` avisa que há um jogo em fullscreen exclusivo: nesse caso
+        nenhum overlay aparece, e quem decide o que fazer é `on_exclusive`
+        (mover para outra tela, mandar Alt+Enter ou só avisar) — uma única vez
+        por sessão de fullscreen, nunca em laço."""
         win = self.find_window() if enabled else None
 
         if win is None:
@@ -113,7 +146,17 @@ class OverlayWatcher:
                 self.active = False
             self.muted = False          # emulador fechou: o próximo pode grudar
             self._last_rect = None
+            self._fs_tratado = False
             return
+
+        if exclusive:
+            if not self._fs_tratado:
+                self._fs_tratado = True
+                trata = self.actions.get("on_exclusive")
+                if trata:
+                    trata(tuple(win["rect"]), win)
+            return
+        self._fs_tratado = False        # saiu do exclusivo: pode reagir de novo
 
         if self.active:
             rect = tuple(win["rect"])
@@ -202,6 +245,85 @@ class WindowsTracker:
                 return int(handle)
         return self.user32.FindWindowW(None, title) or None
 
+    def is_exclusive_fullscreen(self) -> bool:
+        """Há um app Direct3D em fullscreen EXCLUSIVO?
+
+        Nesse modo o emulador toma a saída de vídeo e o compositor sai do
+        caminho: nenhuma janela comum é desenhada por cima, por mais TOPMOST
+        que seja. `SHQueryUserNotificationState` responde exatamente isso —
+        `QUNS_RUNNING_D3D_FULL_SCREEN` (3). Detectar permite avisar ou agir em
+        vez de o overlay simplesmente sumir sem explicação.
+        """
+        ctypes = self._ctypes
+        estado = ctypes.c_int(0)
+        try:
+            hr = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(estado))
+        except Exception:
+            return False
+        return hr == 0 and estado.value == QUNS_RUNNING_D3D_FULL_SCREEN
+
+    def send_fullscreen_toggle(self, hwnd) -> bool:
+        """Manda Alt+Enter para o emulador, tirando-o do fullscreen exclusivo.
+
+        Só é chamado com o interruptor ligado e **uma vez por sessão** de
+        fullscreen — injetar tecla em outro programa em laço seria inaceitável.
+        Traz a janela para frente antes, senão a tecla vai para quem tem foco.
+        """
+        if not hwnd:
+            return False
+        ctypes, wintypes = self._ctypes, self._wintypes
+        user32 = self.user32
+
+        VK_MENU, VK_RETURN = 0x12, 0x0D
+        KEYEVENTF_KEYUP, INPUT_KEYBOARD = 0x0002, 1
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+        class INPUT(ctypes.Structure):
+            class _U(ctypes.Union):
+                _fields_ = [("ki", KEYBDINPUT)]
+            _anonymous_ = ("u",)
+            _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+        def tecla(vk, up=False):
+            return INPUT(type=INPUT_KEYBOARD,
+                         ki=KEYBDINPUT(wVk=vk, wScan=0,
+                                       dwFlags=KEYEVENTF_KEYUP if up else 0,
+                                       time=0, dwExtraInfo=None))
+
+        try:
+            user32.SetForegroundWindow(hwnd)
+            eventos = (INPUT * 4)(tecla(VK_MENU), tecla(VK_RETURN),
+                                  tecla(VK_RETURN, True), tecla(VK_MENU, True))
+            enviados = user32.SendInput(4, ctypes.byref(eventos), ctypes.sizeof(INPUT))
+            return enviados == 4
+        except Exception:
+            return False
+
+    def screens(self):
+        """Retângulos (x, y, w, h) de cada monitor."""
+        ctypes, wintypes = self._ctypes, self._wintypes
+        achadas = []
+
+        MONITORENUMPROC = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+            ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+        @MONITORENUMPROC
+        def cb(_hmon, _hdc, lprect, _lparam):
+            r = lprect.contents
+            achadas.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
+            return True
+
+        try:
+            self.user32.EnumDisplayMonitors(None, None, cb, 0)
+        except Exception:
+            return []
+        return achadas
+
 
 # ---------------------------------------------------------------------------- #
 # Backend Linux/X11 (xprop + xwininfo) — validação local
@@ -285,6 +407,23 @@ class LinuxTracker:
 
     def own_window_handle(self, _window, _title="DigiTracker"):
         return None
+
+    def is_exclusive_fullscreen(self) -> bool:
+        """No X11 não existe o modo exclusivo do Direct3D: mesmo em tela cheia
+        o compositor continua desenhando por cima."""
+        return False
+
+    def send_fullscreen_toggle(self, _hwnd) -> bool:
+        return False
+
+    def screens(self):
+        """Retângulos dos monitores, via `xrandr --listmonitors`."""
+        out = self._run(["xrandr", "--listmonitors"])
+        achadas = []
+        for m in re.finditer(r"(\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)", out):
+            w, h, x, y = (int(g) for g in m.groups())
+            achadas.append((x, y, w, h))
+        return achadas
 
 
 def create_tracker(patterns=None):

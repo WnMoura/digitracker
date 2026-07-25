@@ -302,6 +302,127 @@ class TestLinuxTrackerIntegracao:
         assert t.find_emulator_window() is None
 
 
+class TestEscolhaDeMonitor:
+    """Fullscreen exclusivo captura UMA saída de vídeo; num segundo monitor o
+    overlay continua visível. É a única forma de conviver com o exclusivo."""
+
+    TELA_1 = (0, 0, 1920, 1080)
+    TELA_2 = (1920, 0, 1920, 1080)
+
+    def test_devolve_o_monitor_livre(self):
+        jogo = (0, 0, 1920, 1080)          # ocupa a tela 1 inteira
+        assert et.pick_free_screen(jogo, [self.TELA_1, self.TELA_2]) == self.TELA_2
+
+    def test_monitor_livre_do_outro_lado(self):
+        jogo = (1920, 0, 1920, 1080)
+        assert et.pick_free_screen(jogo, [self.TELA_1, self.TELA_2]) == self.TELA_1
+
+    def test_sem_segundo_monitor_devolve_none(self):
+        assert et.pick_free_screen(self.TELA_1, [self.TELA_1]) is None
+
+    def test_jogo_em_janela_ainda_ocupa_a_tela(self):
+        """Janela pequena dentro do monitor: aquele monitor não está livre."""
+        jogo = (100, 100, 800, 600)
+        assert et.pick_free_screen(jogo, [self.TELA_1, self.TELA_2]) == self.TELA_2
+
+    def test_escolhe_a_maior_entre_as_livres(self):
+        pequena = (1920, 0, 1280, 720)
+        grande = (3200, 0, 2560, 1440)
+        achada = et.pick_free_screen(self.TELA_1, [self.TELA_1, pequena, grande])
+        assert achada == grande
+
+    def test_lista_vazia_nao_quebra(self):
+        assert et.pick_free_screen(self.TELA_1, []) is None
+        assert et.pick_free_screen(self.TELA_1, None) is None
+
+    def test_area_de_sobreposicao(self):
+        assert et._overlap((0, 0, 10, 10), (5, 5, 10, 10)) == 25
+        assert et._overlap((0, 0, 10, 10), (20, 20, 5, 5)) == 0
+        assert et._overlap((0, 0, 10, 10), (10, 0, 10, 10)) == 0   # encostados
+
+
+class TestFullscreenExclusivo:
+    """A reação ao exclusivo acontece UMA vez por sessão de fullscreen —
+    injetar tecla ou pular de monitor em laço seria inaceitável."""
+
+    def test_dispara_o_tratamento_uma_unica_vez(self):
+        acts = FakeActions()
+        chamadas = []
+        acts["on_exclusive"] = lambda rect, win: chamadas.append(rect)
+        w = et.OverlayWatcher(lambda: WIN, acts)
+        for _ in range(4):
+            w.step(exclusive=True)
+        assert len(chamadas) == 1
+
+    def test_nao_gruda_enquanto_em_exclusivo(self):
+        """Grudar seria inútil: o overlay não apareceria mesmo."""
+        acts = FakeActions()
+        acts["on_exclusive"] = lambda rect, win: None
+        w = et.OverlayWatcher(lambda: WIN, acts)
+        w.step(exclusive=True)
+        assert "enter" not in acts.kinds
+        assert not w.active
+
+    def test_recebe_o_retangulo_e_a_janela(self):
+        acts = FakeActions()
+        recebido = {}
+        acts["on_exclusive"] = lambda rect, win: recebido.update(rect=rect, win=win)
+        et.OverlayWatcher(lambda: WIN, acts).step(exclusive=True)
+        assert recebido["rect"] == (0, 0, 1280, 720)
+        assert recebido["win"]["title"] == "Dolphin"
+
+    def test_sair_do_exclusivo_rearma(self):
+        acts = FakeActions()
+        chamadas = []
+        acts["on_exclusive"] = lambda rect, win: chamadas.append(1)
+        w = et.OverlayWatcher(lambda: WIN, acts)
+        w.step(exclusive=True)
+        w.step(exclusive=False)          # voltou para janela: gruda normalmente
+        w.step(exclusive=True)           # entrou de novo: pode reagir
+        assert len(chamadas) == 2
+        assert "enter" in acts.kinds
+
+    def test_fechar_o_emulador_rearma(self):
+        seq = [WIN, None, WIN]
+        acts = FakeActions()
+        chamadas = []
+        acts["on_exclusive"] = lambda rect, win: chamadas.append(1)
+        w = et.OverlayWatcher(lambda: seq.pop(0), acts)
+        w.step(exclusive=True)
+        w.step()                          # emulador fechou
+        w.step(exclusive=True)
+        assert len(chamadas) == 2
+
+    def test_sem_tratador_nao_quebra(self):
+        w = et.OverlayWatcher(lambda: WIN, FakeActions())
+        w.step(exclusive=True)            # sem "on_exclusive" registrado
+
+    def test_linux_nunca_reporta_exclusivo(self):
+        """O X11 não tem o modo exclusivo do Direct3D."""
+        assert et.LinuxTracker().is_exclusive_fullscreen() is False
+
+    def test_linux_nao_manda_alt_enter(self):
+        assert et.LinuxTracker().send_fullscreen_toggle(None) is False
+
+
+class TestMonitoresLinux:
+    SAIDA = (
+        "Monitors: 2\n"
+        " 0: +*DP-4 1920/600x1080/340+0+0  DP-4\n"
+        " 1: +HDMI-1 2560/700x1440/390+1920+0  HDMI-1\n"
+    )
+
+    def test_le_os_monitores(self, monkeypatch):
+        t = et.LinuxTracker()
+        monkeypatch.setattr(t, "_run", lambda cmd: self.SAIDA)
+        assert t.screens() == [(0, 0, 1920, 1080), (1920, 0, 2560, 1440)]
+
+    def test_xrandr_ausente_nao_quebra(self, monkeypatch):
+        t = et.LinuxTracker()
+        monkeypatch.setattr(t, "_run", lambda cmd: "")
+        assert t.screens() == []
+
+
 def test_create_tracker_escolhe_pela_plataforma():
     t = et.create_tracker()
     esperado = et.WindowsTracker if sys.platform == "win32" else et.LinuxTracker
