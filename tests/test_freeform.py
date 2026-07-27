@@ -239,6 +239,49 @@ class TestOrdenacaoPeloFaq:
         assert gp._desc_anchors("") == []
         assert gp._desc_anchors(None) == []
 
+    def test_dificuldade_nunca_vira_ancora(self):
+        """`(Very|Super) Hard` é 2 palavras Capitalizadas, mas aparece em toda
+        linha do guia — ancorar nela jogava a conquista para o lugar errado."""
+        assert gp._desc_anchors("Complete Cliff Dungeon on Very Hard difficulty.") == ["cliff dungeon"]
+        assert gp._desc_anchors("Beat the boss on Super Hard difficulty.") == []
+
+    def test_nome_de_lugar_de_uma_palavra(self):
+        """`Vein` é um lugar de nome único: o regex antigo (2+ palavras) o perdia,
+        deixando toda a família Vein sem posição."""
+        assert gp._desc_anchors("Complete Vein on Normal difficulty.") == ["vein"]
+
+    def test_letra_solta_antes_do_nome(self):
+        """`X Zone`: a letra maiúscula solta faz parte do nome do lugar."""
+        assert gp._desc_anchors("Complete X Zone on Hard difficulty.") == ["x zone"]
+
+    def test_conector_no_meio_do_nome(self):
+        """`Abyss of Grief`, `Doom of Dome`: o `of` minúsculo não quebra o nome."""
+        assert "abyss of grief" in gp._desc_anchors(
+            "Defeat a rare crowned Digimon close to a data stream in Abyss of Grief."
+        )
+        assert "doom of dome" in gp._desc_anchors(
+            "Defeat a rare crowned Digimon deep in a row of bushes in Doom of Dome."
+        )
+
+    def test_preposicao_inicial_sai_da_ancora(self):
+        """`In Undead Yard, ...` — o guia escreve 'Undead Yard', não 'in undead
+        yard'; a preposição de início de frase precisa sair."""
+        assert gp._desc_anchors(
+            "In Undead Yard, destroy all 279 enemies and claim your reward on Normal difficulty."
+        ) == ["undead yard"]
+
+    def test_nome_composto_tem_prioridade_sobre_palavra_unica(self):
+        """Havendo um nome composto (específico), o nome de uma palvra só (mais
+        arriscado) nem é considerado."""
+        anchors = gp._desc_anchors("In Barbarian Cave, defeat Mammothmon and claim your reward.")
+        assert anchors == ["barbarian cave"]        # 'mammothmon' fica de fora
+
+    def test_meta_de_grind_nao_ganha_ancora(self):
+        """Subir de nível não acontece num ponto do walkthrough — sem âncora, a
+        conquista fica no balde 'missing' em vez de ir para um lugar errado."""
+        assert gp._desc_anchors("Raise a Digimon level to 50.") == []
+        assert gp._desc_anchors("Increase your digimon stats 100 times.") == []
+
     def test_nada_e_perdido(self, faq_real, parsed_real):
         meta = {str(i): {"title": t, "points": 5} for i, t in
                 enumerate(["Agumon", "Goburimon", "Zzz Nao Existe"], start=1)}

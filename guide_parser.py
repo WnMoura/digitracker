@@ -446,14 +446,80 @@ def parse_guide(text: str) -> dict:
 # ---------------------------------------------------------------------------- #
 _ACCEPT = 0.84   # score mínimo para aceitar um casamento
 
-# Nomes próprios compostos da descrição ("Humid Cave", "Cliff Dungeon").
-_PROPER_PHRASE_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+")
+# Um "token próprio" é uma palavra Capitalizada, incluindo CamelCase de nomes de
+# Digimon ("MetalEtemon", "PrinceMamemon").
+_PROPER_WORD_RE = re.compile(r"(?:[A-Z][a-z]+)+$")
+# Conectores que ligam nomes próprios sem quebrá-los ("Abyss of Grief").
+_CONNECTORS = {"of", "the", "de", "da", "do", "dos", "das", "and", "und"}
+# Dificuldade: o guia repete "Normal/Hard/Very Hard/Super Hard" em quase toda
+# linha, então jamais localiza uma conquista — pelo contrário, ancora em
+# qualquer lugar e é uma fonte de erro de posição.
+_DIFFICULTY = {"normal", "hard", "very", "super", "difficulty", "mode"}
+# Palavras genéricas de um guia de Digimon: não apontam para nenhum ponto.
+_GENERIC = {
+    "digimon", "digivolution", "digivolutions", "level", "bits", "boss",
+    "enemy", "enemies", "reward", "all", "one", "any", "album", "card",
+    "stats", "time", "times", "game", "weapon", "weapons", "technique",
+    "techniques", "trades",
+}
 # Verbos que abrem a descrição e não ajudam a localizar nada no guia.
 _DESC_VERBS = {
     "complete", "defeat", "clear", "obtain", "finish", "beat", "collect",
     "unlock", "earn", "reach", "win", "get", "find", "kill", "acquire",
-    "conquiste", "derrote", "complete", "termine", "obtenha",
+    "raise", "donate", "increase", "escape", "destroy", "claim", "fully",
+    "conquiste", "derrote", "termine", "obtenha",
 }
+# Preposições/artigos capitalizados por serem início de frase ("In Undead
+# Yard...") — nunca fazem parte do nome do lugar.
+_EDGE_DROP = _DIFFICULTY | _GENERIC | _DESC_VERBS | _CONNECTORS | {
+    "in", "at", "on", "from", "during", "after", "before", "with", "near",
+    "to", "for", "by", "a", "an", "your", "their", "its", "this", "that",
+}
+
+
+def _is_proper(tok: str) -> bool:
+    """Palavra Capitalizada, incluindo CamelCase ('MetalEtemon')."""
+    return bool(_PROPER_WORD_RE.match(tok))
+
+
+def _is_lone_capital(tok: str) -> bool:
+    """Letra maiúscula solta, como o 'X' de 'X Zone'."""
+    return len(tok) == 1 and tok.isupper()
+
+
+def _proper_runs(desc: str) -> list[list[str]]:
+    """Sequências de nomes próprios, com conectores no meio (nunca nas pontas):
+    'Complete Abyss of Grief' -> ['Complete', 'Abyss', 'of', 'Grief']. Uma letra
+    maiúscula solta ('X') só entra quando antecede outra palavra própria."""
+    words = re.findall(r"[A-Za-z']+", desc or "")
+    n = len(words)
+
+    def opens(i: int) -> bool:
+        return _is_proper(words[i]) or (
+            _is_lone_capital(words[i]) and i + 1 < n and _is_proper(words[i + 1])
+        )
+
+    runs: list[list[str]] = []
+    i = 0
+    while i < n:
+        if not opens(i):
+            i += 1
+            continue
+        run = [words[i]]
+        k = i + 1
+        while k < n:
+            if opens(k):
+                run.append(words[k])
+                k += 1
+            elif (words[k].lower() in _CONNECTORS
+                  and k + 1 < n and _is_proper(words[k + 1])):
+                run.extend((words[k], words[k + 1]))
+                k += 2
+            else:
+                break
+        runs.append(run)
+        i = k
+    return runs
 
 
 def _desc_anchors(desc: str) -> list[str]:
@@ -463,16 +529,29 @@ def _desc_anchors(desc: str) -> list[str]:
     inventadas pela comunidade do RetroAchievements muito depois. A descrição,
     porém, cita o que o guia cita ("Complete Humid Cave" -> "humid cave"), e é
     isso que permite posicionar a conquista no texto.
-    """
-    out = []
-    for phrase in _PROPER_PHRASE_RE.findall(desc or ""):
-        parts = normalize(phrase).split()
-        if len(parts) > 1 and parts[0] in _DESC_VERBS:
-            parts = parts[1:]          # "complete humid cave" -> "humid cave"
-        anchor = " ".join(parts)
-        if len(anchor) >= 6:
-            out.append(anchor)
-    return out
+
+    Duas camadas: primeiro os nomes próprios COMPOSTOS ("humid cave", "abyss of
+    grief", "x zone"), específicos e confiáveis. Só quando não sobra nenhum é
+    que se recorre a um nome próprio de UMA palavra ("vein", "mammothmon") —
+    específico o bastante para localizar, genérico o bastante para ser o último
+    recurso. Dificuldade e palavras de enredo nunca viram âncora."""
+    primary, single = [], []
+    for run in _proper_runs(desc):
+        parts = normalize(" ".join(run)).split()
+        while parts and parts[0] in _EDGE_DROP:      # tira verbo/prep/dificuldade
+            parts = parts[1:]
+        while parts and parts[-1] in _EDGE_DROP:
+            parts = parts[:-1]
+        content = [p for p in parts if p not in _CONNECTORS]
+        if len(content) >= 2:
+            anchor = " ".join(parts)
+            if len(anchor) >= 6:
+                primary.append(anchor)
+        elif len(content) == 1:
+            word = content[0]
+            if len(word) >= 4 and word not in _EDGE_DROP:
+                single.append(word)
+    return primary or single
 
 
 def order_from_guide(parsed: dict, achievements_meta: dict, full_text: str = "") -> dict:
