@@ -27,6 +27,7 @@ import emulator_tracker
 import gamefaqs
 import guide_ai
 import guide_parser
+import steamgriddb
 from ra_api import RAClient, RAError, RARateLimited, fmt_date
 
 
@@ -84,7 +85,16 @@ DEFAULT_SETTINGS = {
     "ai_provider": "",     # provedor do refino por IA (vazio = padrão)
     "ai_model": "",        # modelo específico (vazio = o padrão do provedor)
     "ai_base_url": "",     # endpoint próprio, para provedores compatíveis
+    "compact_width": 300,   # tamanho do overlay compacto (ajustável pelo usuário)
+    "compact_height": 232,
+    "compact_last": 2,      # quantas conquistas OBTIDAS mostrar no compacto
+    "compact_next": 0,      # quantas PRÓXIMAS mostrar (0 = cabe o que couber)
 }
+
+# Limites do overlay compacto: não deixa encolher a ponto de nada caber, nem
+# crescer tanto que deixe de ser um overlay.
+COMPACT_MIN = (240, 150)
+COMPACT_MAX = (640, 900)
 
 ACCENTS = ["#D62839", "#F5C518", "#2DE2E6", "#27AE60"]
 
@@ -139,6 +149,10 @@ def load_settings() -> dict:
             value = saved.get(key)
             if isinstance(value, str):
                 settings[key] = value
+        for key in ("compact_width", "compact_height", "compact_last", "compact_next"):
+            value = saved.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                settings[key] = int(value)
     return settings
 
 
@@ -234,6 +248,7 @@ class Api:
             "overlay_second_screen": self.settings["overlay_second_screen"],
             "compact": self._compact,
             "ai_ready": bool(self._ai_key()),   # só o fato, nunca a chave
+            "covers_ready": bool(self._covers_key()),  # idem: só se há chave
         }
 
     def save_secrets(self, username: str, api_key: str) -> dict:
@@ -881,6 +896,142 @@ class Api:
             self._sync_game(game)
         return {"ok": True, "sections": len(guide), "filename": filename}
 
+    # --------------------- seletor de capas (SteamGridDB) ------------------- #
+    # A capa escolhida fica em `art.cover` — separada da capa da RA (`art.box`),
+    # para poder ser trocada e revertida sem perder a original. A chave do
+    # SteamGridDB é guardada em secrets.json, no mesmo esquema das chaves de IA.
+    def _covers_key(self) -> str:
+        return ((load_secrets() or {}).get("steamgriddb_api_key") or "").strip()
+
+    def get_covers_config(self) -> dict:
+        """Estado do seletor para a UI. NUNCA devolve a chave, só se ela existe."""
+        return {"ok": True, "has_key": bool(self._covers_key())}
+
+    def set_covers_key(self, api_key: str = None) -> dict:
+        """Grava a chave do SteamGridDB (string vazia apaga)."""
+        if api_key is not None:
+            secrets = load_secrets() or {}
+            key = (api_key or "").strip()
+            if key:
+                secrets["steamgriddb_api_key"] = key
+            else:
+                secrets.pop("steamgriddb_api_key", None)
+            SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SECRETS_PATH.write_text(json.dumps(secrets, indent=2), encoding="utf-8")
+        return self.get_covers_config()
+
+    # Cada imagem escolhida pode virar CAPA (art.cover: overlay/lateral, retrato)
+    # ou FUNDO (art.background: atrás da lista de conquistas, paisagem) — ou os
+    # dois. Ambos ficam separados da arte da RA e são reversíveis.
+    _ROLE_FILE = {"cover": "cover.png", "background": "background.png"}
+    _ROLE_ART = {"cover": "cover", "background": "background"}
+
+    def covers_search(self, slug: str, query: str = "") -> dict:
+        """Busca imagens para um jogo. Sem `query`, procura pelo título do jogo;
+        com `query`, pela busca digitada (para corrigir um casamento errado).
+        Devolve o jogo casado, suas CAPAS (retrato) e FUNDOS/heroes (paisagem), e
+        os demais jogos encontrados (para trocar de jogo, como no Playnite)."""
+        key = self._covers_key()
+        if not key:
+            return {"ok": False, "error": "Configure sua chave do SteamGridDB nas Configurações."}
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        term = (query or "").strip() or (game or {}).get("title", "")
+        if not term:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        try:
+            session = steamgriddb.create_session(key)
+            matches = steamgriddb.search_games(session, term)
+            if not matches:
+                return {"ok": True, "matches": [], "chosen": None, "covers": [], "heroes": []}
+            chosen = matches[0]
+            covers = steamgriddb.game_covers(session, chosen["id"])
+            heroes = self._safe_heroes(session, chosen["id"])
+        except steamgriddb.SteamGridDBError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "matches": matches, "chosen": chosen,
+                "covers": covers, "heroes": heroes}
+
+    def covers_for(self, game_id: int) -> dict:
+        """Capas e fundos de um jogo específico do SteamGridDB (quando o usuário
+        troca o jogo casado na grade)."""
+        key = self._covers_key()
+        if not key:
+            return {"ok": False, "error": "Configure sua chave do SteamGridDB nas Configurações."}
+        try:
+            session = steamgriddb.create_session(key)
+            gid = int(game_id)
+            covers = steamgriddb.game_covers(session, gid)
+            heroes = self._safe_heroes(session, gid)
+        except (steamgriddb.SteamGridDBError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "covers": covers, "heroes": heroes}
+
+    @staticmethod
+    def _safe_heroes(session, game_id: int) -> list:
+        """Heroes são um extra: se o jogo não tiver nenhum (404), a busca de
+        capas não deve falhar por isso."""
+        try:
+            return steamgriddb.game_heroes(session, game_id)
+        except steamgriddb.SteamGridDBError:
+            return []
+
+    def set_game_cover(self, slug: str, url: str, role: str = "cover") -> dict:
+        """Baixa a imagem escolhida e a grava no papel pedido — `cover`,
+        `background` ou `both` — sem tocar em conquistas/progresso. A URL ganha um
+        sufixo de versão para o webview não reusar a imagem antiga do cache."""
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        key = self._covers_key()
+        if not key:
+            return {"ok": False, "error": "Configure sua chave do SteamGridDB nas Configurações."}
+        roles = ["cover", "background"] if role == "both" else [role]
+        if any(r not in self._ROLE_FILE for r in roles):
+            return {"ok": False, "error": f"Papel inválido: {role}"}
+        try:
+            session = steamgriddb.create_session(key)
+        except steamgriddb.SteamGridDBError as exc:
+            return {"ok": False, "error": str(exc)}
+        art = dict(game.get("art") or {})
+        stamp = int(time.time())
+        for r in roles:
+            dest = ART_DIR / slug / self._ROLE_FILE[r]
+            if not steamgriddb.download_cover(session, url, dest):
+                return {"ok": False, "error": "Não consegui baixar a imagem escolhida."}
+            art[self._ROLE_ART[r]] = f"/assets/art/{slug}/{self._ROLE_FILE[r]}?v={stamp}"
+        self._persist_art(slug, game, art)
+        return {"ok": True, "art": art}
+
+    def clear_game_cover(self, slug: str, role: str = "cover") -> dict:
+        """Volta à arte padrão da RA no papel pedido (`cover`, `background` ou
+        `both`): remove o campo e o arquivo baixado."""
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        roles = ["cover", "background"] if role == "both" else [role]
+        art = dict(game.get("art") or {})
+        for r in roles:
+            if r not in self._ROLE_FILE:
+                continue
+            art.pop(self._ROLE_ART[r], None)
+            try:
+                (ART_DIR / slug / self._ROLE_FILE[r]).unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._persist_art(slug, game, art)
+        return {"ok": True, "art": art}
+
+    def _persist_art(self, slug: str, game: dict, art: dict) -> None:
+        """Grava o `art` no config do jogo e reflete no estado ao vivo."""
+        game["art"] = art
+        (GAMES_DIR / f"{slug}.json").write_text(
+            json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        with self._lock:
+            detail = self.state.get(slug)
+            if detail is not None:
+                detail["art"] = art
+
     # ------------------------- controles da janela -------------------------- #
     # IMPORTANTE: as operacoes de janela do pywebview (destroy/minimize/on_top)
     # NAO surtem efeito quando executadas de dentro do contexto do bridge
@@ -922,7 +1073,7 @@ class Api:
             if value:
                 if not self._pre_compact_pos:
                     self._pre_compact_pos = (win.x, win.y)
-                w, h = COMPACT_SIZE
+                w, h = self._compact_size()
                 win.resize(w, h)
                 pos = dock
                 if pos is None:
@@ -1024,9 +1175,46 @@ class Api:
         with self._lock:
             self.overlay_notice = mensagem
 
-    @staticmethod
-    def _dock_for(rect):
-        return emulator_tracker.dock_position(rect, COMPACT_SIZE, COMPACT_MARGIN)
+    def _compact_size(self) -> tuple[int, int]:
+        """Tamanho do overlay compacto, do jeito que o usuário ajustou nas
+        Configurações, preso a limites sensatos."""
+        with self._lock:
+            w = int(self.settings.get("compact_width") or COMPACT_SIZE[0])
+            h = int(self.settings.get("compact_height") or COMPACT_SIZE[1])
+        w = max(COMPACT_MIN[0], min(COMPACT_MAX[0], w))
+        h = max(COMPACT_MIN[1], min(COMPACT_MAX[1], h))
+        return w, h
+
+    def _dock_for(self, rect):
+        return emulator_tracker.dock_position(rect, self._compact_size(), COMPACT_MARGIN)
+
+    def get_compact_config(self) -> dict:
+        """Tamanho e contagens do overlay compacto para a UI."""
+        w, h = self._compact_size()
+        with self._lock:
+            last = int(self.settings.get("compact_last", 2))
+            nxt = int(self.settings.get("compact_next", 0))
+        return {"ok": True, "width": w, "height": h,
+                "last": max(0, last), "next": max(0, nxt)}
+
+    def set_compact_config(self, width=None, height=None, last=None, next=None) -> dict:
+        """Salva o tamanho/contagens do compacto. Se já estiver em modo compacto,
+        redimensiona a janela na hora."""
+        with self._lock:
+            if width is not None:
+                self.settings["compact_width"] = int(width)
+            if height is not None:
+                self.settings["compact_height"] = int(height)
+            if last is not None:
+                self.settings["compact_last"] = max(0, int(last))
+            if next is not None:
+                self.settings["compact_next"] = max(0, int(next))
+            save_settings(self.settings)
+        win = self._window
+        if win and self._compact and (width is not None or height is not None):
+            w, h = self._compact_size()
+            self._window_op(lambda: win.resize(w, h))
+        return self.get_compact_config()
 
     def _notify_ui_compact(self, compact: bool):
         """O backend mudou o modo sozinho — o JS precisa saber para re-renderizar
@@ -1223,7 +1411,9 @@ class Api:
                     if last_earned is None or date > last_earned["date_raw"]:
                         last_earned = row
 
-        next_ids = [r["id"] for r in ordered if not r["earned"]][:3]
+        # Guarda várias próximas: o overlay compacto escolhe quantas mostrar
+        # conforme o tamanho ajustado da janela.
+        next_ids = [r["id"] for r in ordered if not r["earned"]][:12]
         # Mastery = 100% em hardcore. É o número que a RA usa para o badge
         # dourado; as obtidas só em softcore precisam ser refeitas sem savestate.
         total = len(ordered)
@@ -1340,7 +1530,7 @@ def main():
         js_api=api,
         width=NORMAL_SIZE[0],
         height=NORMAL_SIZE[1],
-        min_size=COMPACT_SIZE,   # permite encolher até o modo compacto (overlay)
+        min_size=COMPACT_MIN,    # permite encolher até o menor overlay ajustável
         frameless=True,
         easy_drag=False,      # arrasto via .pywebview-drag-region
         on_top=True,

@@ -227,6 +227,12 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
   background-size: cover; background-position: center;
   opacity: .12; filter: saturate(.7);
 }
+/* Quando o fundo é uma imagem escolhida (capa ou wallpaper), aparece mais forte
+   que o screenshot ambiente — é uma escolha deliberada do usuário. Um blur leve
+   mantém a lista legível por cima; o scale esconde as bordas do blur. */
+.game-bg.escolhida {
+  opacity: .32; filter: saturate(.9) blur(2px); transform: scale(1.06);
+}
 .game-bg::after {
   content: ""; position: absolute; inset: 0;
   background: linear-gradient(180deg, transparent, var(--ink) 76%);
@@ -471,6 +477,7 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
 .set-field:focus { outline: none; border-color: var(--accent); }
 .set-label { font-size: 11px; color: var(--text-2); margin-bottom: 5px; display: block; }
 .set-hint { font-size: 11px; color: var(--text-3); margin: 4px 0 var(--s3); line-height: 1.5; }
+.set-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
 /* interruptor */
 .switch {
@@ -666,34 +673,114 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
 .gf-faq-id { font-size: 10px; color: var(--text-3); flex-shrink: 0; }
 .gf-foot { display: flex; align-items: center; justify-content: space-between; padding: var(--s3) var(--s4); border-top: 1px solid var(--line); }
 
+/* ═══════════════════════════  TROCAR CAPA  ═════════════════════════════ */
+/* Botão no canto do herói que abre o seletor de capas. */
+.cover-btn {
+  position: absolute; top: 12px; right: 12px; z-index: 3;
+  font-size: 11px; font-weight: 600; color: var(--text-2);
+  padding: 5px 10px; border-radius: var(--pill);
+  background: rgba(8, 8, 15, .55); border: 1px solid var(--line);
+  backdrop-filter: blur(4px); transition: color .15s, border-color .15s;
+}
+.cover-btn:hover { color: var(--text); border-color: var(--jogo); }
+
+.cv-panel { width: min(680px, 100%); }
+.cv-go { font-size: 11px; font-weight: 600; color: var(--jogo); padding: 0 4px; flex-shrink: 0; }
+/* Papel da imagem escolhida: capa (overlay), fundo (lista) ou ambos. */
+.cv-roles { display: flex; align-items: center; gap: 6px; margin: var(--s3) 0 2px; }
+.cv-roles-label { font-size: 10.5px; color: var(--text-3); margin-right: 2px; }
+.cv-role {
+  font-size: 11px; font-weight: 600; color: var(--text-2); padding: 4px 12px;
+  border-radius: var(--pill); background: var(--raised); border: 1px solid var(--line);
+  transition: color .15s, border-color .15s, background .15s;
+}
+.cv-role:hover { color: var(--text); }
+.cv-role.on { color: #08080F; background: var(--jogo); border-color: var(--jogo); }
+.cv-grid-label { font-size: 9px; font-weight: 700; letter-spacing: .12em; color: var(--text-3); margin: var(--s3) 0 6px; }
+.cv-match { font-size: 11.5px; color: var(--text-2); margin: var(--s3) 0 6px; }
+.cv-alts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--s3); }
+.cv-alt {
+  font-size: 10.5px; color: var(--text-2); padding: 3px 9px; border-radius: var(--pill);
+  background: var(--raised); border: 1px solid var(--line); transition: border-color .15s, color .15s;
+}
+.cv-alt:hover { color: var(--text); border-color: var(--jogo); }
+.cv-empty { font-size: 11.5px; color: var(--text-3); padding: var(--s3) 0; }
+.cv-nokey { font-size: 12px; color: var(--text-2); line-height: 1.55; }
+.cv-nokey .btn-primary { margin-top: var(--s3); }
+.cv-grid {
+  display: grid; gap: var(--s3); margin-top: var(--s2);
+  grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+}
+.cv-cell {
+  aspect-ratio: 2 / 3; border-radius: var(--r); overflow: hidden;
+  border: 2px solid transparent; background: var(--raised);
+  transition: border-color .15s, transform .1s;
+}
+.cv-cell:hover { border-color: var(--jogo); transform: translateY(-2px); }
+.cv-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
 /* ══════════════════════════  OVERLAY COMPACTO  ═════════════════════════ */
-#app.compact .titlebar { height: 30px; padding: 0 var(--s2); }
-#app.compact .titlebar .brand,
-#app.compact .titlebar .sync-tag { display: none; }
-#app.compact .win-btn { width: 24px; height: 24px; font-size: 11px; }
+/* No compacto a barra de título do app some por inteiro — o próprio overlay
+   traz sua faixa mínima (abas + progresso + fechar) e é arrastável por ela. */
+#app.compact .titlebar { display: none; }
 #app.compact .keybar { display: none; }
 
-.cw { position: relative; height: 100%; overflow: hidden; }
+.cw { position: relative; height: 100%; overflow: hidden; display: flex; flex-direction: column; }
+/* A capa (escolhida no seletor ou a da RA) preenche o fundo do overlay, bem
+   apagada; o scrim por cima garante que o texto continue legível sobre ela. */
 .cw-art {
   position: absolute; inset: 0;
-  background-size: cover; background-position: center; opacity: .15;
+  background-size: cover; background-position: center; opacity: .2;
 }
-.cw-in { position: relative; padding: 9px var(--s3); }
-.cw-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); margin-bottom: 8px; }
-.cw-title { font-size: 11.5px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.cw-nav { color: var(--text-3); font-size: 12px; padding: 0 4px; }
-.cw-nav:hover { color: var(--text); }
-.cw-top { display: flex; align-items: baseline; gap: 6px; margin-bottom: 5px; }
-.cw-top-label { display: none; }
-.cw-pills { display: flex; align-items: baseline; gap: 6px; width: 100%; }
-.cw-pill { font-size: 10.5px; color: var(--text-2); }
-.cw-pill:first-child { font-size: 14px; font-weight: 700; color: var(--jogo); }
-.cw-pill:last-child { margin-left: auto; }
-.cw-bar { height: 5px; border-radius: var(--pill); background: rgba(0, 0, 0, .55); overflow: hidden; margin-bottom: 9px; }
+.cw-scrim {
+  position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(180deg, rgba(8,8,15,.72) 0%, rgba(8,8,15,.82) 100%);
+}
+/* Faixa superior: abas Conquistas/Dicas + progresso + controles. É a região de
+   arraste (pywebview-drag-region) — os botões dentro dela continuam clicáveis. */
+.cw-head {
+  position: relative; z-index: 2; flex-shrink: 0;
+  display: flex; align-items: center; gap: var(--s2);
+  padding: 7px var(--s3); cursor: move;
+}
+.cw-tabs { display: flex; gap: 2px; background: rgba(0,0,0,.35); border-radius: var(--pill); padding: 2px; }
+.cw-tab {
+  font-size: 10.5px; font-weight: 700; color: var(--text-3);
+  padding: 3px 9px; border-radius: var(--pill); transition: color .15s, background .15s;
+}
+.cw-tab:hover { color: var(--text-2); }
+.cw-tab.on { color: #08080F; background: var(--jogo); }
+.cw-badges { display: flex; align-items: center; gap: 5px; flex-shrink: 0; margin-left: auto; }
+.cw-count { font-size: 10px; font-weight: 600; color: var(--text-2); padding: 2px 7px; border-radius: var(--pill); background: rgba(0, 0, 0, .4); }
+.cw-count small { color: var(--text-3); }
+.cw-pct { font-size: 10px; font-weight: 800; color: #08080F; padding: 2px 7px; border-radius: var(--pill); background: var(--jogo); }
+.cw-ctrls { display: flex; align-items: center; gap: 1px; flex-shrink: 0; }
+.cw-ctrl { font-size: 12px; color: var(--text-3); width: 20px; height: 20px; border-radius: var(--r-sm); transition: color .15s, background .15s; }
+.cw-ctrl:hover { color: var(--text); background: rgba(255,255,255,.08); }
+.cw-ctrl.close:hover { color: var(--danger); }
+/* Conteúdo abaixo da faixa: rola quando não cabe (útil na aba Dicas). */
+.cw-content { position: relative; z-index: 2; flex: 1; min-height: 0; overflow-y: auto; padding: 0 var(--s3) 9px; }
+/* Setas de carrossel: no modo compacto o keybar some, então é por aqui que se
+   troca de jogo. Ficam abaixo da faixa para não cobrir as abas; acendem no hover. */
+.cw-nav {
+  position: absolute; top: 38px; bottom: 0; width: 24px; z-index: 3;
+  display: grid; place-items: center; color: var(--text-2); font-size: 16px;
+  background: rgba(8, 8, 15, .35); opacity: 0; transition: opacity .15s, color .15s;
+}
+.cw-nav.prev { left: 0; }
+.cw-nav.next { right: 0; }
+.cw:hover .cw-nav { opacity: 1; }
+.cw-nav:hover { color: var(--text); background: rgba(8, 8, 15, .6); }
+.cw-bar { height: 5px; border-radius: var(--pill); background: rgba(0, 0, 0, .55); overflow: hidden; margin: 2px 0 9px; }
 .cw-fill { height: 100%; border-radius: var(--pill); transition: width .5s ease; }
 .cw-sec { margin-bottom: 7px; }
 .cw-sec-label { font-size: 8.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--text-3); margin-bottom: 4px; }
-.cw-row { display: flex; align-items: center; gap: var(--s2); }
+.cw-row { display: flex; align-items: center; gap: var(--s2); margin-bottom: 4px; }
+/* Aba Dicas dentro do overlay */
+.cw-tips { font-size: 10px; color: var(--text-2); line-height: 1.5; }
+.cw-tip-h { font-size: 10.5px; font-weight: 700; color: var(--text); margin: 8px 0 3px; }
+.cw-tip-sub { font-weight: 600; color: var(--text-2); margin: 5px 0 2px; }
+.cw-tip-p { margin-bottom: 4px; }
 .cw-badge {
   width: 26px; height: 26px; flex-shrink: 0; border-radius: var(--r-sm);
   display: grid; place-items: center; background: var(--raised);

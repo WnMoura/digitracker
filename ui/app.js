@@ -122,6 +122,8 @@ const S = {
   tab: "walk",           // aba do painel: 'walk' | 'tips'
   onTop: true,
   compact: false,        // modo mini-overlay (progresso de conquistas)
+  cwTab: "walk",         // aba do overlay compacto: 'walk' (conquistas) | 'tips'
+  compactCfg: null,      // tamanho/contagens do overlay (vêm do backend)
   poll: null,
   sig: null,             // assinatura do último render (evita redesenhar à toa)
   screenKey: null,       // identidade da tela atual (p/ decidir se mantém o scroll)
@@ -233,6 +235,39 @@ const backend = {
   async setAiConfig(cfg) {
     if (S.mode === "demo") return { ok: false };
     return window.pywebview.api.set_ai_config(cfg.provider, cfg.api_key, cfg.model, cfg.base_url);
+  },
+  async getCoversConfig() {
+    if (S.mode === "demo") return { ok: true, has_key: false };
+    return window.pywebview.api.get_covers_config();
+  },
+  async setCoversKey(key) {
+    if (S.mode === "demo") return { ok: true, has_key: !!key };
+    return window.pywebview.api.set_covers_key(key);
+  },
+  async coversSearch(slug, query) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.covers_search(slug, query || "");
+  },
+  async coversFor(gameId) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.covers_for(gameId);
+  },
+  async setGameCover(slug, url, role) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.set_game_cover(slug, url, role || "cover");
+  },
+  async clearGameCover(slug, role) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.clear_game_cover(slug, role || "cover");
+  },
+  async getCompactConfig() {
+    if (S.mode === "demo") return { ok: true, width: 300, height: 232, last: 2, next: 0 };
+    return window.pywebview.api.get_compact_config();
+  },
+  async setCompactConfig(cfg) {
+    if (S.mode === "demo") return { ok: true, ...cfg };
+    return window.pywebview.api.set_compact_config(
+      cfg.width, cfg.height, cfg.last, cfg.next);
   },
 };
 
@@ -362,6 +397,7 @@ async function enterDashboard() {
   S.view = "dashboard";
   S.library = await backend.library();
   if (!S.activeSlug && S.library.length) S.activeSlug = S.library[0].slug;
+  S.compactCfg = await backend.getCompactConfig().catch(() => null);
   await carregarCores(S.library);       // a cor de cada jogo vem da capa dele
   await renderDashboard({ force: true });
   startPolling();
@@ -454,54 +490,113 @@ function compactHTML(game) {
   if (!game) {
     return `<div class="cw-empty">Nenhum jogo selecionado.<br>Volte ao modo completo para adicionar um.</div>`;
   }
-  const { t, e, pct } = totals(game);
-  const le = game.last_earned;
-  const nextId = (game.next_ids || [])[0];
-  const nextAch = nextId != null ? game.achievements.find((a) => a.id === nextId) : null;
-
-  const badge = (url, fallback) => url
-    ? `<div class="cw-badge${fallback === "🔒" ? " locked" : ""}" style="background-image:url('${esc(url)}')"></div>`
-    : `<div class="cw-badge${fallback === "🔒" ? " locked" : ""}">${fallback}</div>`;
-
-  const card = (label, a, locked) => a ? `<div class="cw-sec">
-    <p class="cw-sec-label">${label}</p>
-    <div class="cw-row">
-      ${badge(a.badge_url, locked ? "🔒" : "🏆")}
-      <div class="cw-info">
-        <p class="cw-name">${esc(a.name)}</p>
-        <p class="cw-desc">${esc(a.desc || "")}</p>
-      </div>
-    </div>
-  </div>` : "";
-
+  const { t, e } = totals(game);
   const mst = game.mastery || {};
   const cor = corDe(game);
-  const capa = game.art?.box;
+  const tab = S.cwTab || "walk";
+  // A arte escolhida (capa) vira o fundo full-bleed do overlay, transparente.
+  const capa = game.art?.cover || game.art?.box;
+
+  const conteudo = tab === "tips" ? cwTipsHTML(game) : cwWalkHTML(game, t, e, cor);
+
   return `<div class="cw" style="--jogo:${cor}">
     ${capa ? `<div class="cw-art" style="background-image:url('${esc(capa)}')"></div>` : ""}
-    <div class="cw-in">
-      <div class="cw-head">
-        <button class="cw-nav" id="cw-prev" title="Jogo anterior">‹</button>
-        <div class="cw-title" title="${esc(game.title)}">${esc(game.title)}</div>
-        <button class="cw-nav" id="cw-next" title="Próximo jogo">›</button>
+    <div class="cw-scrim"></div>
+    <button class="cw-nav prev" id="cw-prev" title="Jogo anterior">‹</button>
+    <button class="cw-nav next" id="cw-next" title="Próximo jogo">›</button>
+    <div class="cw-head pywebview-drag-region" title="${esc(game.title)} — arraste para mover">
+      <div class="cw-tabs">
+        <button class="cw-tab ${tab === "walk" ? "on" : ""}" data-cwtab="walk">Conquistas</button>
+        <button class="cw-tab ${tab === "tips" ? "on" : ""}" data-cwtab="tips">Dicas</button>
       </div>
-      <div class="cw-top">
-        <span class="cw-pills">
-          <span class="cw-pill" title="Em hardcore, o que vale Mastery">${mst.hardcore || 0}<small>/${t}</small></span>
-          <span class="cw-pill">${mst.percent || 0}%</span>
-        </span>
-      </div>
-      <div class="cw-bar"><div class="cw-fill" style="width:${mst.percent || 0}%;background:${cor}"></div></div>
-      ${card("Última conquista", le, false)}
-      ${card("Próxima", nextAch, true)}
-      ${!le && !nextAch ? (t > 0 && e >= t ? `<div class="cw-done">✓ 100% concluído</div>` : `<p class="cw-empty-sm">Sem conquistas registradas ainda.</p>`) : ""}
+      <span class="cw-badges">
+        <span class="cw-count" title="Em hardcore, o que vale Mastery">${mst.hardcore || 0}<small>/${t}</small></span>
+        <span class="cw-pct">${mst.percent || 0}%</span>
+      </span>
+      <span class="cw-ctrls">
+        <button class="cw-ctrl" id="cw-exit" title="Sair do modo compacto">▣</button>
+        <button class="cw-ctrl close" id="cw-close" title="Fechar">✕</button>
+      </span>
+    </div>
+    <div class="cw-content" data-scroll="compact">${conteudo}</div>
+  </div>`;
+}
+
+/* Aba Conquistas do overlay: barra de progresso + N últimas obtidas (fixo, do
+   ajuste) + as próximas que couberem na altura atual. */
+function cwWalkHTML(game, t, e, cor) {
+  const mst = game.mastery || {};
+  const cfg = S.compactCfg || { height: 232, last: 2, next: 0 };
+  const lastN = Math.max(0, cfg.last ?? 2);
+
+  const earned = (game.achievements || []).filter((a) => a.earned && a.date_raw);
+  earned.sort((a, b) => (a.date_raw < b.date_raw ? 1 : a.date_raw > b.date_raw ? -1 : 0));
+  const ultimas = earned.slice(0, lastN);
+
+  const proxIds = game.next_ids || [];
+  let nextN = Math.max(0, cfg.next ?? 0);
+  if (nextN === 0) {
+    // auto: estima quantas linhas cabem na altura ajustada do overlay
+    const H = cfg.height || 232;
+    const ROW = 40, LABEL = 18, HEAD = 36, BAR = 16, PAD = 14;
+    const usadoUlt = ultimas.length ? LABEL + ultimas.length * ROW : 0;
+    const restante = H - HEAD - BAR - usadoUlt - LABEL - PAD;
+    nextN = Math.max(1, Math.floor(restante / ROW));
+  }
+  const proximas = proxIds.slice(0, nextN)
+    .map((id) => (game.achievements || []).find((a) => a.id === id))
+    .filter(Boolean);
+
+  const secao = (label, itens, locked) => itens.length ? `<div class="cw-sec">
+    <p class="cw-sec-label">${label}</p>
+    ${itens.map((a) => cwRow(a, locked)).join("")}
+  </div>` : "";
+
+  const vazio = !ultimas.length && !proximas.length
+    ? (t > 0 && e >= t
+        ? `<div class="cw-done">✓ 100% concluído</div>`
+        : `<p class="cw-empty-sm">Sem conquistas registradas ainda.</p>`)
+    : "";
+
+  return `<div class="cw-bar"><div class="cw-fill" style="width:${mst.percent || 0}%;background:${cor}"></div></div>
+    ${secao(lastN === 1 ? "Última obtida" : `Últimas ${ultimas.length} obtidas`, ultimas, false)}
+    ${secao("Próximas", proximas, true)}
+    ${vazio}`;
+}
+
+function cwRow(a, locked) {
+  const badge = a.badge_url
+    ? `<div class="cw-badge${locked && !a.earned ? " locked" : ""}" style="background-image:url('${esc(a.badge_url)}')"></div>`
+    : `<div class="cw-badge${locked && !a.earned ? " locked" : ""}">${locked && !a.earned ? "🔒" : "🏆"}</div>`;
+  return `<div class="cw-row">
+    ${badge}
+    <div class="cw-info">
+      <p class="cw-name">${esc(a.name)}</p>
+      <p class="cw-desc">${esc(a.desc || "")}</p>
     </div>
   </div>`;
+}
+
+/* Aba Dicas do overlay: as seções do guia importado, roláveis. */
+function cwTipsHTML(game) {
+  const secs = game.guide || [];
+  if (!secs.length) {
+    return `<p class="cw-empty-sm">Sem dicas importadas para este jogo.<br>Importe um guia na tela completa.</p>`;
+  }
+  return `<div class="cw-tips">${secs.map((s) => `
+    <p class="cw-tip-h">${esc(s.title || "")}</p>
+    ${(s.blocks || []).map((b) =>
+      `<p class="cw-tip-${b.type === "subhead" ? "sub" : "p"}">${esc(b.text || "")}</p>`).join("")}
+  `).join("")}</div>`;
 }
 
 function bindCompact() {
   $("#cw-prev")?.addEventListener("click", () => switchCompactGame(-1));
   $("#cw-next")?.addEventListener("click", () => switchCompactGame(1));
+  $("#cw-exit")?.addEventListener("click", () => toggleCompact(false));
+  $("#cw-close")?.addEventListener("click", () => hasBackend() && window.pywebview.api.close());
+  root.querySelectorAll("[data-cwtab]").forEach((b) =>
+    b.addEventListener("click", () => { S.cwTab = b.dataset.cwtab; renderDashboard({ force: true }); }));
 }
 
 function switchCompactGame(dir) {
@@ -510,6 +605,19 @@ function switchCompactGame(dir) {
   const next = (idx + dir + S.library.length) % S.library.length;
   S.activeSlug = S.library[next].slug;
   renderDashboard();
+}
+
+/* Liga/desliga o modo compacto (usado pelo botão da barra E pelo controle que
+   aparece no hover do próprio overlay, já que a barra some no compacto). */
+async function toggleCompact(value) {
+  S.compact = value !== undefined ? !!value : !S.compact;
+  const btn = document.getElementById("btn-compact");
+  if (btn) {
+    btn.classList.toggle("active", S.compact);
+    btn.title = S.compact ? "Sair do modo compacto" : "Modo compacto (overlay de progresso)";
+  }
+  if (hasBackend()) window.pywebview.api.set_compact(S.compact);
+  if (S.view === "dashboard") await renderDashboard({ force: true });
 }
 
 function sidebarHTML() {
@@ -568,13 +676,19 @@ function mainHTML(game) {
 
   const cor = corDe(game);
   const arte = game.art || {};
+  // Fundo da lista: o wallpaper escolhido (art.background) tem prioridade;
+  // depois a capa; e por fim o screenshot in-game, como antes. Uma imagem
+  // escolhida ganha a classe .escolhida (mais visível), o screenshot fica sutil.
+  const fundo = arte.background || arte.cover || arte.ingame;
+  const escolhido = arte.background || arte.cover;
   return `<main class="main" data-scroll="main" style="--jogo:${cor}">
-    ${arte.ingame ? `<div class="game-bg" style="background-image:url('${esc(arte.ingame)}')"></div>` : ""}
+    ${fundo ? `<div class="game-bg ${escolhido ? "escolhida" : ""}" style="background-image:url('${esc(fundo)}')"></div>` : ""}
     <div class="game-glow"></div>
     <div class="panel-head">
       <div class="hero">
         ${arte.title ? `<div class="hero-art" style="background-image:url('${esc(arte.title)}')"></div>` : ""}
         <div class="hero-scrim"></div>
+        <button class="cover-btn" id="btn-cover" title="Escolher a capa no SteamGridDB">🖼 Trocar capa</button>
         <div class="hero-txt">
           <div class="head-info">
             <h1>${esc(game.title)}</h1>
@@ -756,6 +870,12 @@ function bindSidebar() {
       },
     });
   };
+  const cover = $("#btn-cover");
+  if (cover) cover.onclick = () => {
+    if (S.mode === "demo") return toast("Disponível só no app real.", true);
+    const jogo = S.library.find((g) => g.slug === S.activeSlug);
+    if (jogo) openCoverPicker(jogo);
+  };
   const add = $("#btn-add");
   if (add) add.onclick = () => enterWizard1();
   const imp = $("#btn-import-all");
@@ -769,17 +889,26 @@ function bindSidebar() {
 async function enterSettings() {
   S.view = "settings";
   stopPolling();
-  const [estado, ia] = await Promise.all([
+  const [estado, ia, covers, compact] = await Promise.all([
     backend.appState().catch(() => ({})),
     backend.getAiConfig().catch(() => ({ ok: false })),
+    backend.getCoversConfig().catch(() => ({ ok: false })),
+    backend.getCompactConfig().catch(() => null),
   ]);
-  S.SET = { estado, ia: ia && ia.ok ? ia : null };
+  S.SET = {
+    estado,
+    ia: ia && ia.ok ? ia : null,
+    covers: covers && covers.ok ? covers : { has_key: false },
+    compact: compact && compact.ok ? compact : { width: 300, height: 232, last: 2, next: 0 },
+  };
   renderSettings();
 }
 
 function renderSettings() {
-  const { estado, ia } = S.SET;
+  const { estado, ia, covers, compact } = S.SET;
   const prov = ia && (ia.providers.find((p) => p.id === ia.provider) || ia.providers[0]);
+  const temCapaKey = !!(covers && covers.has_key);
+  const cc = compact || { width: 300, height: 232, last: 2, next: 0 };
 
   const chave = (id, txt, sub, ligado) => `
     <div class="set-row">
@@ -838,6 +967,22 @@ function renderSettings() {
         </section>
 
         <section class="set-section">
+          <h3>Capas (SteamGridDB)</h3>
+          <p class="set-hint">Opcional. Liga o botão <b>Trocar capa</b> na tela do jogo: busca
+            pelo nome e mostra várias capas da comunidade para você escolher, como no Playnite.
+            A capa escolhida vira o fundo do overlay e da lista de troféus.</p>
+          <label class="set-label">Chave da API${temCapaKey ? " (salva — deixe em branco para manter)" : ""}</label>
+          <input class="set-field" id="set-sgdb-key" type="password" autocomplete="off" spellcheck="false"
+                 placeholder="${temCapaKey ? "••••••••••••••••" : "cole a chave aqui"}" />
+          <p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.
+            Obter em <span class="ai-link">steamgriddb.com/profile/preferences/api</span></p>
+          <div style="display:flex;gap:8px">
+            <button class="btn-primary" id="set-sgdb-save">Salvar</button>
+            <button class="btn-ghost" id="set-sgdb-clear">Remover chave</button>
+          </div>
+        </section>
+
+        <section class="set-section">
           <h3>Biblioteca</h3>
           ${chave("auto_import", "Importar jogos novos automaticamente",
                   "Verifica a cada 5 minutos e traz os jogos em que você começou a jogar",
@@ -856,6 +1001,26 @@ function renderSettings() {
                   S.overlaySecondScreen)}
         </section>
 
+        <section class="set-section">
+          <h3>Modo compacto</h3>
+          <p class="set-hint">Tamanho do overlay e quantas conquistas ele mostra. As
+            "próximas" em <b>0</b> = mostra quantas couberem na altura; as "últimas obtidas"
+            ficam fixas nesse número.</p>
+          <div class="set-grid2">
+            <div><label class="set-label">Largura (px)</label>
+              <input class="set-field" id="cc-w" type="number" min="240" max="640" value="${cc.width}" /></div>
+            <div><label class="set-label">Altura (px)</label>
+              <input class="set-field" id="cc-h" type="number" min="150" max="900" value="${cc.height}" /></div>
+            <div><label class="set-label">Últimas obtidas</label>
+              <input class="set-field" id="cc-last" type="number" min="0" max="10" value="${cc.last}" /></div>
+            <div><label class="set-label">Próximas (0 = auto)</label>
+              <input class="set-field" id="cc-next" type="number" min="0" max="10" value="${cc.next}" /></div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button class="btn-primary" id="cc-save">Salvar</button>
+          </div>
+        </section>
+
       </div>
     </div>
   </div>`;
@@ -872,6 +1037,38 @@ function renderSettings() {
   if (salvar) salvar.onclick = () => salvarIa(null);
   const limpar = $("#set-ai-clear");
   if (limpar) limpar.onclick = () => salvarIa("");
+  const sgSalvar = $("#set-sgdb-save");
+  if (sgSalvar) sgSalvar.onclick = () => salvarSgdb(null);
+  const sgLimpar = $("#set-sgdb-clear");
+  if (sgLimpar) sgLimpar.onclick = () => salvarSgdb("");
+  const ccSave = $("#cc-save");
+  if (ccSave) ccSave.onclick = salvarCompacto;
+}
+
+async function salvarCompacto() {
+  const num = (id, def) => {
+    const v = parseInt($("#" + id)?.value, 10);
+    return Number.isFinite(v) ? v : def;
+  };
+  const cfg = {
+    width: num("cc-w", 300), height: num("cc-h", 232),
+    last: num("cc-last", 2), next: num("cc-next", 0),
+  };
+  const res = await backend.setCompactConfig(cfg);
+  if (!res || !res.ok) return toast("Não foi possível salvar.", true);
+  S.SET.compact = res;
+  S.compactCfg = res;   // o overlay passa a usar já no próximo render
+  toast("Modo compacto atualizado.");
+}
+
+async function salvarSgdb(forcar) {
+  const digitada = ($("#set-sgdb-key")?.value || "").trim();
+  const chave = forcar !== null ? forcar : (digitada || null);
+  const res = await backend.setCoversKey(chave);
+  if (!res || !res.ok) return toast("Não foi possível salvar.", true);
+  S.SET.covers = res;
+  renderSettings();
+  toast(res.has_key ? "Seletor de capas pronto." : "Chave removida.");
 }
 
 async function alternarPreferencia(chave, botao) {
@@ -1026,6 +1223,178 @@ async function gfBaixar(url) {
     G.error = "Erro: " + e;
     renderGameFaqs();
   }
+}
+
+/* ═══════════════════════════  TROCAR ARTE  ═══════════════════════════
+   Busca imagens pelo nome do jogo no SteamGridDB, como no Playnite. Cada imagem
+   pode virar CAPA (art.cover: overlay + lateral) ou FUNDO (art.background: atrás
+   da lista de conquistas) — ou os dois, conforme o papel selecionado. */
+const CV_ROLES = [
+  { id: "cover", label: "Capa" },
+  { id: "background", label: "Fundo" },
+  { id: "both", label: "Ambos" },
+];
+
+function openCoverPicker(game) {
+  S.CV = {
+    slug: game.slug, title: game.title, query: game.title,
+    busy: true, error: "", noKey: false, role: "cover",
+    matches: [], chosen: null, covers: [], heroes: [],
+  };
+  renderCoverPicker();
+  cvBuscar("");   // primeira busca é pelo próprio título do jogo
+}
+
+function closeCoverPicker() {
+  S.CV = null;
+  $("#cv-modal")?.remove();
+}
+
+function renderCoverPicker() {
+  const V = S.CV;
+  if (!V) return;
+  let el = $("#cv-modal");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "cv-modal";
+    el.className = "gf-backdrop";
+    document.body.appendChild(el);
+  }
+
+  const outros = (V.matches || []).filter((m) => !V.chosen || m.id !== V.chosen.id);
+  const cell = (c, cls) => `
+    <button class="cv-cell ${cls}" data-url="${esc(c.url)}" title="Aplicar (${esc(cvRoleLabel())})">
+      <img src="${esc(c.thumb)}" alt="" loading="lazy" />
+    </button>`;
+  const capas = (V.covers || []).map((c) => cell(c, "portrait")).join("");
+  const fundos = (V.heroes || []).map((c) => cell(c, "landscape")).join("");
+
+  el.innerHTML = `<div class="gf-panel cv-panel">
+    <div class="gf-head">
+      <div>
+        <div class="gf-title">🖼 TROCAR ARTE</div>
+        <div class="gf-sub">${esc(V.title || "")}</div>
+      </div>
+      <button class="gf-close" id="cv-x">✕</button>
+    </div>
+
+    <div class="gf-body">
+      ${V.noKey ? `
+        <div class="cv-nokey">
+          <p>O seletor usa o <b>SteamGridDB</b>. Configure sua chave (gratuita)
+             nas Configurações para buscar artes pelo nome do jogo.</p>
+          <button class="btn-primary" id="cv-settings">Abrir Configurações</button>
+        </div>` : `
+        <div class="search-box">
+          <span style="color:var(--text-low)">🔎</span>
+          <input id="cv-q" placeholder="Nome do jogo" autocomplete="off"
+                 spellcheck="false" value="${esc(V.query || "")}" />
+          <button class="cv-go" id="cv-go">Buscar</button>
+        </div>
+        <div class="cv-roles">
+          <span class="cv-roles-label">Aplicar como:</span>
+          ${CV_ROLES.map((r) => `<button class="cv-role ${V.role === r.id ? "on" : ""}"
+            data-role="${r.id}">${r.label}</button>`).join("")}
+        </div>
+        ${V.chosen ? `<p class="cv-match">Casado com <b>${esc(V.chosen.name)}</b>${
+          outros.length ? " — ou troque de jogo:" : ""}</p>` : ""}
+        ${outros.length ? `<div class="cv-alts">${outros.slice(0, 8).map((m) =>
+          `<button class="cv-alt" data-gid="${m.id}">${esc(m.name)}</button>`).join("")}</div>` : ""}
+        ${V.busy ? `<div class="status-msg">⏳ Buscando artes…</div>` : ""}
+        ${V.error ? `<div class="gf-error">${esc(V.error)}</div>` : ""}
+        ${!V.busy && !V.error && !V.chosen
+          ? `<p class="cv-empty">Nenhum jogo encontrado. Ajuste o nome e busque de novo.</p>` : ""}
+        ${!V.busy && V.chosen && !V.covers.length && !V.heroes.length
+          ? `<p class="cv-empty">Nenhuma arte encontrada para este jogo.</p>` : ""}
+        ${capas ? `<p class="cv-grid-label">CAPAS</p><div class="cv-grid">${capas}</div>` : ""}
+        ${fundos ? `<p class="cv-grid-label">FUNDOS (wallpaper)</p><div class="cv-grid wide">${fundos}</div>` : ""}`}
+    </div>
+
+    <div class="gf-foot">
+      ${V.noKey ? "<span></span>" : `<button class="btn-ghost" id="cv-clear">↺ Remover ${esc(cvRoleLabel().toLowerCase())}</button>`}
+      <span></span>
+    </div>
+  </div>`;
+
+  $("#cv-x").onclick = closeCoverPicker;
+  $("#cv-settings")?.addEventListener("click", () => { closeCoverPicker(); enterSettings(); });
+  $("#cv-clear")?.addEventListener("click", cvLimpar);
+  const go = $("#cv-go");
+  if (go) go.onclick = () => cvBuscar(($("#cv-q")?.value || "").trim());
+  const q = $("#cv-q");
+  if (q) q.onkeydown = (e) => { if (e.key === "Enter") cvBuscar((q.value || "").trim()); };
+  el.querySelectorAll(".cv-role").forEach((b) =>
+    b.onclick = () => { V.role = b.dataset.role; renderCoverPicker(); });
+  el.querySelectorAll(".cv-alt").forEach((b) =>
+    b.onclick = () => cvTrocarJogo(Number(b.dataset.gid)));
+  el.querySelectorAll(".cv-cell").forEach((b) =>
+    b.onclick = () => cvAplicar(b.dataset.url));
+}
+
+function cvRoleLabel() {
+  return (CV_ROLES.find((r) => r.id === S.CV?.role) || CV_ROLES[0]).label;
+}
+
+async function cvBuscar(query) {
+  const V = S.CV;
+  if (!V) return;
+  V.busy = true; V.error = ""; if (query) V.query = query;
+  renderCoverPicker();
+  try {
+    const res = await backend.coversSearch(V.slug, query || "");
+    V.busy = false;
+    if (!res.ok) {
+      if (/SteamGridDB|Configure/i.test(res.error || "")) V.noKey = true;
+      V.error = res.error || "Não consegui buscar artes.";
+    } else {
+      V.matches = res.matches || [];
+      V.chosen = res.chosen || null;
+      V.covers = res.covers || [];
+      V.heroes = res.heroes || [];
+    }
+  } catch (e) {
+    V.busy = false; V.error = "Erro: " + e;
+  }
+  renderCoverPicker();
+}
+
+async function cvTrocarJogo(gameId) {
+  const V = S.CV;
+  if (!V) return;
+  V.busy = true; V.error = "";
+  V.chosen = (V.matches || []).find((m) => m.id === gameId) || V.chosen;
+  renderCoverPicker();
+  try {
+    const res = await backend.coversFor(gameId);
+    V.busy = false;
+    if (!res.ok) V.error = res.error || "Não consegui buscar as artes.";
+    else { V.covers = res.covers || []; V.heroes = res.heroes || []; }
+  } catch (e) {
+    V.busy = false; V.error = "Erro: " + e;
+  }
+  renderCoverPicker();
+}
+
+async function cvAplicar(url) {
+  const V = S.CV;
+  if (!V) return;
+  const role = V.role;
+  const res = await backend.setGameCover(V.slug, url, role).catch((e) => ({ ok: false, error: "" + e }));
+  if (!res || !res.ok) return toast(res && res.error ? res.error : "Não consegui aplicar a arte.", true);
+  closeCoverPicker();
+  toast(role === "both" ? "Capa e fundo atualizados." : role === "background" ? "Fundo atualizado." : "Capa atualizada.");
+  await renderDashboard({ force: true });
+}
+
+async function cvLimpar() {
+  const V = S.CV;
+  if (!V) return;
+  const role = V.role;
+  const res = await backend.clearGameCover(V.slug, role).catch((e) => ({ ok: false, error: "" + e }));
+  if (!res || !res.ok) return toast(res && res.error ? res.error : "Não consegui remover.", true);
+  closeCoverPicker();
+  toast("Voltou à arte padrão da RA.");
+  await renderDashboard({ force: true });
 }
 
 /* Refina o guia recém-importado com a IA (opcional, custa por uso). */
@@ -1741,13 +2110,7 @@ function bindWindowControls() {
     if (hasBackend()) window.pywebview.api.toggle_on_top(S.onTop);
   });
   $("#btn-pin")?.classList.add("active");
-  $("#btn-compact")?.addEventListener("click", async (e) => {
-    S.compact = !S.compact;
-    e.currentTarget.classList.toggle("active", S.compact);
-    e.currentTarget.title = S.compact ? "Sair do modo compacto" : "Modo compacto (overlay de progresso)";
-    if (hasBackend()) window.pywebview.api.set_compact(S.compact);
-    if (S.view === "dashboard") await renderDashboard();
-  });
+  $("#btn-compact")?.addEventListener("click", () => toggleCompact());
   $("#btn-exit-demo")?.addEventListener("click", exitDemo);
   $("#btn-settings")?.addEventListener("click", () => {
     if (S.view === "settings") return enterDashboard();
