@@ -6,13 +6,16 @@
    jogando.                                                                 */
 :root {
   --ink: #0E1419;        /* fundo da janela */
+  --ink-deep: 8 8 15;    /* preto near-ink (scrims do overlay, texto sobre dourado) — rgb triplet */
   --surface: #172029;    /* cartões, prateleira, barras */
   --raised: #1F2A35;     /* elevação, hover, estado ativo */
   --line: #2A3745;       /* divisórias e contornos */
 
   --text: #F0F4F8;
   --text-2: #9BAAB8;
-  --text-3: #64748B;
+  /* Elevado de #64748B (~4:1) para passar 4.5:1 em textos pequenos, inclusive
+     sobre a arte do overlay — sem perder a hierarquia abaixo de --text-2. */
+  --text-3: #8A99AB;
 
   --hardcore: #E0B341;   /* dourado: vale Mastery */
   --softcore: #7FA8C9;   /* azul dessaturado: não vale */
@@ -420,17 +423,25 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
 .g-sub { font-size: 11.5px; font-weight: 600; color: var(--jogo); margin: var(--s3) 0 6px; }
 .g-step { font-size: 12px; margin: var(--s2) 0 var(--s1); }
 .g-step-n { font-size: 11px; font-weight: 700; color: var(--jogo); margin-right: 6px; }
+/* Callouts de chefe e nota: borda completa + ícone-guia, em vez da faixa lateral
+   colorida (o tell nº1 de UI de IA). A identidade vem da cor da borda/tint e do
+   glifo, não de um stripe. */
 .g-boss {
+  display: flex; align-items: baseline; gap: 7px;
   font-size: 12px; font-weight: 700; color: var(--danger);
   margin: var(--s3) 0 var(--s2); padding: var(--s2) var(--s3);
-  border-left: 3px solid var(--danger); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+  border-radius: var(--r-sm);
   background: color-mix(in srgb, var(--danger) 8%, transparent);
 }
+.g-boss::before { content: "⚔"; flex-shrink: 0; font-size: 11px; }
 .g-note {
+  display: flex; align-items: baseline; gap: 7px;
   font-size: 11.5px; color: var(--text-2); margin: var(--s2) 0;
   padding: var(--s2) var(--s3); border-radius: var(--r-sm);
-  background: var(--surface); border-left: 3px solid var(--hardcore);
+  background: var(--surface); border: 1px solid var(--line);
 }
+.g-note::before { content: "✎"; flex-shrink: 0; color: var(--text-3); }
 .g-row { font-size: 11.5px; color: var(--text-2); margin: 4px 0; }
 .g-lbl { font-weight: 700; color: var(--text); margin-right: 6px; }
 .g-li { font-size: 11.5px; color: var(--text-2); margin: 3px 0 3px var(--s3); }
@@ -679,7 +690,7 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
   position: absolute; top: 12px; right: 12px; z-index: 3;
   font-size: 11px; font-weight: 600; color: var(--text-2);
   padding: 5px 10px; border-radius: var(--pill);
-  background: rgba(8, 8, 15, .55); border: 1px solid var(--line);
+  background: rgb(var(--ink-deep) / .55); border: 1px solid var(--line);
   backdrop-filter: blur(4px); transition: color .15s, border-color .15s;
 }
 .cover-btn:hover { color: var(--text); border-color: var(--jogo); }
@@ -695,7 +706,7 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
   transition: color .15s, border-color .15s, background .15s;
 }
 .cv-role:hover { color: var(--text); }
-.cv-role.on { color: #08080F; background: var(--jogo); border-color: var(--jogo); }
+.cv-role.on { color: rgb(var(--ink-deep)); background: var(--jogo); border-color: var(--jogo); }
 .cv-grid-label { font-size: 9px; font-weight: 700; letter-spacing: .12em; color: var(--text-3); margin: var(--s3) 0 6px; }
 .cv-match { font-size: 11.5px; color: var(--text-2); margin: var(--s3) 0 6px; }
 .cv-alts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--s3); }
@@ -734,7 +745,7 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
 }
 .cw-scrim {
   position: absolute; inset: 0; pointer-events: none;
-  background: linear-gradient(180deg, rgba(8,8,15,.72) 0%, rgba(8,8,15,.82) 100%);
+  background: linear-gradient(180deg, rgb(var(--ink-deep) / .72) 0%, rgb(var(--ink-deep) / .82) 100%);
 }
 /* Faixa superior: abas Conquistas/Dicas + progresso + controles. É a região de
    arraste (pywebview-drag-region) — os botões dentro dela continuam clicáveis. */
@@ -749,11 +760,11 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
   padding: 3px 9px; border-radius: var(--pill); transition: color .15s, background .15s;
 }
 .cw-tab:hover { color: var(--text-2); }
-.cw-tab.on { color: #08080F; background: var(--jogo); }
+.cw-tab.on { color: rgb(var(--ink-deep)); background: var(--jogo); }
 .cw-badges { display: flex; align-items: center; gap: 5px; flex-shrink: 0; margin-left: auto; }
 .cw-count { font-size: 10px; font-weight: 600; color: var(--text-2); padding: 2px 7px; border-radius: var(--pill); background: rgba(0, 0, 0, .4); }
 .cw-count small { color: var(--text-3); }
-.cw-pct { font-size: 10px; font-weight: 800; color: #08080F; padding: 2px 7px; border-radius: var(--pill); background: var(--jogo); }
+.cw-pct { font-size: 10px; font-weight: 800; color: rgb(var(--ink-deep)); padding: 2px 7px; border-radius: var(--pill); background: var(--jogo); }
 /* Conteúdo abaixo da faixa: rola quando não cabe (útil na aba Dicas). A barra
    de rolagem fica oculta — o overlay é pequeno e ganharia uma faixa cinza à
    direita; a rolagem pela roda do mouse continua funcionando. */

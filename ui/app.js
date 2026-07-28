@@ -361,11 +361,11 @@ function renderSetup() {
         <h1>DIGI<span>TRACKER</span></h1>
         <p class="sub">Conecte sua conta da RetroAchievements. Suas credenciais ficam salvas apenas localmente em <code>config/secrets.json</code> — nunca saem da sua máquina.</p>
         <div class="field">
-          <label>Username</label>
+          <label for="in-user">Username</label>
           <input id="in-user" autocomplete="off" spellcheck="false" placeholder="seu_usuario_RA" />
         </div>
         <div class="field">
-          <label>Web API Key</label>
+          <label for="in-key">Web API Key</label>
           <input id="in-key" autocomplete="off" spellcheck="false" placeholder="••••••••••••••••" />
           <p class="hint">Gere em retroachievements.org → Settings → Keys.</p>
         </div>
@@ -942,14 +942,14 @@ function renderSettings() {
                   ${p.has_key ? `<span class="ai-prov-ok">✓ chave salva</span>` : ""}
                 </button>`).join("")}
             </div>
-            <label class="set-label">Chave da API${prov.has_key ? " (salva — deixe em branco para manter)" : ""}</label>
+            <label class="set-label" for="set-key">Chave da API${prov.has_key ? " (salva — deixe em branco para manter)" : ""}</label>
             <input class="set-field" id="set-key" type="password" autocomplete="off" spellcheck="false"
                    placeholder="${prov.has_key ? "••••••••••••••••" : "cole a chave aqui"}" />
-            <label class="set-label">Modelo</label>
+            <label class="set-label" for="set-model">Modelo</label>
             <input class="set-field" id="set-model" autocomplete="off" spellcheck="false"
                    value="${esc(ia.model || "")}" placeholder="${esc(prov.default_model)}" />
             ${prov.needs_base_url ? `
-              <label class="set-label">Endpoint (OpenRouter, Ollama, LM Studio…)</label>
+              <label class="set-label" for="set-base">Endpoint (OpenRouter, Ollama, LM Studio…)</label>
               <input class="set-field" id="set-base" autocomplete="off" spellcheck="false"
                      value="${esc(ia.base_url || "")}" placeholder="${esc(prov.default_base_url || "")}" />` : ""}
             <p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.
@@ -965,7 +965,7 @@ function renderSettings() {
           <p class="set-hint">Opcional. Liga o botão <b>Trocar capa</b> na tela do jogo: busca
             pelo nome e mostra várias capas da comunidade para você escolher, como no Playnite.
             A capa escolhida vira o fundo do overlay e da lista de troféus.</p>
-          <label class="set-label">Chave da API${temCapaKey ? " (salva — deixe em branco para manter)" : ""}</label>
+          <label class="set-label" for="set-sgdb-key">Chave da API${temCapaKey ? " (salva — deixe em branco para manter)" : ""}</label>
           <input class="set-field" id="set-sgdb-key" type="password" autocomplete="off" spellcheck="false"
                  placeholder="${temCapaKey ? "••••••••••••••••" : "cole a chave aqui"}" />
           <p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.
@@ -1001,13 +1001,13 @@ function renderSettings() {
             "próximas" em <b>0</b> = mostra quantas couberem na altura; as "últimas obtidas"
             ficam fixas nesse número.</p>
           <div class="set-grid2">
-            <div><label class="set-label">Largura (px)</label>
+            <div><label class="set-label" for="cc-w">Largura (px)</label>
               <input class="set-field" id="cc-w" type="number" min="240" max="640" value="${cc.width}" /></div>
-            <div><label class="set-label">Altura (px)</label>
+            <div><label class="set-label" for="cc-h">Altura (px)</label>
               <input class="set-field" id="cc-h" type="number" min="150" max="900" value="${cc.height}" /></div>
-            <div><label class="set-label">Últimas obtidas</label>
+            <div><label class="set-label" for="cc-last">Últimas obtidas</label>
               <input class="set-field" id="cc-last" type="number" min="0" max="10" value="${cc.last}" /></div>
-            <div><label class="set-label">Próximas (0 = auto)</label>
+            <div><label class="set-label" for="cc-next">Próximas (0 = auto)</label>
               <input class="set-field" id="cc-next" type="number" min="0" max="10" value="${cc.next}" /></div>
           </div>
           <div style="display:flex;gap:8px;margin-top:10px">
@@ -1126,7 +1126,7 @@ function renderGameFaqs() {
       <span class="gf-faq-id">#${esc(f.id)}</span>
     </button>`).join("");
 
-  el.innerHTML = `<div class="gf-panel">
+  el.innerHTML = `<div class="gf-panel" role="dialog" aria-modal="true" aria-label="Importar do GameFAQs">
     <div class="gf-head">
       <div>
         <div class="gf-title">🌐 IMPORTAR DO GAMEFAQS</div>
@@ -1144,6 +1144,7 @@ function renderGameFaqs() {
         <div class="search-box">
           <span style="color:var(--text-low)">🔗</span>
           <input id="gf-url" placeholder="https://gamefaqs.gamespot.com/ps2/580782-digimon-world-4/faqs"
+                 aria-label="URL do jogo ou guia no GameFAQs"
                  autocomplete="off" spellcheck="false" value="${esc(G.url)}" />
         </div>
         <p class="gf-note">O GameFAQs limita a velocidade de acesso: listar leva alguns segundos e baixar um guia grande pode levar um minuto.</p>
@@ -1263,7 +1264,7 @@ function renderCoverPicker() {
   const capas = (V.covers || []).map((c) => cell(c, "portrait")).join("");
   const fundos = (V.heroes || []).map((c) => cell(c, "landscape")).join("");
 
-  el.innerHTML = `<div class="gf-panel cv-panel">
+  el.innerHTML = `<div class="gf-panel cv-panel" role="dialog" aria-modal="true" aria-label="Trocar arte do jogo">
     <div class="gf-head">
       <div>
         <div class="gf-title">🖼 TROCAR ARTE</div>
@@ -1281,8 +1282,8 @@ function renderCoverPicker() {
         </div>` : `
         <div class="search-box">
           <span style="color:var(--text-low)">🔎</span>
-          <input id="cv-q" placeholder="Nome do jogo" autocomplete="off"
-                 spellcheck="false" value="${esc(V.query || "")}" />
+          <input id="cv-q" placeholder="Nome do jogo" aria-label="Buscar arte pelo nome do jogo"
+                 autocomplete="off" spellcheck="false" value="${esc(V.query || "")}" />
           <button class="cv-go" id="cv-go">Buscar</button>
         </div>
         <div class="cv-roles">
@@ -1429,7 +1430,7 @@ function renderAiConfig() {
   }
   const atual = cfg.providers.find((p) => p.id === cfg.provider) || cfg.providers[0];
 
-  el.innerHTML = `<div class="gf-panel">
+  el.innerHTML = `<div class="gf-panel" role="dialog" aria-modal="true" aria-label="Refinar guia com IA">
     <div class="gf-head">
       <div>
         <div class="gf-title">✨ REFINAR GUIA COM IA</div>
@@ -1449,20 +1450,20 @@ function renderAiConfig() {
         </div>
       </div>
       <div class="field">
-        <label>API key ${atual.has_key ? "(já salva — deixe em branco para manter)" : ""}</label>
+        <label for="ai-key">API key ${atual.has_key ? "(já salva — deixe em branco para manter)" : ""}</label>
         <input id="ai-key" type="password" autocomplete="off" spellcheck="false"
                placeholder="${atual.has_key ? "••••••••••••" : "cole a chave aqui"}" />
         <p class="hint">Fica só em <code>config/secrets.json</code>, nesta máquina. Obter em
           <span class="ai-link">${esc(atual.key_url || "")}</span></p>
       </div>
       <div class="field">
-        <label>Modelo (opcional)</label>
+        <label for="ai-model">Modelo (opcional)</label>
         <input id="ai-model" autocomplete="off" spellcheck="false"
                value="${esc(cfg.model || "")}" placeholder="${esc(atual.default_model)}" />
       </div>
       ${atual.needs_base_url ? `
       <div class="field">
-        <label>Endpoint (para OpenRouter, Ollama, LM Studio…)</label>
+        <label for="ai-base">Endpoint (para OpenRouter, Ollama, LM Studio…)</label>
         <input id="ai-base" autocomplete="off" spellcheck="false"
                value="${esc(cfg.base_url || "")}" placeholder="${esc(atual.default_base_url || "")}" />
       </div>` : ""}
@@ -2131,6 +2132,8 @@ function bindAtalhos() {
     if (e.key === "Escape") {
       e.preventDefault();
       if ($("#gf-modal")) return closeGameFaqs();
+      if ($("#cv-modal")) return closeCoverPicker();
+      if ($("#ai-modal")) return $("#ai-modal").remove();
       if (S.view !== "dashboard") return enterDashboard();
       if (S.compact) return toggleCompacto();
       return;
