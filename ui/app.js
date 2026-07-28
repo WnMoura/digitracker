@@ -513,10 +513,6 @@ function compactHTML(game) {
         <span class="cw-count" title="Em hardcore, o que vale Mastery">${mst.hardcore || 0}<small>/${t}</small></span>
         <span class="cw-pct">${mst.percent || 0}%</span>
       </span>
-      <span class="cw-ctrls">
-        <button class="cw-ctrl" id="cw-exit" title="Sair do modo compacto">▣</button>
-        <button class="cw-ctrl close" id="cw-close" title="Fechar">✕</button>
-      </span>
     </div>
     <div class="cw-content" data-scroll="compact">${conteudo}</div>
   </div>`;
@@ -593,8 +589,6 @@ function cwTipsHTML(game) {
 function bindCompact() {
   $("#cw-prev")?.addEventListener("click", () => switchCompactGame(-1));
   $("#cw-next")?.addEventListener("click", () => switchCompactGame(1));
-  $("#cw-exit")?.addEventListener("click", () => toggleCompact(false));
-  $("#cw-close")?.addEventListener("click", () => hasBackend() && window.pywebview.api.close());
   root.querySelectorAll("[data-cwtab]").forEach((b) =>
     b.addEventListener("click", () => { S.cwTab = b.dataset.cwtab; renderDashboard({ force: true }); }));
 }

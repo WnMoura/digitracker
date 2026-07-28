@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import posixpath
 import re
 import sys
@@ -20,6 +21,14 @@ import unicodedata
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
+
+# No GNOME/Wayland o backend nativo do GTK não honra bem uma janela sem moldura
+# (o compositor ainda desenha decoração com fechar/maximizar) e o arraste
+# programático do overlay não funciona. Rodar via XWayland (GDK_BACKEND=x11)
+# resolve os dois: janela realmente sem moldura e overlay arrastável/posicionável.
+# `setdefault` deixa o usuário sobrescrever, e é inócuo fora do Linux/GTK.
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("GDK_BACKEND", "x11")
 
 import webview
 
