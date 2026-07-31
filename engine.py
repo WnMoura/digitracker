@@ -89,6 +89,7 @@ DEFAULT_SETTINGS = {
     "auto_overlay": True,           # grudar no emulador quando ele abrir
     "overlay_exit_fullscreen": False,  # mandar Alt+Enter ao ver fullscreen exclusivo
     "overlay_second_screen": False,    # levar o overlay para o monitor livre
+    "overlay_fit_emulator": True,      # dimensionar o overlay conforme a janela do emulador
     "dismissed": [],       # slugs removidos à mão — não voltam sozinhos
     "emulators": [],       # sobrescreve a lista padrão de emuladores (opcional)
     "ai_provider": "",     # provedor do refino por IA (vazio = padrão)
@@ -104,6 +105,12 @@ DEFAULT_SETTINGS = {
 # crescer tanto que deixe de ser um overlay.
 COMPACT_MIN = (240, 150)
 COMPACT_MAX = (640, 900)
+
+# Quando "ajustar ao emulador" está ligado, o overlay ocupa esta fração da
+# janela do emulador (preso a COMPACT_MIN/MAX) — cresce em jogo grande, encolhe
+# em janela pequena.
+OVERLAY_FIT_W = 0.26
+OVERLAY_FIT_H = 0.44
 
 ACCENTS = ["#D62839", "#F5C518", "#2DE2E6", "#27AE60"]
 
@@ -150,6 +157,7 @@ def load_settings() -> dict:
         settings["auto_overlay"] = bool(saved.get("auto_overlay", True))
         for chave in ("overlay_exit_fullscreen", "overlay_second_screen"):
             settings[chave] = bool(saved.get(chave, False))
+        settings["overlay_fit_emulator"] = bool(saved.get("overlay_fit_emulator", True))
         for key in ("dismissed", "emulators"):
             value = saved.get(key)
             if isinstance(value, list):
@@ -229,6 +237,7 @@ class Api:
         self.auto_imported: list[str] = []    # jogos trazidos sozinhos (avisa a UI)
         self.last_faq: dict | None = None     # último guia baixado (p/ refino IA)
         self._overlay = None                  # OverlayWatcher (grudar no emulador)
+        self._overlay_size = None             # último tamanho aplicado ao overlay grudado
         self._tracker = None
         self._own_hwnd = None
         self.overlay_notice = ""              # aviso pendente para a interface
@@ -255,6 +264,7 @@ class Api:
             "auto_overlay": self.settings["auto_overlay"],
             "overlay_exit_fullscreen": self.settings["overlay_exit_fullscreen"],
             "overlay_second_screen": self.settings["overlay_second_screen"],
+            "overlay_fit_emulator": self.settings["overlay_fit_emulator"],
             "compact": self._compact,
             "ai_ready": bool(self._ai_key()),   # só o fato, nunca a chave
             "covers_ready": bool(self._covers_key()),  # idem: só se há chave
@@ -1064,7 +1074,24 @@ class Api:
             self._window_op(lambda: setattr(self._window, "on_top", val))
         return {"ok": True, "on_top": val}
 
-    def set_compact(self, value: bool, dock=None, from_user: bool = True) -> dict:
+    def move_window(self, x, y) -> dict:
+        """Move a janela para (x, y) — usado pelo arraste manual do overlay
+        compacto. Passa pelo _window_op (thread própria) de propósito: mover a
+        janela DIRETO no contexto do bridge js_api não surte efeito no
+        Windows/WinForms (mesmo motivo de fechar/minimizar). É exatamente por
+        isso que o drag-region nativo do pywebview — que chama window.move na
+        thread do bridge — arrasta no Linux/GTK mas não no Windows."""
+        win = self._window
+        if not win:
+            return {"ok": False}
+        try:
+            ix, iy = int(x), int(y)
+        except (TypeError, ValueError):
+            return {"ok": False}
+        self._window_op(lambda: win.move(ix, iy))
+        return {"ok": True}
+
+    def set_compact(self, value: bool, dock=None, from_user: bool = True, size=None) -> dict:
         """Alterna entre o dashboard completo e um mini-overlay (quadradinho)
         com o progresso do jogo ativo — pensado para ficar por cima do
         emulador enquanto se joga, tipo o popup de conquistas do RetroArch.
@@ -1082,7 +1109,7 @@ class Api:
             if value:
                 if not self._pre_compact_pos:
                     self._pre_compact_pos = (win.x, win.y)
-                w, h = self._compact_size()
+                w, h = size or self._compact_size()
                 win.resize(w, h)
                 pos = dock
                 if pos is None:
@@ -1117,7 +1144,8 @@ class Api:
     def set_overlay_option(self, chave: str, value: bool) -> dict:
         """Interruptores do comportamento em fullscreen exclusivo. Ambos vêm
         desligados: o app não injeta tecla nem pula de monitor sem seu aval."""
-        if chave not in ("overlay_exit_fullscreen", "overlay_second_screen"):
+        if chave not in ("overlay_exit_fullscreen", "overlay_second_screen",
+                         "overlay_fit_emulator"):
             return {"ok": False, "error": f"Opção desconhecida: {chave}"}
         value = bool(value)
         with self._lock:
@@ -1130,14 +1158,23 @@ class Api:
         canto de dentro do emulador; o JS é avisado para trocar a tela."""
 
         def enter(rect):
-            self.set_compact(True, dock=self._dock_for(rect), from_user=False)
+            size = self._overlay_size_for(rect)
+            self._overlay_size = size
+            self.set_compact(True, dock=self._dock_for(rect, size), from_user=False, size=size)
             self._notify_ui_compact(True)
 
         def follow(rect):
             win = self._window
-            if win:
-                pos = self._dock_for(rect)
-                self._window_op(lambda: win.move(*pos))
+            if not win:
+                return
+            size = self._overlay_size_for(rect)
+            # O emulador foi redimensionado? Reajusta o overlay antes de reposicionar.
+            if size != getattr(self, "_overlay_size", None):
+                self._overlay_size = size
+                self._window_op(lambda: win.resize(*size))
+                self._notify_ui_compact(True)   # o JS reajusta quantas próximas cabem
+            pos = self._dock_for(rect, size)
+            self._window_op(lambda: win.move(*pos))
 
         def leave():
             self.set_compact(False, from_user=False)
@@ -1159,7 +1196,10 @@ class Api:
             if usar_2a_tela:
                 livre = emulator_tracker.pick_free_screen(rect, self._tracker.screens())
                 if livre:
-                    self.set_compact(True, dock=self._dock_for(livre), from_user=False)
+                    size = self._overlay_size_for(livre)
+                    self._overlay_size = size
+                    self.set_compact(True, dock=self._dock_for(livre, size),
+                                     from_user=False, size=size)
                     self._notify_ui_compact(True)
                     self._warn_ui("O jogo está em tela cheia exclusiva; movi o overlay "
                                   "para o outro monitor.")
@@ -1194,8 +1234,22 @@ class Api:
         h = max(COMPACT_MIN[1], min(COMPACT_MAX[1], h))
         return w, h
 
-    def _dock_for(self, rect):
-        return emulator_tracker.dock_position(rect, self._compact_size(), COMPACT_MARGIN)
+    def _overlay_size_for(self, rect=None) -> tuple[int, int]:
+        """Tamanho do overlay ao grudar: proporcional à janela do emulador quando
+        'ajustar ao emulador' está ligado (preso a COMPACT_MIN/MAX); senão, o
+        tamanho manual das Configurações."""
+        with self._lock:
+            fit = self.settings.get("overlay_fit_emulator", True)
+        if not (fit and rect):
+            return self._compact_size()
+        _ex, _ey, ew, eh = rect
+        w = max(COMPACT_MIN[0], min(COMPACT_MAX[0], round(ew * OVERLAY_FIT_W)))
+        h = max(COMPACT_MIN[1], min(COMPACT_MAX[1], round(eh * OVERLAY_FIT_H)))
+        return w, h
+
+    def _dock_for(self, rect, size=None):
+        return emulator_tracker.dock_position(
+            rect, size or self._compact_size(), COMPACT_MARGIN)
 
     def get_compact_config(self) -> dict:
         """Tamanho e contagens do overlay compacto para a UI."""

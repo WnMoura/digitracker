@@ -134,6 +134,7 @@ const S = {
   aiReady: false,        // há chave salva para o provedor de IA escolhido
   overlayExitFullscreen: false,  // mandar Alt+Enter ao detectar tela cheia exclusiva
   overlaySecondScreen: false,    // levar o overlay para o monitor livre
+  overlayFitEmulator: true,      // dimensionar o overlay conforme a janela do emulador
   G: null,               // estado do painel do GameFAQs
   AI: null,              // estado do painel de configuração da IA
   SET: null,             // estado da tela de Configurações
@@ -268,6 +269,10 @@ const backend = {
     if (S.mode === "demo") return { ok: true, ...cfg };
     return window.pywebview.api.set_compact_config(
       cfg.width, cfg.height, cfg.last, cfg.next);
+  },
+  moveWindow(x, y) {
+    if (S.mode === "demo" || !hasBackend()) return;
+    try { window.pywebview.api.move_window(x, y); } catch (_) { /* janela indo embora */ }
   },
 };
 
@@ -504,7 +509,7 @@ function compactHTML(game) {
     <div class="cw-scrim"></div>
     <button class="cw-nav prev" id="cw-prev" title="Jogo anterior">‹</button>
     <button class="cw-nav next" id="cw-next" title="Próximo jogo">›</button>
-    <div class="cw-head pywebview-drag-region" title="${esc(game.title)} — arraste para mover">
+    <div class="cw-head" title="${esc(game.title)} — arraste para mover">
       <div class="cw-tabs">
         <button class="cw-tab ${tab === "walk" ? "on" : ""}" data-cwtab="walk">Conquistas</button>
         <button class="cw-tab ${tab === "tips" ? "on" : ""}" data-cwtab="tips">Dicas</button>
@@ -532,8 +537,9 @@ function cwWalkHTML(game, t, e, cor) {
   const proxIds = game.next_ids || [];
   let nextN = Math.max(0, cfg.next ?? 0);
   if (nextN === 0) {
-    // auto: estima quantas linhas cabem na altura ajustada do overlay
-    const H = cfg.height || 232;
+    // auto: estima quantas linhas cabem na ALTURA REAL da janela (vale tanto
+    // para o tamanho manual quanto para o auto-ajuste ao emulador).
+    const H = window.innerHeight || cfg.height || 232;
     const ROW = 40, LABEL = 18, HEAD = 36, BAR = 16, PAD = 14;
     const usadoUlt = ultimas.length ? LABEL + ultimas.length * ROW : 0;
     const restante = H - HEAD - BAR - usadoUlt - LABEL - PAD;
@@ -589,6 +595,7 @@ function cwTipsHTML(game) {
 function bindCompact() {
   $("#cw-prev")?.addEventListener("click", () => switchCompactGame(-1));
   $("#cw-next")?.addEventListener("click", () => switchCompactGame(1));
+  makeDraggable(root.querySelector(".cw-head"));
   root.querySelectorAll("[data-cwtab]").forEach((b) =>
     b.addEventListener("click", () => { S.cwTab = b.dataset.cwtab; renderDashboard({ force: true }); }));
 }
@@ -599,6 +606,33 @@ function switchCompactGame(dir) {
   const next = (idx + dir + S.library.length) % S.library.length;
   S.activeSlug = S.library[next].slug;
   renderDashboard();
+}
+
+/* Arraste manual da janela por um elemento (a faixa do overlay). Substitui o
+   drag-region nativo do pywebview, que só funciona no Linux — no Windows ele
+   chama window.move na thread do bridge, que não surte efeito. Aqui a posição
+   nova (canto = cursor na tela menos o ponto agarrado) vai pelo move_window, que
+   passa pelo _window_op e funciona nos dois SOs. rAF coalesce os mousemove. */
+function makeDraggable(el) {
+  if (!el) return;
+  let grabX = 0, grabY = 0, raf = 0, pend = null;
+  const flush = () => { raf = 0; if (pend) { backend.moveWindow(pend[0], pend[1]); pend = null; } };
+  const onMove = (e) => {
+    pend = [Math.round(e.screenX - grabX), Math.round(e.screenY - grabY)];
+    if (!raf) raf = requestAnimationFrame(flush);
+  };
+  const onUp = () => {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+  };
+  el.addEventListener("mousedown", (e) => {
+    // botão esquerdo, e nunca sobre um controle (abas): esses clicam, não arrastam
+    if (e.button !== 0 || e.target.closest("button")) return;
+    grabX = e.clientX; grabY = e.clientY;
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    e.preventDefault();
+  });
 }
 
 /* Liga/desliga o modo compacto (usado pelo botão da barra E pelo controle que
@@ -993,6 +1027,9 @@ function renderSettings() {
           ${chave("overlay_second_screen", "Usar o segundo monitor",
                   "Com dois monitores, leva o overlay para a tela que o jogo não ocupa",
                   S.overlaySecondScreen)}
+          ${chave("overlay_fit_emulator", "Ajustar ao tamanho do emulador",
+                  "Grudado, o overlay fica proporcional à janela do emulador (cresce em jogo grande, encolhe em janela pequena). Desligado, usa o tamanho manual da seção Modo compacto",
+                  S.overlayFitEmulator)}
         </section>
 
         <section class="set-section">
@@ -1073,6 +1110,7 @@ async function alternarPreferencia(chave, botao) {
   else if (chave === "auto_overlay") { S.autoOverlay = novo; await backend.setAutoOverlay(novo); }
   else {
     if (chave === "overlay_exit_fullscreen") S.overlayExitFullscreen = novo;
+    else if (chave === "overlay_fit_emulator") S.overlayFitEmulator = novo;
     else S.overlaySecondScreen = novo;
     await backend.setOverlayOption(chave, novo);
   }
@@ -2205,6 +2243,7 @@ async function boot() {
     if (st.ai_ready !== undefined) S.aiReady = st.ai_ready;
     if (st.overlay_exit_fullscreen !== undefined) S.overlayExitFullscreen = st.overlay_exit_fullscreen;
     if (st.overlay_second_screen !== undefined) S.overlaySecondScreen = st.overlay_second_screen;
+    if (st.overlay_fit_emulator !== undefined) S.overlayFitEmulator = st.overlay_fit_emulator;
     if (S.mode === "real" && !st.configured) renderSetup();
     else enterDashboard();
   } catch (e) {
