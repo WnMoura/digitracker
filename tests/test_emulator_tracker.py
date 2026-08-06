@@ -232,6 +232,19 @@ xwininfo: Window id: 0x280000a "ePSXe 2.0.5"
 
 GEOM_MINIMIZADA = GEOM.replace("IsViewable", "IsUnviewable")
 
+# Saída do `xwininfo -root -tree`: o emulador (ePSXe) aparece REPARENTADO sob o
+# frame do mutter (aninhado), e a segunda geometria (+abs) é a da tela.
+TREE = '''  Root window id: 0x2a (the root window) (has no name)
+  Parent window id: 0x0 (none)
+     4 children:
+     0x600009 "mutter guard window": ()  1920x1080+0+0  +0+0
+     0xa00001 "gnome-terminal-server": ("gnome-terminal-server" "Gnome-terminal")  900x600+120+80  +120+80
+     0x800002 "mutter-x11-frames": ("mutter-x11-frames" "mutter-x11-frames")  1x1+0+0  +0+0
+        1 child:
+        0x2a00003 "ePSXe 2.0.5": ("epsxe" "ePSXe")  908x663+96+159  +96+159
+     0x400003 "panel tray": ()  24x24+0+0  +0+0
+'''
+
 
 class TestParsersLinux:
     def test_le_a_lista_de_janelas(self):
@@ -261,6 +274,23 @@ class TestParsersLinux:
     def test_geometria_incompleta_e_ignorada(self):
         assert et.parse_geometry("Map State: IsViewable\n") is None
 
+    def test_tree_extrai_janelas_com_geometria_absoluta(self):
+        d = {w["title"]: w for w in et.parse_tree(TREE)}
+        assert d["ePSXe 2.0.5"]["rect"] == (96, 159, 908, 663)   # (absX, absY, w, h)
+        assert d["ePSXe 2.0.5"]["cls"] == "epsxe ePSXe"
+        assert "gnome-terminal-server" in d
+
+    def test_tree_classe_vazia_nao_quebra(self):
+        wins = et.parse_tree('0x1 "guard": ()  1920x1080+0+0  +0+0')
+        assert wins[0]["cls"] == "" and wins[0]["rect"] == (0, 0, 1920, 1080)
+
+    def test_tree_coordenadas_negativas(self):
+        wins = et.parse_tree('0x1 "X": ()  100x50+-100+-50  +-100+-50')
+        assert wins[0]["rect"] == (-100, -50, 100, 50)
+
+    def test_tree_vazia(self):
+        assert et.parse_tree("") == []
+
 
 class TestLinuxTrackerIntegracao:
     """O tracker inteiro, com os comandos externos substituídos."""
@@ -268,19 +298,7 @@ class TestLinuxTrackerIntegracao:
     @pytest.fixture
     def tracker(self, monkeypatch):
         t = et.LinuxTracker()
-        respostas = {
-            ("xprop", "-root"): CLIENT_LIST,
-            ("xprop", "0x280000a"): PROPS_TERMINAL,
-            ("xprop", "0x2a00003"): PROPS_EPSXE,
-            ("xwininfo", "0x2a00003"): GEOM,
-        }
-
-        def fake_run(cmd):
-            if cmd[0] == "xprop" and cmd[1] == "-root":
-                return respostas[("xprop", "-root")]
-            return respostas.get((cmd[0], cmd[2]), "")
-
-        monkeypatch.setattr(t, "_run", fake_run)
+        monkeypatch.setattr(t, "_run", lambda cmd: TREE)   # xwininfo -root -tree
         return t
 
     def test_acha_o_emulador_entre_as_janelas(self, tracker):
@@ -288,12 +306,18 @@ class TestLinuxTrackerIntegracao:
         assert win["title"] == "ePSXe 2.0.5"
         assert win["rect"] == (96, 159, 908, 663)
 
+    def test_ignora_janelas_pequenas(self, monkeypatch):
+        """Uma janela minúscula com nome de emulador (tray/popup) não conta."""
+        t = et.LinuxTracker()
+        tree = TREE.replace("908x663+96+159  +96+159", "40x24+0+0  +0+0")
+        monkeypatch.setattr(t, "_run", lambda cmd: tree)
+        assert t.find_emulator_window() is None
+
     def test_sem_emulador_devolve_none(self, monkeypatch):
         t = et.LinuxTracker()
-        monkeypatch.setattr(
-            t, "_run",
-            lambda cmd: CLIENT_LIST if cmd[1] == "-root" else PROPS_TERMINAL,
-        )
+        tree = TREE.replace('"ePSXe 2.0.5": ("epsxe" "ePSXe")',
+                            '"LibreOffice Writer": ("soffice" "libreoffice")')
+        monkeypatch.setattr(t, "_run", lambda cmd: tree)
         assert t.find_emulator_window() is None
 
     def test_comando_indisponivel_nao_quebra(self, monkeypatch):

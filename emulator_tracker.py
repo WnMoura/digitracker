@@ -44,6 +44,10 @@ _EXCLUDES = ["org.kde.dolphin", "dolphin file manager", "digitracker"]
 # único caso em que nenhum overlay aparece por cima.
 QUNS_RUNNING_D3D_FULL_SCREEN = 3
 
+# Tamanho mínimo para considerar uma janela como jogo/emulador (descarta
+# helpers, bandejas e popups minúsculos que aparecem na árvore X11).
+_MIN_EMU_W, _MIN_EMU_H = 320, 200
+
 
 def is_emulator(title: str, wm_class: str, patterns=None) -> bool:
     """A janela (título + classe) parece um emulador?"""
@@ -350,6 +354,29 @@ def parse_client_list(output: str) -> list[str]:
     return [w.strip() for w in m.group(1).split(",") if w.strip().startswith("0x")]
 
 
+# Uma linha de `xwininfo -root -tree`:
+#   0x1400007 "Dolphin 5.0 | JIT64": ("dolphin-emu" "dolphin-emu")  1280x720+320+140  +320+140
+# A PRIMEIRA geometria é relativa ao pai (pode ser um frame do mutter); a
+# SEGUNDA (+absX+absY) é a absoluta na tela — é a que interessa para grudar.
+_TREE_RE = re.compile(
+    r'(0x[0-9a-f]+)\s+"([^"]*)":\s+\(([^)]*)\)\s+'
+    r'(\d+)x(\d+)[+-]-?\d+[+-]-?\d+\s+\+(-?\d+)\+(-?\d+)'
+)
+
+
+def parse_tree(output: str) -> list[dict]:
+    """Janelas do `xwininfo -root -tree`: [{id, title, cls, rect}] com `rect` =
+    (absX, absY, w, h). Funciona no GNOME/Wayland, onde `_NET_CLIENT_LIST` vem
+    vazio, e pega janelas reparentadas (emuladores com decoração)."""
+    out = []
+    for m in _TREE_RE.finditer(output or ""):
+        wid, title, cls_raw, w, h, ax, ay = m.groups()
+        cls = " ".join(re.findall(r'"([^"]*)"', cls_raw))
+        out.append({"id": wid, "title": title, "cls": cls,
+                    "rect": (int(ax), int(ay), int(w), int(h))})
+    return out
+
+
 def parse_window_props(output: str) -> tuple[str, str]:
     """(título, classe) do `xprop -id <id> WM_CLASS _NET_WM_NAME WM_NAME`."""
     cls = ""
@@ -392,14 +419,15 @@ class LinuxTracker:
             return ""
 
     def find_emulator_window(self):
-        for wid in parse_client_list(self._run(["xprop", "-root", "_NET_CLIENT_LIST"])):
-            props = self._run(["xprop", "-id", wid, "WM_CLASS", "_NET_WM_NAME", "WM_NAME"])
-            title, cls = parse_window_props(props)
-            if not is_emulator(title, cls, self.patterns):
+        # `xwininfo -root -tree` numa chamada só: funciona no GNOME/Wayland (onde
+        # _NET_CLIENT_LIST vem vazio) e pega emuladores decorados (reparentados
+        # sob o frame do mutter). Filtra janelas pequenas — helper/popup/tray.
+        for w in parse_tree(self._run(["xwininfo", "-root", "-tree"])):
+            _ax, _ay, ww, hh = w["rect"]
+            if ww < _MIN_EMU_W or hh < _MIN_EMU_H:
                 continue
-            rect = parse_geometry(self._run(["xwininfo", "-id", wid, "-stats"]))
-            if rect:
-                return {"title": title, "rect": rect, "hwnd": None}
+            if is_emulator(w["title"], w["cls"], self.patterns):
+                return {"title": w["title"], "rect": w["rect"], "hwnd": None}
         return None
 
     def make_topmost(self, _hwnd):
