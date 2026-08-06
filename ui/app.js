@@ -229,6 +229,14 @@ const backend = {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
     return window.pywebview.api.refine_guide_ai();
   },
+  async refineGameTips(slug) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.refine_game_tips(slug);
+  },
+  async translateGameTips(slug) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.translate_game_tips(slug);
+  },
   async getAiConfig() {
     if (S.mode === "demo") return { ok: false };
     return window.pywebview.api.get_ai_config();
@@ -237,21 +245,21 @@ const backend = {
     if (S.mode === "demo") return { ok: false };
     return window.pywebview.api.set_ai_config(cfg.provider, cfg.api_key, cfg.model, cfg.base_url);
   },
-  async getCoversConfig() {
-    if (S.mode === "demo") return { ok: true, has_key: false };
-    return window.pywebview.api.get_covers_config();
+  async getSourcesConfig() {
+    if (S.mode === "demo") return { ok: true, ready: {} };
+    return window.pywebview.api.get_sources_config();
   },
-  async setCoversKey(key) {
-    if (S.mode === "demo") return { ok: true, has_key: !!key };
-    return window.pywebview.api.set_covers_key(key);
+  async setSourceKey(source, key1, key2) {
+    if (S.mode === "demo") return { ok: true, ready: {} };
+    return window.pywebview.api.set_source_key(source, key1 ?? null, key2 ?? null);
   },
-  async coversSearch(slug, query) {
+  async coversSearch(slug, query, source) {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
-    return window.pywebview.api.covers_search(slug, query || "");
+    return window.pywebview.api.covers_search(slug, query || "", source || "steamgriddb");
   },
-  async coversFor(gameId) {
+  async coversFor(gameId, source) {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
-    return window.pywebview.api.covers_for(gameId);
+    return window.pywebview.api.covers_for(gameId, source || "steamgriddb");
   },
   async setGameCover(slug, url, role) {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
@@ -845,6 +853,10 @@ function guideHTML(game) {
   const importBtn = S.mode === "demo" ? "" : `
     <button class="pdf-order-btn gf" id="guide-gamefaqs">🌐 ${secs.length ? "Substituir pelo GameFAQs" : "Importar do GameFAQs"}</button>
     <button class="pdf-order-btn" id="guide-import">📄 ${secs.length ? "Substituir dicas (PDF)" : "Importar dicas do PDF"}</button>`;
+  // IA sobre as dicas já importadas (não mexe nas conquistas): só com guia + chave.
+  const aiBtns = (secs.length && S.aiReady && S.mode !== "demo") ? `
+    <button class="pdf-order-btn ai" id="guide-refine">✨ Refinar dicas</button>
+    <button class="pdf-order-btn" id="guide-translate">🌐 Traduzir (PT-BR)</button>` : "";
   if (!secs.length) {
     return `<div class="list-wrap"><p class="list-title">DICAS & TUTORIAIS</p>
       <p class="guide-empty">Nenhuma dica importada para este jogo.<br>
@@ -854,7 +866,7 @@ function guideHTML(game) {
   }
   const block = (b) => {
     switch (b.type) {
-      case "boss":    return `<div class="g-boss">⚔️ CHEFE: ${esc(b.text)}</div>`;
+      case "boss":    return `<div class="g-boss">CHEFE: ${esc(b.text)}</div>`;
       case "step":    return `<div class="g-step"><span class="g-step-n">#${b.n}</span> ${esc(b.text)}</div>`;
       case "subhead": return `<div class="g-sub">${esc(b.text)}</div>`;
       case "note":    return `<div class="g-note">${esc(b.text)}</div>`;
@@ -870,10 +882,36 @@ function guideHTML(game) {
   return `<div class="list-wrap guide-wrap">
     <div class="guide-head">
       <p class="list-title" style="margin:0">DICAS & TUTORIAIS DO GUIA</p>
-      ${importBtn}
+      ${importBtn}${aiBtns}
     </div>
     ${secs.map(section).join("")}
   </div>`;
+}
+
+/* Passa as dicas JÁ importadas do jogo pela IA: refina (limpa/cura) ou traduz
+   para PT-BR. Não toca nas conquistas nem na ordem. */
+async function dicasIa(kind) {
+  const slug = S.activeSlug;
+  if (!slug) return;
+  const btn = kind === "refine" ? $("#guide-refine") : $("#guide-translate");
+  if (btn) { btn.disabled = true; btn.textContent = kind === "refine" ? "✨ Refinando…" : "🌐 Traduzindo…"; }
+  try {
+    const res = kind === "refine"
+      ? await backend.refineGameTips(slug)
+      : await backend.translateGameTips(slug);
+    if (!res || !res.ok) {
+      toast(res && res.error ? res.error : "Falha na IA.", true);
+      if (btn) { btn.disabled = false; btn.textContent = kind === "refine" ? "✨ Refinar dicas" : "🌐 Traduzir (PT-BR)"; }
+      return;
+    }
+    toast(kind === "refine"
+      ? `Dicas refinadas (${res.sections} seções).`
+      : `Dicas traduzidas (${res.sections} seções).`);
+    await renderDashboard({ force: true });   // re-render já traz os botões limpos
+  } catch (e) {
+    toast("Erro: " + e, true);
+    if (btn) { btn.disabled = false; btn.textContent = kind === "refine" ? "✨ Refinar dicas" : "🌐 Traduzir (PT-BR)"; }
+  }
 }
 
 function bindSidebar() {
@@ -883,6 +921,8 @@ function bindSidebar() {
   root.querySelectorAll(".ptab").forEach((b) => {
     b.onclick = () => { S.tab = b.dataset.tab; renderDashboard(); };
   });
+  $("#guide-refine")?.addEventListener("click", () => dicasIa("refine"));
+  $("#guide-translate")?.addEventListener("click", () => dicasIa("translate"));
   const gimport = $("#guide-import");
   if (gimport) gimport.onclick = attachGuide;
   const gfaqs = $("#guide-gamefaqs");
@@ -917,25 +957,25 @@ function bindSidebar() {
 async function enterSettings() {
   S.view = "settings";
   stopPolling();
-  const [estado, ia, covers, compact] = await Promise.all([
+  const [estado, ia, sources, compact] = await Promise.all([
     backend.appState().catch(() => ({})),
     backend.getAiConfig().catch(() => ({ ok: false })),
-    backend.getCoversConfig().catch(() => ({ ok: false })),
+    backend.getSourcesConfig().catch(() => ({ ok: false })),
     backend.getCompactConfig().catch(() => null),
   ]);
   S.SET = {
     estado,
     ia: ia && ia.ok ? ia : null,
-    covers: covers && covers.ok ? covers : { has_key: false },
+    sources: sources && sources.ok ? sources.ready : {},
     compact: compact && compact.ok ? compact : { width: 300, height: 232, last: 2, next: 0 },
   };
   renderSettings();
 }
 
 function renderSettings() {
-  const { estado, ia, covers, compact } = S.SET;
+  const { estado, ia, sources, compact } = S.SET;
   const prov = ia && (ia.providers.find((p) => p.id === ia.provider) || ia.providers[0]);
-  const temCapaKey = !!(covers && covers.has_key);
+  const ready = sources || {};
   const cc = compact || { width: 300, height: 232, last: 2, next: 0 };
 
   const chave = (id, txt, sub, ligado) => `
@@ -995,18 +1035,38 @@ function renderSettings() {
         </section>
 
         <section class="set-section">
-          <h3>Capas (SteamGridDB)</h3>
-          <p class="set-hint">Opcional. Liga o botão <b>Trocar capa</b> na tela do jogo: busca
-            pelo nome e mostra várias capas da comunidade para você escolher, como no Playnite.
-            A capa escolhida vira o fundo do overlay e da lista de troféus.</p>
-          <label class="set-label" for="set-sgdb-key">Chave da API${temCapaKey ? " (salva — deixe em branco para manter)" : ""}</label>
-          <input class="set-field" id="set-sgdb-key" type="password" autocomplete="off" spellcheck="false"
-                 placeholder="${temCapaKey ? "••••••••••••••••" : "cole a chave aqui"}" />
-          <p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.
-            Obter em <span class="ai-link">steamgriddb.com/profile/preferences/api</span></p>
-          <div style="display:flex;gap:8px">
-            <button class="btn-primary" id="set-sgdb-save">Salvar</button>
-            <button class="btn-ghost" id="set-sgdb-clear">Remover chave</button>
+          <h3>Fontes de imagem</h3>
+          <p class="set-hint">Opcional. Liga o botão <b>Trocar arte</b> na tela do jogo: busca
+            capas e fundos pelo nome, como no Playnite. Configure uma ou mais fontes — o seletor
+            deixa alternar entre elas. As chaves ficam só em <code>config/secrets.json</code>.</p>
+
+          <div class="src-cfg">
+            <label class="set-label" for="src-steamgriddb">SteamGridDB${ready.steamgriddb ? " ✓" : ""}</label>
+            <input class="set-field" id="src-steamgriddb" type="password" autocomplete="off" spellcheck="false"
+                   placeholder="${ready.steamgriddb ? "••••••••  (salva — em branco mantém)" : "chave da API"}" />
+            <p class="set-hint">Capas da comunidade. Obter em <span class="ai-link">steamgriddb.com/profile/preferences/api</span></p>
+            <div class="src-btns"><button class="btn-primary" data-src-save="steamgriddb">Salvar</button>
+              <button class="btn-ghost" data-src-clear="steamgriddb">Remover</button></div>
+          </div>
+
+          <div class="src-cfg">
+            <label class="set-label" for="src-rawg">RAWG${ready.rawg ? " ✓" : ""}</label>
+            <input class="set-field" id="src-rawg" type="password" autocomplete="off" spellcheck="false"
+                   placeholder="${ready.rawg ? "••••••••  (salva — em branco mantém)" : "chave da API"}" />
+            <p class="set-hint">Base gigante, ótima para retrô (fundos/screenshots). Obter em <span class="ai-link">rawg.io/apidocs</span></p>
+            <div class="src-btns"><button class="btn-primary" data-src-save="rawg">Salvar</button>
+              <button class="btn-ghost" data-src-clear="rawg">Remover</button></div>
+          </div>
+
+          <div class="src-cfg">
+            <label class="set-label" for="src-igdb-id">IGDB${ready.igdb ? " ✓" : ""}</label>
+            <input class="set-field" id="src-igdb-id" autocomplete="off" spellcheck="false"
+                   placeholder="${ready.igdb ? "•••• (Client ID salvo — em branco mantém)" : "Twitch Client ID"}" />
+            <input class="set-field" id="src-igdb-secret" type="password" autocomplete="off" spellcheck="false"
+                   style="margin-top:6px" placeholder="${ready.igdb ? "•••• (Client Secret salvo — em branco mantém)" : "Twitch Client Secret"}" />
+            <p class="set-hint">Capas de qualidade (retrô). Crie um app em <span class="ai-link">dev.twitch.tv/console/apps</span> e use o Client ID + Secret.</p>
+            <div class="src-btns"><button class="btn-primary" data-src-save="igdb">Salvar</button>
+              <button class="btn-ghost" data-src-clear="igdb">Remover</button></div>
           </div>
         </section>
 
@@ -1068,12 +1128,31 @@ function renderSettings() {
   if (salvar) salvar.onclick = () => salvarIa(null);
   const limpar = $("#set-ai-clear");
   if (limpar) limpar.onclick = () => salvarIa("");
-  const sgSalvar = $("#set-sgdb-save");
-  if (sgSalvar) sgSalvar.onclick = () => salvarSgdb(null);
-  const sgLimpar = $("#set-sgdb-clear");
-  if (sgLimpar) sgLimpar.onclick = () => salvarSgdb("");
+  root.querySelectorAll("[data-src-save]").forEach((b) =>
+    b.onclick = () => salvarFonte(b.dataset.srcSave, false));
+  root.querySelectorAll("[data-src-clear]").forEach((b) =>
+    b.onclick = () => salvarFonte(b.dataset.srcClear, true));
   const ccSave = $("#cc-save");
   if (ccSave) ccSave.onclick = salvarCompacto;
+}
+
+/* Salva (ou remove) a credencial de uma fonte de imagem. IGDB tem dois campos
+   (client id + secret); as demais, um. */
+async function salvarFonte(source, remover) {
+  let key1, key2 = null;
+  if (source === "igdb") {
+    key1 = remover ? "" : (($("#src-igdb-id")?.value || "").trim() || null);
+    key2 = remover ? "" : (($("#src-igdb-secret")?.value || "").trim() || null);
+  } else {
+    key1 = remover ? "" : (($("#src-" + source)?.value || "").trim() || null);
+  }
+  if (!remover && key1 === null && key2 === null) return;  // nada digitado
+  const res = await backend.setSourceKey(source, key1, key2);
+  if (!res || !res.ok) return toast("Não foi possível salvar.", true);
+  S.SET.sources = res.ready || {};
+  renderSettings();
+  const nome = { steamgriddb: "SteamGridDB", rawg: "RAWG", igdb: "IGDB" }[source] || source;
+  toast(remover ? `Chave do ${nome} removida.` : `${nome} pronto.`);
 }
 
 async function salvarCompacto() {
@@ -1090,16 +1169,6 @@ async function salvarCompacto() {
   S.SET.compact = res;
   S.compactCfg = res;   // o overlay passa a usar já no próximo render
   toast("Modo compacto atualizado.");
-}
-
-async function salvarSgdb(forcar) {
-  const digitada = ($("#set-sgdb-key")?.value || "").trim();
-  const chave = forcar !== null ? forcar : (digitada || null);
-  const res = await backend.setCoversKey(chave);
-  if (!res || !res.ok) return toast("Não foi possível salvar.", true);
-  S.SET.covers = res;
-  renderSettings();
-  toast(res.has_key ? "Seletor de capas pronto." : "Chave removida.");
 }
 
 async function alternarPreferencia(chave, botao) {
@@ -1259,23 +1328,33 @@ async function gfBaixar(url) {
 }
 
 /* ═══════════════════════════  TROCAR ARTE  ═══════════════════════════
-   Busca imagens pelo nome do jogo no SteamGridDB, como no Playnite. Cada imagem
-   pode virar CAPA (art.cover: overlay + lateral) ou FUNDO (art.background: atrás
-   da lista de conquistas) — ou os dois, conforme o papel selecionado. */
+   Busca imagens pelo nome do jogo em várias fontes (SteamGridDB, RAWG, IGDB) ou
+   por URL colada, como no Playnite. Cada imagem pode virar CAPA (art.cover:
+   overlay + lateral) ou FUNDO (art.background: atrás da lista) — ou os dois. */
 const CV_ROLES = [
   { id: "cover", label: "Capa" },
   { id: "background", label: "Fundo" },
   { id: "both", label: "Ambos" },
 ];
+const CV_SOURCES = [
+  { id: "steamgriddb", label: "SteamGridDB" },
+  { id: "rawg", label: "RAWG" },
+  { id: "igdb", label: "IGDB" },
+  { id: "url", label: "Colar URL" },
+];
+const CV_SRC_LABEL = { steamgriddb: "SteamGridDB", rawg: "RAWG", igdb: "IGDB" };
 
-function openCoverPicker(game) {
+async function openCoverPicker(game) {
+  const cfg = await backend.getSourcesConfig().catch(() => ({ ready: {} }));
+  const ready = (cfg && cfg.ready) || {};
+  const first = ["steamgriddb", "rawg", "igdb"].find((s) => ready[s]) || "steamgriddb";
   S.CV = {
     slug: game.slug, title: game.title, query: game.title,
-    busy: true, error: "", noKey: false, role: "cover",
-    matches: [], chosen: null, covers: [], heroes: [],
+    source: first, ready, role: "cover", urlValue: "",
+    busy: false, error: "", matches: [], chosen: null, covers: [], heroes: [],
   };
   renderCoverPicker();
-  cvBuscar("");   // primeira busca é pelo próprio título do jogo
+  if (ready[first]) cvBuscar("");   // só busca se a fonte tem chave
 }
 
 function closeCoverPicker() {
@@ -1302,6 +1381,45 @@ function renderCoverPicker() {
   const capas = (V.covers || []).map((c) => cell(c, "portrait")).join("");
   const fundos = (V.heroes || []).map((c) => cell(c, "landscape")).join("");
 
+  // corpo por fonte: URL tem um campo próprio; as demais, busca + grades.
+  let corpo;
+  if (V.source === "url") {
+    corpo = `<p class="cv-url-hint">Cole o link direto de uma imagem (Google Imagens, etc.) e aplique no papel escolhido acima.</p>
+      <div class="search-box">
+        <span style="color:var(--text-low)">🔗</span>
+        <input id="cv-url" placeholder="https://…/imagem.jpg" aria-label="URL da imagem"
+               autocomplete="off" spellcheck="false" value="${esc(V.urlValue || "")}" />
+        <button class="cv-go" id="cv-url-go">Aplicar</button>
+      </div>
+      ${V.busy ? `<div class="status-msg">⏳ Baixando…</div>` : ""}
+      ${V.error ? `<div class="gf-error">${esc(V.error)}</div>` : ""}`;
+  } else if (!V.ready[V.source]) {
+    corpo = `<div class="cv-nokey">
+      <p>Configure a chave do <b>${esc(CV_SRC_LABEL[V.source] || V.source)}</b> nas
+         Configurações para buscar por aqui — ou use outra aba acima.</p>
+      <button class="btn-primary" id="cv-settings">Abrir Configurações</button>
+    </div>`;
+  } else {
+    corpo = `<div class="search-box">
+        <span style="color:var(--text-low)">🔎</span>
+        <input id="cv-q" placeholder="Nome do jogo" aria-label="Buscar arte pelo nome do jogo"
+               autocomplete="off" spellcheck="false" value="${esc(V.query || "")}" />
+        <button class="cv-go" id="cv-go">Buscar</button>
+      </div>
+      ${V.chosen ? `<p class="cv-match">Casado com <b>${esc(V.chosen.name)}</b>${
+        outros.length ? " — ou troque de jogo:" : ""}</p>` : ""}
+      ${outros.length ? `<div class="cv-alts">${outros.slice(0, 8).map((m) =>
+        `<button class="cv-alt" data-gid="${esc(m.id)}">${esc(m.name)}</button>`).join("")}</div>` : ""}
+      ${V.busy ? `<div class="status-msg">⏳ Buscando artes…</div>` : ""}
+      ${V.error ? `<div class="gf-error">${esc(V.error)}</div>` : ""}
+      ${!V.busy && !V.error && !V.chosen
+        ? `<p class="cv-empty">Nenhum jogo encontrado. Ajuste o nome e busque de novo.</p>` : ""}
+      ${!V.busy && V.chosen && !V.covers.length && !V.heroes.length
+        ? `<p class="cv-empty">Nenhuma arte encontrada nesta fonte para este jogo.</p>` : ""}
+      ${capas ? `<p class="cv-grid-label">CAPAS</p><div class="cv-grid">${capas}</div>` : ""}
+      ${fundos ? `<p class="cv-grid-label">FUNDOS (wallpaper)</p><div class="cv-grid wide">${fundos}</div>` : ""}`;
+  }
+
   el.innerHTML = `<div class="gf-panel cv-panel" role="dialog" aria-modal="true" aria-label="Trocar arte do jogo">
     <div class="gf-head">
       <div>
@@ -1312,39 +1430,21 @@ function renderCoverPicker() {
     </div>
 
     <div class="gf-body">
-      ${V.noKey ? `
-        <div class="cv-nokey">
-          <p>O seletor usa o <b>SteamGridDB</b>. Configure sua chave (gratuita)
-             nas Configurações para buscar artes pelo nome do jogo.</p>
-          <button class="btn-primary" id="cv-settings">Abrir Configurações</button>
-        </div>` : `
-        <div class="search-box">
-          <span style="color:var(--text-low)">🔎</span>
-          <input id="cv-q" placeholder="Nome do jogo" aria-label="Buscar arte pelo nome do jogo"
-                 autocomplete="off" spellcheck="false" value="${esc(V.query || "")}" />
-          <button class="cv-go" id="cv-go">Buscar</button>
-        </div>
-        <div class="cv-roles">
-          <span class="cv-roles-label">Aplicar como:</span>
-          ${CV_ROLES.map((r) => `<button class="cv-role ${V.role === r.id ? "on" : ""}"
-            data-role="${r.id}">${r.label}</button>`).join("")}
-        </div>
-        ${V.chosen ? `<p class="cv-match">Casado com <b>${esc(V.chosen.name)}</b>${
-          outros.length ? " — ou troque de jogo:" : ""}</p>` : ""}
-        ${outros.length ? `<div class="cv-alts">${outros.slice(0, 8).map((m) =>
-          `<button class="cv-alt" data-gid="${m.id}">${esc(m.name)}</button>`).join("")}</div>` : ""}
-        ${V.busy ? `<div class="status-msg">⏳ Buscando artes…</div>` : ""}
-        ${V.error ? `<div class="gf-error">${esc(V.error)}</div>` : ""}
-        ${!V.busy && !V.error && !V.chosen
-          ? `<p class="cv-empty">Nenhum jogo encontrado. Ajuste o nome e busque de novo.</p>` : ""}
-        ${!V.busy && V.chosen && !V.covers.length && !V.heroes.length
-          ? `<p class="cv-empty">Nenhuma arte encontrada para este jogo.</p>` : ""}
-        ${capas ? `<p class="cv-grid-label">CAPAS</p><div class="cv-grid">${capas}</div>` : ""}
-        ${fundos ? `<p class="cv-grid-label">FUNDOS (wallpaper)</p><div class="cv-grid wide">${fundos}</div>` : ""}`}
+      <div class="cv-sources">
+        ${CV_SOURCES.map((s) => `<button class="cv-src ${V.source === s.id ? "on" : ""}${
+          s.id !== "url" && !V.ready[s.id] ? " off" : ""}" data-src="${s.id}"
+          title="${s.id !== "url" && !V.ready[s.id] ? "sem chave configurada" : ""}">${s.label}</button>`).join("")}
+      </div>
+      <div class="cv-roles">
+        <span class="cv-roles-label">Aplicar como:</span>
+        ${CV_ROLES.map((r) => `<button class="cv-role ${V.role === r.id ? "on" : ""}"
+          data-role="${r.id}">${r.label}</button>`).join("")}
+      </div>
+      ${corpo}
     </div>
 
     <div class="gf-foot">
-      ${V.noKey ? "<span></span>" : `<button class="btn-ghost" id="cv-clear">↺ Remover ${esc(cvRoleLabel().toLowerCase())}</button>`}
+      <button class="btn-ghost" id="cv-clear">↺ Remover ${esc(cvRoleLabel().toLowerCase())}</button>
       <span></span>
     </div>
   </div>`;
@@ -1352,14 +1452,23 @@ function renderCoverPicker() {
   $("#cv-x").onclick = closeCoverPicker;
   $("#cv-settings")?.addEventListener("click", () => { closeCoverPicker(); enterSettings(); });
   $("#cv-clear")?.addEventListener("click", cvLimpar);
+  el.querySelectorAll(".cv-src").forEach((b) =>
+    b.onclick = () => cvTrocarFonte(b.dataset.src));
+  el.querySelectorAll(".cv-role").forEach((b) =>
+    b.onclick = () => { V.role = b.dataset.role; renderCoverPicker(); });
   const go = $("#cv-go");
   if (go) go.onclick = () => cvBuscar(($("#cv-q")?.value || "").trim());
   const q = $("#cv-q");
   if (q) q.onkeydown = (e) => { if (e.key === "Enter") cvBuscar((q.value || "").trim()); };
-  el.querySelectorAll(".cv-role").forEach((b) =>
-    b.onclick = () => { V.role = b.dataset.role; renderCoverPicker(); });
+  const urlGo = $("#cv-url-go");
+  if (urlGo) urlGo.onclick = () => cvAplicar(($("#cv-url")?.value || "").trim());
+  const urlIn = $("#cv-url");
+  if (urlIn) {
+    urlIn.oninput = () => { V.urlValue = urlIn.value; };
+    urlIn.onkeydown = (e) => { if (e.key === "Enter") cvAplicar((urlIn.value || "").trim()); };
+  }
   el.querySelectorAll(".cv-alt").forEach((b) =>
-    b.onclick = () => cvTrocarJogo(Number(b.dataset.gid)));
+    b.onclick = () => cvTrocarJogo(b.dataset.gid));
   el.querySelectorAll(".cv-cell").forEach((b) =>
     b.onclick = () => cvAplicar(b.dataset.url));
 }
@@ -1368,16 +1477,24 @@ function cvRoleLabel() {
   return (CV_ROLES.find((r) => r.id === S.CV?.role) || CV_ROLES[0]).label;
 }
 
+function cvTrocarFonte(source) {
+  const V = S.CV;
+  if (!V || V.source === source) return;
+  V.source = source; V.error = "";
+  V.matches = []; V.chosen = null; V.covers = []; V.heroes = [];
+  renderCoverPicker();
+  if (source !== "url" && V.ready[source]) cvBuscar("");
+}
+
 async function cvBuscar(query) {
   const V = S.CV;
   if (!V) return;
   V.busy = true; V.error = ""; if (query) V.query = query;
   renderCoverPicker();
   try {
-    const res = await backend.coversSearch(V.slug, query || "");
+    const res = await backend.coversSearch(V.slug, query || "", V.source);
     V.busy = false;
     if (!res.ok) {
-      if (/SteamGridDB|Configure/i.test(res.error || "")) V.noKey = true;
       V.error = res.error || "Não consegui buscar artes.";
     } else {
       V.matches = res.matches || [];
@@ -1395,10 +1512,10 @@ async function cvTrocarJogo(gameId) {
   const V = S.CV;
   if (!V) return;
   V.busy = true; V.error = "";
-  V.chosen = (V.matches || []).find((m) => m.id === gameId) || V.chosen;
+  V.chosen = (V.matches || []).find((m) => String(m.id) === String(gameId)) || V.chosen;
   renderCoverPicker();
   try {
-    const res = await backend.coversFor(gameId);
+    const res = await backend.coversFor(gameId, V.source);
     V.busy = false;
     if (!res.ok) V.error = res.error || "Não consegui buscar as artes.";
     else { V.covers = res.covers || []; V.heroes = res.heroes || []; }
@@ -1411,9 +1528,16 @@ async function cvTrocarJogo(gameId) {
 async function cvAplicar(url) {
   const V = S.CV;
   if (!V) return;
+  url = (url || "").trim();
+  if (!url) return toast("Cole uma URL de imagem.", true);
   const role = V.role;
+  V.busy = true; V.error = ""; renderCoverPicker();
   const res = await backend.setGameCover(V.slug, url, role).catch((e) => ({ ok: false, error: "" + e }));
-  if (!res || !res.ok) return toast(res && res.error ? res.error : "Não consegui aplicar a arte.", true);
+  if (!res || !res.ok) {
+    V.busy = false; V.error = (res && res.error) || "Não consegui aplicar a arte.";
+    renderCoverPicker();
+    return;
+  }
   closeCoverPicker();
   toast(role === "both" ? "Capa e fundo atualizados." : role === "background" ? "Fundo atualizado." : "Capa atualizada.");
   await renderDashboard({ force: true });

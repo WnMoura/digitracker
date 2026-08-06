@@ -36,6 +36,9 @@ import emulator_tracker
 import gamefaqs
 import guide_ai
 import guide_parser
+import igdb
+import image_fetch
+import rawg
 import steamgriddb
 from ra_api import RAClient, RAError, RARateLimited, fmt_date
 
@@ -81,8 +84,10 @@ SYNC_SPACING = 0.4       # pausa entre jogos, para não disparar tudo de uma vez
 # De quanto em quanto tempo procuramos jogos novos na conta (uma chamada só).
 AUTO_IMPORT_INTERVAL = 300
 
-# De quanto em quanto tempo procuramos uma janela de emulador aberta.
-OVERLAY_INTERVAL = 2.5
+# De quanto em quanto tempo procuramos/seguimos a janela do emulador. A detecção
+# é uma chamada só de xwininfo, barata — um intervalo curto deixa o overlay
+# acompanhar o emulador de forma natural quando ele é movido/redimensionado.
+OVERLAY_INTERVAL = 1.2
 
 DEFAULT_SETTINGS = {
     "auto_import": True,   # espelhar a conta: jogo novo entra sozinho
@@ -194,23 +199,24 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
-def _move_after_resize(win, pos, settle: float = 0.2, tries: int = 3) -> None:
-    """Move a janela DEPOIS que o novo tamanho valeu.
+def _move_after_resize(win, pos, settle: float = 0.1, tries: int = 4) -> None:
+    """Move a janela para `pos`, reconferindo até assentar.
 
     O resize do GTK é assíncrono: se pedirmos a posição enquanto a janela ainda
     tem o tamanho antigo, o gerenciador limita o x para a janela não sair da
     tela (com 1920px de largura, um pedido de x=921 numa janela de 1040px vira
-    x=880). Esperamos assentar e reconferimos.
+    x=880). Movemos JÁ e só esperamos+repetimos se a posição não bateu — assim,
+    no caso comum (o move pega de primeira), não há atraso perceptível.
     """
     x, y = pos
     for _ in range(tries):
-        time.sleep(settle)
         win.move(x, y)
         try:
-            if (win.x, win.y) == (x, y):
+            if (round(win.x), round(win.y)) == (round(x), round(y)):
                 return
         except Exception:
-            return
+            return                      # sem leitura confiável: um move já basta
+        time.sleep(settle)
 
 
 def extract_pdf_text(source) -> str:
@@ -238,6 +244,7 @@ class Api:
         self.last_faq: dict | None = None     # último guia baixado (p/ refino IA)
         self._overlay = None                  # OverlayWatcher (grudar no emulador)
         self._overlay_size = None             # último tamanho aplicado ao overlay grudado
+        self._igdb_token = None               # cache do token OAuth do IGDB (Twitch)
         self._tracker = None
         self._own_hwnd = None
         self.overlay_notice = ""              # aviso pendente para a interface
@@ -869,6 +876,56 @@ class Api:
         out["guide"] = out.pop("sections")
         return out
 
+    # ---- IA nas dicas de um jogo JÁ SALVO (sem tocar em conquistas/ordem) --- #
+    def _ai_config(self) -> dict:
+        with self._lock:
+            provider = self.settings.get("ai_provider") or guide_ai.DEFAULT_PROVIDER
+            config = {
+                "provider": provider,
+                "model": self.settings.get("ai_model", ""),
+                "base_url": self.settings.get("ai_base_url", ""),
+            }
+        config["api_key"] = self._ai_key(provider)
+        return config
+
+    def _process_game_tips(self, slug: str, op) -> dict:
+        """Aplica uma operação de IA (`op(sections, config) -> sections`) às dicas
+        de um jogo salvo, substitui `game['guide']` e atualiza o estado. Comum ao
+        refinar e ao traduzir. Não mexe em conquistas nem no walkthrough."""
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        sections = game.get("guide") or []
+        if not sections:
+            return {"ok": False, "error": "Este jogo não tem dicas importadas."}
+        config = self._ai_config()
+        if not config["api_key"]:
+            label = guide_ai.PROVIDERS[config["provider"]]["label"]
+            return {"ok": False, "error": f"Configure sua chave do {label} para usar a IA."}
+        try:
+            novas = op(sections, config)
+        except guide_ai.GuideAIError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "error": f"Falha na IA: {exc}"}
+        game["guide"] = novas
+        (GAMES_DIR / f"{slug}.json").write_text(
+            json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        with self._lock:
+            detail = self.state.get(slug)
+            if detail is not None:
+                detail["guide"] = novas
+        return {"ok": True, "sections": len(novas)}
+
+    def refine_game_tips(self, slug: str) -> dict:
+        """Cura as dicas de um jogo salvo com a IA (não toca em conquistas)."""
+        return self._process_game_tips(slug, guide_ai.refine_tips)
+
+    def translate_game_tips(self, slug: str) -> dict:
+        """Traduz as dicas de um jogo salvo para português com a IA."""
+        return self._process_game_tips(slug, guide_ai.translate)
+
     def _read_guide_sections(self, b64: str):
         """(ok, erro, seções) — extrai do PDF só as seções de dicas/tutoriais
         (remove a seção que lista as conquistas)."""
@@ -915,108 +972,200 @@ class Api:
             self._sync_game(game)
         return {"ok": True, "sections": len(guide), "filename": filename}
 
-    # --------------------- seletor de capas (SteamGridDB) ------------------- #
-    # A capa escolhida fica em `art.cover` — separada da capa da RA (`art.box`),
-    # para poder ser trocada e revertida sem perder a original. A chave do
-    # SteamGridDB é guardada em secrets.json, no mesmo esquema das chaves de IA.
+    # --------------------- seletor de artes (multi-fonte) ------------------- #
+    # A arte escolhida vira art.cover (retrato: overlay/lateral) e/ou
+    # art.background (paisagem: fundo da lista) — separadas da arte da RA e
+    # reversíveis. Cada fonte guarda a própria chave em secrets.json.
+    _ROLE_FILE = {"cover": "cover.png", "background": "background.png"}
+    _ROLE_ART = {"cover": "cover", "background": "background"}
+    # Campos de secrets por fonte (todos precisam estar preenchidos p/ "pronta").
+    _SOURCE_KEYS = {
+        "steamgriddb": ("steamgriddb_api_key",),
+        "rawg": ("rawg_api_key",),
+        "igdb": ("igdb_client_id", "igdb_client_secret"),
+    }
+    _SOURCE_LABEL = {"steamgriddb": "SteamGridDB", "rawg": "RAWG", "igdb": "IGDB"}
+
     def _covers_key(self) -> str:
         return ((load_secrets() or {}).get("steamgriddb_api_key") or "").strip()
 
-    def get_covers_config(self) -> dict:
-        """Estado do seletor para a UI. NUNCA devolve a chave, só se ela existe."""
-        return {"ok": True, "has_key": bool(self._covers_key())}
+    def _source_ready(self, source: str) -> bool:
+        secrets = load_secrets() or {}
+        fields = self._SOURCE_KEYS.get(source, ())
+        return bool(fields) and all((secrets.get(f) or "").strip() for f in fields)
 
-    def set_covers_key(self, api_key: str = None) -> dict:
-        """Grava a chave do SteamGridDB (string vazia apaga)."""
-        if api_key is not None:
-            secrets = load_secrets() or {}
-            key = (api_key or "").strip()
-            if key:
-                secrets["steamgriddb_api_key"] = key
+    def get_sources_config(self) -> dict:
+        """Quais fontes de imagem têm chave configurada (nunca devolve a chave)."""
+        return {"ok": True, "ready": {s: self._source_ready(s) for s in self._SOURCE_KEYS}}
+
+    def set_source_key(self, source: str, key1: str = None, key2: str = None) -> dict:
+        """Grava as credenciais de uma fonte. Fontes de 1 campo usam `key1`; o
+        IGDB usa key1=client_id, key2=client_secret. String vazia apaga o campo."""
+        fields = self._SOURCE_KEYS.get(source)
+        if not fields:
+            return {"ok": False, "error": f"Fonte desconhecida: {source}"}
+        secrets = load_secrets() or {}
+        for field, value in zip(fields, (key1, key2)):
+            if value is None:
+                continue
+            value = (value or "").strip()
+            if value:
+                secrets[field] = value
             else:
-                secrets.pop("steamgriddb_api_key", None)
-            SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SECRETS_PATH.write_text(json.dumps(secrets, indent=2), encoding="utf-8")
-        return self.get_covers_config()
+                secrets.pop(field, None)
+        SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SECRETS_PATH.write_text(json.dumps(secrets, indent=2), encoding="utf-8")
+        return self.get_sources_config()
 
-    # Cada imagem escolhida pode virar CAPA (art.cover: overlay/lateral, retrato)
-    # ou FUNDO (art.background: atrás da lista de conquistas, paisagem) — ou os
-    # dois. Ambos ficam separados da arte da RA e são reversíveis.
-    _ROLE_FILE = {"cover": "cover.png", "background": "background.png"}
-    _ROLE_ART = {"cover": "cover", "background": "background"}
+    @staticmethod
+    def _need_key(label: str) -> dict:
+        return {"ok": False, "error": f"Configure a chave do {label} nas Configurações."}
 
-    def covers_search(self, slug: str, query: str = "") -> dict:
-        """Busca imagens para um jogo. Sem `query`, procura pelo título do jogo;
-        com `query`, pela busca digitada (para corrigir um casamento errado).
-        Devolve o jogo casado, suas CAPAS (retrato) e FUNDOS/heroes (paisagem), e
-        os demais jogos encontrados (para trocar de jogo, como no Playnite)."""
-        key = self._covers_key()
-        if not key:
-            return {"ok": False, "error": "Configure sua chave do SteamGridDB nas Configurações."}
+    def covers_search(self, slug: str, query: str = "", source: str = "steamgriddb") -> dict:
+        """Busca imagens para um jogo na fonte escolhida. Sem `query`, procura
+        pelo título do jogo. Devolve o jogo casado, CAPAS (retrato) e FUNDOS
+        (paisagem), e os demais jogos encontrados (para trocar, como no Playnite)."""
         game = load_game_file(GAMES_DIR / f"{slug}.json")
         term = (query or "").strip() or (game or {}).get("title", "")
         if not term:
             return {"ok": False, "error": "Jogo não encontrado."}
-        try:
-            session = steamgriddb.create_session(key)
-            matches = steamgriddb.search_games(session, term)
-            if not matches:
-                return {"ok": True, "matches": [], "chosen": None, "covers": [], "heroes": []}
-            chosen = matches[0]
-            covers = steamgriddb.game_covers(session, chosen["id"])
-            heroes = self._safe_heroes(session, chosen["id"])
-        except steamgriddb.SteamGridDBError as exc:
-            return {"ok": False, "error": str(exc)}
-        return {"ok": True, "matches": matches, "chosen": chosen,
-                "covers": covers, "heroes": heroes}
+        return self._search_source(source, term)
 
-    def covers_for(self, game_id: int) -> dict:
-        """Capas e fundos de um jogo específico do SteamGridDB (quando o usuário
-        troca o jogo casado na grade)."""
-        key = self._covers_key()
-        if not key:
-            return {"ok": False, "error": "Configure sua chave do SteamGridDB nas Configurações."}
+    def covers_for(self, game_id, source: str = "steamgriddb") -> dict:
+        """Imagens de um jogo específico da fonte (ao trocar o jogo casado)."""
         try:
-            session = steamgriddb.create_session(key)
             gid = int(game_id)
-            covers = steamgriddb.game_covers(session, gid)
-            heroes = self._safe_heroes(session, gid)
-        except (steamgriddb.SteamGridDBError, ValueError) as exc:
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Jogo inválido."}
+        return self._images_for_source(source, gid)
+
+    _EMPTY_HIT = {"ok": True, "matches": [], "chosen": None, "covers": [], "heroes": []}
+
+    def _search_source(self, source: str, term: str) -> dict:
+        secrets = load_secrets() or {}
+        try:
+            if source == "steamgriddb":
+                key = (secrets.get("steamgriddb_api_key") or "").strip()
+                if not key:
+                    return self._need_key("SteamGridDB")
+                sess = steamgriddb.create_session(key)
+                matches = steamgriddb.search_games(sess, term)
+                if not matches:
+                    return dict(self._EMPTY_HIT)
+                chosen = matches[0]
+                return {"ok": True, "matches": matches, "chosen": chosen,
+                        "covers": steamgriddb.game_covers(sess, chosen["id"]),
+                        "heroes": self._sgdb_heroes(sess, chosen["id"])}
+            if source == "rawg":
+                key = (secrets.get("rawg_api_key") or "").strip()
+                if not key:
+                    return self._need_key("RAWG")
+                sess, k = rawg.create_session(key)
+                matches = rawg.search_games(sess, k, term)
+                if not matches:
+                    return dict(self._EMPTY_HIT)
+                chosen = matches[0]
+                heroes = (rawg.hero_from_background(chosen.get("background", ""))
+                          + rawg.game_screenshots(sess, k, chosen["id"]))
+                slim = [{"id": m["id"], "name": m["name"]} for m in matches]
+                return {"ok": True, "matches": slim,
+                        "chosen": {"id": chosen["id"], "name": chosen["name"]},
+                        "covers": [], "heroes": heroes}
+            if source == "igdb":
+                cid = (secrets.get("igdb_client_id") or "").strip()
+                secret = (secrets.get("igdb_client_secret") or "").strip()
+                if not (cid and secret):
+                    return self._need_key("IGDB")
+                sess = igdb.create_session()
+                token = self._igdb_token_get(sess, cid, secret)
+                matches = igdb.search_games(sess, cid, token, term)
+                if not matches:
+                    return dict(self._EMPTY_HIT)
+                chosen = matches[0]
+                slim = [{"id": m["id"], "name": m["name"]} for m in matches]
+                return {"ok": True, "matches": slim,
+                        "chosen": {"id": chosen["id"], "name": chosen["name"]},
+                        "covers": igdb.covers_of(chosen), "heroes": igdb.heroes_of(chosen)}
+        except (steamgriddb.SteamGridDBError, rawg.RawgError, igdb.IgdbError) as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "covers": covers, "heroes": heroes}
+        return {"ok": False, "error": f"Fonte desconhecida: {source}"}
+
+    def _igdb_token_get(self, session, client_id: str, client_secret: str) -> str:
+        """Token OAuth do IGDB (Twitch), cacheado até perto de expirar."""
+        cache = self._igdb_token
+        now = time.time()
+        if cache and cache.get("exp", 0) > now + 60:
+            return cache["token"]
+        tok = igdb.get_token(session, client_id, client_secret)
+        self._igdb_token = {"token": tok["token"],
+                            "exp": now + max(60, (tok["expires_in"] or 0) - 60)}
+        return tok["token"]
+
+    def _images_for_source(self, source: str, game_id: int) -> dict:
+        secrets = load_secrets() or {}
+        try:
+            if source == "steamgriddb":
+                key = (secrets.get("steamgriddb_api_key") or "").strip()
+                if not key:
+                    return self._need_key("SteamGridDB")
+                sess = steamgriddb.create_session(key)
+                return {"ok": True, "covers": steamgriddb.game_covers(sess, game_id),
+                        "heroes": self._sgdb_heroes(sess, game_id)}
+            if source == "rawg":
+                key = (secrets.get("rawg_api_key") or "").strip()
+                if not key:
+                    return self._need_key("RAWG")
+                sess, k = rawg.create_session(key)
+                return {"ok": True, "covers": [],
+                        "heroes": rawg.game_screenshots(sess, k, game_id)}
+            if source == "igdb":
+                cid = (secrets.get("igdb_client_id") or "").strip()
+                secret = (secrets.get("igdb_client_secret") or "").strip()
+                if not (cid and secret):
+                    return self._need_key("IGDB")
+                sess = igdb.create_session()
+                token = self._igdb_token_get(sess, cid, secret)
+                game = igdb.game_by_id(sess, cid, token, game_id)
+                if not game:
+                    return {"ok": True, "covers": [], "heroes": []}
+                return {"ok": True, "covers": igdb.covers_of(game),
+                        "heroes": igdb.heroes_of(game)}
+        except (steamgriddb.SteamGridDBError, rawg.RawgError, igdb.IgdbError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": f"Fonte desconhecida: {source}"}
 
     @staticmethod
-    def _safe_heroes(session, game_id: int) -> list:
-        """Heroes são um extra: se o jogo não tiver nenhum (404), a busca de
-        capas não deve falhar por isso."""
+    def _sgdb_heroes(session, game_id: int) -> list:
+        """Heroes são um extra: se o jogo não tiver nenhum (404), a busca não
+        deve falhar por isso."""
         try:
             return steamgriddb.game_heroes(session, game_id)
         except steamgriddb.SteamGridDBError:
             return []
 
     def set_game_cover(self, slug: str, url: str, role: str = "cover") -> dict:
-        """Baixa a imagem escolhida e a grava no papel pedido — `cover`,
-        `background` ou `both` — sem tocar em conquistas/progresso. A URL ganha um
-        sufixo de versão para o webview não reusar a imagem antiga do cache."""
+        """Baixa a imagem escolhida (de qualquer fonte, ou de uma URL colada) e a
+        grava no papel pedido — `cover`, `background` ou `both` — sem tocar em
+        conquistas/progresso. NÃO exige chave: o asset vem de um CDN público e é
+        baixado por `image_fetch` (sessão limpa, com User-Agent, sem token — era
+        o token indo pro CDN que fazia o download falhar). A URL ganha um sufixo
+        de versão para o webview não reusar a imagem antiga do cache."""
         game = load_game_file(GAMES_DIR / f"{slug}.json")
         if not game:
             return {"ok": False, "error": "Jogo não encontrado."}
-        key = self._covers_key()
-        if not key:
-            return {"ok": False, "error": "Configure sua chave do SteamGridDB nas Configurações."}
+        url = (url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return {"ok": False, "error": "URL de imagem inválida."}
         roles = ["cover", "background"] if role == "both" else [role]
         if any(r not in self._ROLE_FILE for r in roles):
             return {"ok": False, "error": f"Papel inválido: {role}"}
-        try:
-            session = steamgriddb.create_session(key)
-        except steamgriddb.SteamGridDBError as exc:
-            return {"ok": False, "error": str(exc)}
         art = dict(game.get("art") or {})
         stamp = int(time.time())
         for r in roles:
             dest = ART_DIR / slug / self._ROLE_FILE[r]
-            if not steamgriddb.download_cover(session, url, dest):
-                return {"ok": False, "error": "Não consegui baixar a imagem escolhida."}
+            if not image_fetch.download_image(url, dest):
+                return {"ok": False,
+                        "error": "Não consegui baixar a imagem (o servidor recusou ou não é uma imagem)."}
             art[self._ROLE_ART[r]] = f"/assets/art/{slug}/{self._ROLE_FILE[r]}?v={stamp}"
         self._persist_art(slug, game, art)
         return {"ok": True, "art": art}

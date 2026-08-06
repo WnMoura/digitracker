@@ -154,6 +154,49 @@ def com_respostas(monkeypatch, *respostas):
     return chamadas
 
 
+# ---- IA sobre as dicas já parseadas (refinar / traduzir) ------------------- #
+SECOES = [{"num": "1", "title": "Bosses", "blocks": [{"type": "boss", "text": "Use fire."}]}]
+SECOES_IA = json_mod.dumps({"sections": [
+    {"title": "Chefes", "blocks": [{"type": "boss", "text": "Use fogo."}]}]})
+
+
+class TestDicasIA:
+    def test_apply_sections_vira_formato_do_app(self):
+        data = {"sections": [{"title": "T", "blocks": [{"type": "note", "text": "x"}]}]}
+        out = guide_ai._apply_sections(data, SECOES)
+        assert out[0]["num"] == "1" and out[0]["title"] == "T"
+        assert out[0]["blocks"][0] == {"type": "note", "text": "x"}
+        assert out[0]["is_achievements"] is False
+
+    def test_apply_sections_invalido_cai_para_original(self):
+        assert guide_ai._apply_sections({"sections": []}, SECOES) == SECOES
+        assert guide_ai._apply_sections({"nada": 1}, SECOES) == SECOES
+
+    def test_apply_sections_tipo_desconhecido_vira_p(self):
+        data = {"sections": [{"title": "T", "blocks": [{"type": "xyz", "text": "y"}]}]}
+        assert guide_ai._apply_sections(data, SECOES)[0]["blocks"][0]["type"] == "p"
+
+    def test_refine_tips_pelo_gemini(self, monkeypatch):
+        com_respostas(monkeypatch, gemini_ok(SECOES_IA))
+        out = guide_ai.refine_tips(SECOES, {"provider": "gemini", "api_key": "k"})
+        assert out[0]["title"] == "Chefes"
+        assert out[0]["blocks"][0]["text"] == "Use fogo."
+
+    def test_translate_pelo_gemini(self, monkeypatch):
+        chamadas = com_respostas(monkeypatch, gemini_ok(SECOES_IA))
+        out = guide_ai.translate(SECOES, {"provider": "gemini", "api_key": "k"})
+        assert out[0]["blocks"][0]["text"] == "Use fogo."
+        assert "portug" in chamadas[0]["body"]["systemInstruction"]["parts"][0]["text"].lower()
+
+    def test_sem_chave_avisa(self):
+        with pytest.raises(guide_ai.GuideAIError, match="chave"):
+            guide_ai.refine_tips(SECOES, {"provider": "anthropic", "api_key": ""})
+
+    def test_sem_secoes_avisa(self):
+        with pytest.raises(guide_ai.GuideAIError, match="dicas"):
+            guide_ai.translate([], {"provider": "anthropic", "api_key": "k"})
+
+
 class TestGemini:
     def test_refina_pelo_gemini(self, monkeypatch):
         com_respostas(monkeypatch, gemini_ok(RESPOSTA_IA))

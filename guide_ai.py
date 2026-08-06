@@ -189,7 +189,7 @@ def _extract_json(text: str) -> dict:
 # ---------------------------------------------------------------------------- #
 # Provedor: Anthropic (SDK oficial)
 # ---------------------------------------------------------------------------- #
-def _call_anthropic(faq_text: str, meta: dict, cfg: dict) -> dict:
+def _call_anthropic(cfg: dict, system: str, user: str, schema: dict) -> dict:
     try:
         import anthropic
     except ImportError as exc:      # pragma: no cover - depende do ambiente
@@ -204,10 +204,10 @@ def _call_anthropic(faq_text: str, meta: dict, cfg: dict) -> dict:
         with client.messages.stream(
             model=cfg["model"],
             max_tokens=MAX_TOKENS,
-            system=SYSTEM,
+            system=system,
             thinking={"type": "adaptive"},
-            output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}},
-            messages=[{"role": "user", "content": _prompt(faq_text, meta)}],
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+            messages=[{"role": "user", "content": user}],
         ) as stream:
             message = stream.get_final_message()
     except anthropic.AuthenticationError as exc:
@@ -247,17 +247,17 @@ def _gemini_schema(schema: dict) -> dict:
     return out
 
 
-def _call_gemini(faq_text: str, meta: dict, cfg: dict) -> dict:
+def _call_gemini(cfg: dict, system: str, user: str, schema: dict) -> dict:
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{cfg['model']}:generateContent"
     )
     body = {
-        "systemInstruction": {"parts": [{"text": SYSTEM}]},
-        "contents": [{"role": "user", "parts": [{"text": _prompt(faq_text, meta)}]}],
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "responseSchema": _gemini_schema(RESPONSE_SCHEMA),
+            "responseSchema": _gemini_schema(schema),
             "maxOutputTokens": MAX_TOKENS,
         },
     }
@@ -283,18 +283,18 @@ def _call_gemini(faq_text: str, meta: dict, cfg: dict) -> dict:
 # ---------------------------------------------------------------------------- #
 # Provedor: OpenAI e compatíveis (REST)
 # ---------------------------------------------------------------------------- #
-def _call_openai(faq_text: str, meta: dict, cfg: dict) -> dict:
+def _call_openai(cfg: dict, system: str, user: str, schema: dict) -> dict:
     base = cfg["base_url"] or PROVIDERS["openai"]["default_base_url"]
     body = {
         "model": cfg["model"],
         "max_tokens": MAX_TOKENS,
         "messages": [
-            {"role": "system", "content": SYSTEM + JSON_INSTRUCTION},
-            {"role": "user", "content": _prompt(faq_text, meta)},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "guide", "strict": True, "schema": RESPONSE_SCHEMA},
+            "json_schema": {"name": "guide", "strict": True, "schema": schema},
         },
     }
     headers = {"authorization": f"Bearer {cfg['api_key']}", "content-type": "application/json"}
@@ -365,11 +365,134 @@ def refine(faq_text: str, achievements_meta: dict, config: dict) -> dict:
         "model": resolve_model(provider, config.get("model", "")),
         "base_url": resolve_base_url(provider, config.get("base_url", "")),
     }
-    data = _CALLERS[provider](faq_text, achievements_meta, cfg)
+    data = _CALLERS[provider](cfg, SYSTEM + JSON_INSTRUCTION,
+                              _prompt(faq_text, achievements_meta), RESPONSE_SCHEMA)
     out = _apply(data, achievements_meta, faq_text)
     out["provider"] = provider
     out["model"] = cfg["model"]
     return out
+
+
+# ---------------------------------------------------------------------------- #
+# Operações sobre as DICAS já parseadas (sem tocar em conquistas/ordem):
+# curar e traduzir. Entram e saem seções no formato do app.
+# ---------------------------------------------------------------------------- #
+SECTIONS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "blocks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string",
+                                         "enum": ["p", "li", "note", "boss", "step", "subhead"]},
+                                "text": {"type": "string"},
+                            },
+                            "required": ["type", "text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["title", "blocks"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["sections"],
+    "additionalProperties": False,
+}
+
+_SECTIONS_JSON_HINT = (
+    "\n\nResponda SOMENTE com JSON válido, sem cercas de código, no formato: "
+    '{"sections": [{"title": "...", "blocks": [{"type": "p|li|note|boss|step|subhead", '
+    '"text": "..."}]}]}. Mantenha o MESMO número de seções e blocos, na mesma ordem, '
+    "preservando o `type` de cada bloco."
+)
+
+_TIPS_SYSTEM = (
+    "Você cura as dicas/tutoriais de um guia de videogame para um app de conquistas. "
+    "Recebe seções já extraídas e as devolve mais limpas e legíveis: remova ruído "
+    "(índice, changelog, direitos autorais, e-mails, arte ASCII), junte fragmentos "
+    "quebrados em frases inteiras e corrija a formatação. NÃO invente conteúdo novo "
+    "nem traduza — mantenha o idioma original. Preserve estratégias de chefe, "
+    "localizações e requisitos." + _SECTIONS_JSON_HINT
+)
+
+
+def _translate_system(target: str) -> str:
+    return (
+        f"Você traduz as dicas de um guia de videogame para {target}, para um app de "
+        "conquistas. Traduza o texto de cada bloco e cada título de forma natural, "
+        "mantendo a estrutura. NÃO traduza nomes próprios de personagens, lugares, "
+        "itens ou jogos, nem nomes de conquistas — deixe-os no original. Não invente "
+        "conteúdo." + _SECTIONS_JSON_HINT
+    )
+
+
+def _sections_payload(sections: list) -> str:
+    """Só o que a IA precisa ver: título + (type, text) de cada bloco."""
+    slim = [{
+        "title": s.get("title", ""),
+        "blocks": [{"type": b.get("type", "p"), "text": b.get("text", "")}
+                   for b in s.get("blocks", [])],
+    } for s in sections]
+    return "SEÇÕES DE DICAS:\n" + json.dumps(slim, ensure_ascii=False)
+
+
+def _apply_sections(data: dict, fallback: list) -> list:
+    """Valida a resposta e devolve seções no formato do app. Se a IA devolver
+    algo inválido/vazio, cai para as seções originais."""
+    secs = data.get("sections") if isinstance(data, dict) else None
+    if not isinstance(secs, list) or not secs:
+        return fallback
+    out = []
+    for i, s in enumerate(secs):
+        if not isinstance(s, dict):
+            continue
+        blocks = []
+        for b in s.get("blocks", []):
+            if isinstance(b, dict) and b.get("text"):
+                t = b.get("type") if b.get("type") in ("p", "li", "note", "boss", "step", "subhead") else "p"
+                blocks.append({"type": t, "text": str(b["text"])})
+        if s.get("title") or blocks:
+            out.append({"num": str(i + 1), "title": str(s.get("title", "")),
+                        "blocks": blocks, "is_achievements": False})
+    return out or fallback
+
+
+def _run_sections(sections: list, config: dict, system: str) -> list:
+    """Chama o provedor com um `system` próprio e devolve seções aplicadas."""
+    provider = (config.get("provider") or DEFAULT_PROVIDER).strip()
+    info = provider_info(provider)
+    api_key = (config.get("api_key") or "").strip()
+    if not api_key:
+        raise GuideAIError(f"Nenhuma chave configurada para {info['label']}.")
+    if not sections:
+        raise GuideAIError("Não há dicas para processar.")
+    cfg = {
+        "api_key": api_key,
+        "model": resolve_model(provider, config.get("model", "")),
+        "base_url": resolve_base_url(provider, config.get("base_url", "")),
+    }
+    data = _CALLERS[provider](cfg, system, _sections_payload(sections), SECTIONS_SCHEMA)
+    return _apply_sections(data, sections)
+
+
+def refine_tips(sections: list, config: dict) -> list:
+    """Cura as seções de dicas (sem tocar em conquistas/ordem)."""
+    return _run_sections(sections, config, _TIPS_SYSTEM)
+
+
+def translate(sections: list, config: dict, target: str = "português (Brasil)") -> list:
+    """Traduz as seções de dicas para `target`."""
+    return _run_sections(sections, config, _translate_system(target))
 
 
 def _apply(data: dict, achievements_meta: dict, faq_text: str) -> dict:

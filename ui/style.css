@@ -697,6 +697,21 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
 
 .cv-panel { width: min(680px, 100%); }
 .cv-go { font-size: 11px; font-weight: 600; color: var(--jogo); padding: 0 4px; flex-shrink: 0; }
+/* Abas de fonte de imagem (SteamGridDB / RAWG / IGDB / URL) */
+.cv-sources { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: var(--s3); }
+.cv-src {
+  font-size: 11px; font-weight: 600; color: var(--text-2); padding: 5px 11px;
+  border-radius: var(--pill); background: var(--raised); border: 1px solid var(--line);
+  transition: color .15s, border-color .15s, background .15s;
+}
+.cv-src:hover { color: var(--text); }
+.cv-src.on { color: rgb(var(--ink-deep)); background: var(--jogo); border-color: var(--jogo); }
+.cv-src.off { color: var(--text-3); opacity: .6; }        /* sem chave configurada */
+.cv-url-hint { font-size: 11.5px; color: var(--text-2); margin-bottom: var(--s3); line-height: 1.5; }
+/* Cada fonte na tela de Configurações */
+.src-cfg { padding: var(--s3) 0; border-top: 1px solid var(--line); }
+.src-cfg:first-of-type { border-top: none; }
+.src-btns { display: flex; gap: 8px; margin-top: 8px; }
 /* Papel da imagem escolhida: capa (overlay), fundo (lista) ou ambos. */
 .cv-roles { display: flex; align-items: center; gap: 6px; margin: var(--s3) 0 2px; }
 .cv-roles-label { font-size: 10.5px; color: var(--text-3); margin-right: 2px; }

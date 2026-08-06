@@ -15,7 +15,6 @@ dados) para poderem ser testadas sem rede.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 API_BASE = "https://www.steamgriddb.com/api/v2"
 
@@ -145,19 +144,3 @@ def game_heroes(session, game_id: int) -> list[dict]:
     conquistas. Mesmo formato das capas; sem NSFW e só estáticos."""
     params = {"types": "static", "nsfw": "false"}
     return parse_grids(_get_json(session, f"{API_BASE}/heroes/game/{game_id}", params))
-
-
-def download_cover(session, url: str, dest_path) -> bool:
-    """Baixa a imagem da capa escolhida para o disco (cache local)."""
-    if not url:
-        return False
-    dest_path = Path(dest_path)
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        resp = session.get(url, timeout=TIMEOUT)
-    except Exception:
-        return False
-    if resp.status_code == 200 and resp.content:
-        dest_path.write_bytes(resp.content)
-        return True
-    return False
