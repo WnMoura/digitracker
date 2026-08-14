@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import unicodedata
+import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
@@ -40,7 +41,9 @@ import igdb
 import image_fetch
 import rawg
 import steamgriddb
+import updater
 from ra_api import RAClient, RAError, RARateLimited, fmt_date
+from version import APP_VERSION
 
 
 def _bundle_dir() -> Path:
@@ -95,6 +98,8 @@ DEFAULT_SETTINGS = {
     "overlay_exit_fullscreen": False,  # mandar Alt+Enter ao ver fullscreen exclusivo
     "overlay_second_screen": False,    # levar o overlay para o monitor livre
     "overlay_fit_emulator": True,      # dimensionar o overlay conforme a janela do emulador
+    "auto_check_updates": True,        # procurar releases estáveis ao iniciar
+    "update_remind_until": 0,          # epoch: "Lembrar depois" adia o aviso
     "dismissed": [],       # slugs removidos à mão — não voltam sozinhos
     "emulators": [],       # sobrescreve a lista padrão de emuladores (opcional)
     "ai_provider": "",     # provedor do refino por IA (vazio = padrão)
@@ -163,6 +168,10 @@ def load_settings() -> dict:
         for chave in ("overlay_exit_fullscreen", "overlay_second_screen"):
             settings[chave] = bool(saved.get(chave, False))
         settings["overlay_fit_emulator"] = bool(saved.get("overlay_fit_emulator", True))
+        settings["auto_check_updates"] = bool(saved.get("auto_check_updates", True))
+        remind = saved.get("update_remind_until", 0)
+        if isinstance(remind, (int, float)) and not isinstance(remind, bool):
+            settings["update_remind_until"] = float(remind)
         for key in ("dismissed", "emulators"):
             value = saved.get(key)
             if isinstance(value, list):
@@ -248,10 +257,13 @@ class Api:
         self._tracker = None
         self._own_hwnd = None
         self.overlay_notice = ""              # aviso pendente para a interface
+        self._overlay_error = ""
+        self._overlay_last_check = 0.0
         self.index_building = False
         self._compact = False
         self._pre_compact_pos: tuple[int, int] | None = None
         self._lock = threading.Lock()
+        self._updates = updater.UpdateManager(APP_VERSION, sys.executable)
 
         for d in (GAMES_DIR, CACHE_DIR, BADGES_DIR, ICONS_DIR, ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
@@ -262,6 +274,7 @@ class Api:
 
     # ------------------------ status / configuração ------------------------- #
     def get_app_state(self) -> dict:
+        ai_provider, ai_label, ai_model = self._ai_summary()
         return {
             "configured": self._client is not None,
             "username": self._client.username if self._client else "",
@@ -272,10 +285,94 @@ class Api:
             "overlay_exit_fullscreen": self.settings["overlay_exit_fullscreen"],
             "overlay_second_screen": self.settings["overlay_second_screen"],
             "overlay_fit_emulator": self.settings["overlay_fit_emulator"],
+            "auto_check_updates": self.settings["auto_check_updates"],
+            "version": APP_VERSION,
             "compact": self._compact,
             "ai_ready": bool(self._ai_key()),   # só o fato, nunca a chave
+            "ai_provider": ai_provider,
+            "ai_provider_label": ai_label,
+            "ai_model": ai_model,
             "covers_ready": bool(self._covers_key()),  # idem: só se há chave
         }
+
+    def _ai_summary(self) -> tuple[str, str, str]:
+        provider = self.settings.get("ai_provider") or guide_ai.DEFAULT_PROVIDER
+        info = guide_ai.PROVIDERS.get(provider) or guide_ai.PROVIDERS[guide_ai.DEFAULT_PROVIDER]
+        model = self.settings.get("ai_model") or info["default_model"]
+        return provider, info["label"], model
+
+    # --------------------------- atualizações ------------------------------ #
+    def set_auto_check_updates(self, value: bool) -> dict:
+        value = bool(value)
+        with self._lock:
+            self.settings["auto_check_updates"] = value
+            save_settings(self.settings)
+        return {"ok": True, "auto_check_updates": value}
+
+    def check_for_updates(self, force: bool = False) -> dict:
+        """Consulta a release estável. A checagem automática respeita o toggle e
+        o adiamento; a ação manual (`force=True`) ignora ambos."""
+        force = bool(force)
+        with self._lock:
+            enabled = self.settings.get("auto_check_updates", True)
+            remind_until = float(self.settings.get("update_remind_until") or 0)
+        if not force and not getattr(sys, "frozen", False):
+            return {"ok": True, "phase": "source", "current_version": APP_VERSION,
+                    "update_available": False, "source_mode": True}
+        if not force and (not enabled or time.time() < remind_until):
+            return {
+                "ok": True,
+                "phase": "deferred" if enabled else "disabled",
+                "current_version": APP_VERSION,
+                "update_available": False,
+                "source_mode": not getattr(sys, "frozen", False),
+            }
+        return self._updates.check()
+
+    def defer_update(self, hours: int = 24) -> dict:
+        try:
+            hours = max(1, min(24 * 30, int(hours)))
+        except (TypeError, ValueError):
+            hours = 24
+        until = time.time() + hours * 3600
+        with self._lock:
+            self.settings["update_remind_until"] = until
+            save_settings(self.settings)
+        return {"ok": True, "remind_until": until}
+
+    def start_update_download(self) -> dict:
+        return self._updates.start_download()
+
+    def get_update_status(self) -> dict:
+        return self._updates.status()
+
+    def install_downloaded_update(self) -> dict:
+        result = self._updates.prepare_install(os.getpid())
+        if result.get("ok") and self._window:
+            def close_after_reply():
+                time.sleep(0.35)
+                try:
+                    self._window.destroy()
+                except Exception:
+                    pass
+            threading.Thread(target=close_after_reply, daemon=True).start()
+        return result
+
+    def open_update_release(self) -> dict:
+        status = self._updates.status()
+        url = status.get("release_url") or "https://github.com/WnMoura/digitracker/releases/latest"
+        if not str(url).startswith("https://github.com/WnMoura/digitracker/"):
+            return {"ok": False, "error": "Endereço de release inválido."}
+        try:
+            webbrowser.open(str(url))
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def confirm_update_boot(self) -> dict:
+        """A UI e a ponte JS carregaram; agora é seguro remover o `.bak`."""
+        updater.cleanup_backup(sys.executable)
+        return {"ok": True}
 
     def save_secrets(self, username: str, api_key: str) -> dict:
         username = (username or "").strip()
@@ -1318,14 +1415,21 @@ class Api:
                 return
             size = self._overlay_size_for(rect)
             # O emulador foi redimensionado? Reajusta o overlay antes de reposicionar.
-            if size != getattr(self, "_overlay_size", None):
+            resize = size != getattr(self, "_overlay_size", None)
+            if resize:
                 self._overlay_size = size
-                self._window_op(lambda: win.resize(*size))
                 self._notify_ui_compact(True)   # o JS reajusta quantas próximas cabem
             pos = self._dock_for(rect, size)
-            self._window_op(lambda: win.move(*pos))
+
+            def resize_and_move():
+                if resize:
+                    win.resize(*size)
+                _move_after_resize(win, pos)
+
+            self._window_op(resize_and_move)
 
         def leave():
+            self._overlay_size = None
             self.set_compact(False, from_user=False)
             self._notify_ui_compact(False)
 
@@ -1440,6 +1544,46 @@ class Api:
         except Exception:
             pass
 
+    def get_overlay_status(self) -> dict:
+        tracker = self._tracker
+        raw = tracker.status() if tracker and hasattr(tracker, "status") else {
+            "detected": False,
+            "error": "O rastreador ainda não iniciou.",
+        }
+        rect = raw.get("rect")
+        result = {
+            "ok": not bool(self._overlay_error),
+            "enabled": bool(self.settings.get("auto_overlay", True)),
+            "detected": bool(raw.get("detected")),
+            "title": str(raw.get("title") or ""),
+            "process": str(raw.get("process") or ""),
+            "class": str(raw.get("class") or ""),
+            "rect": list(rect) if rect else [],
+            "last_check": raw.get("last_check") or self._overlay_last_check,
+            "error": self._overlay_error or str(raw.get("error") or ""),
+        }
+        if rect:
+            size = self._overlay_size_for(rect)
+            result["overlay_size"] = list(size)
+            result["dock"] = list(self._dock_for(rect, size))
+        else:
+            result["overlay_size"] = []
+            result["dock"] = []
+        return result
+
+    def test_overlay_detection(self) -> dict:
+        try:
+            if self._tracker is None:
+                patterns = self.settings.get("emulators") or None
+                self._tracker = emulator_tracker.create_tracker(patterns)
+            self._tracker.find_emulator_window()
+            self._overlay_error = ""
+            self._overlay_last_check = time.time()
+        except Exception as exc:
+            self._overlay_error = f"{type(exc).__name__}: {exc}"
+            self._overlay_last_check = time.time()
+        return self.get_overlay_status()
+
     def overlay_loop(self):
         """Verifica a cada OVERLAY_INTERVAL se há emulador aberto."""
         patterns = self.settings.get("emulators") or None
@@ -1461,8 +1605,13 @@ class Api:
                 exclusivo = enabled and self._tracker.is_exclusive_fullscreen()
                 self._overlay.step(enabled=enabled, user_compact=self._compact,
                                    exclusive=exclusivo)
-            except Exception:
-                pass          # nunca deixa o laço morrer por causa de uma janela
+                self._overlay_error = ""
+                self._overlay_last_check = time.time()
+            except Exception as exc:
+                # O laço continua vivo, mas a falha deixa de ser invisível: aparece
+                # no diagnóstico das Configurações e pode ser reproduzida na hora.
+                self._overlay_error = f"{type(exc).__name__}: {exc}"
+                self._overlay_last_check = time.time()
 
     # ----------------------------- helpers ---------------------------------- #
     def _download_art(self, slug: str, progress: dict) -> dict:
@@ -1732,6 +1881,7 @@ def start_static_server() -> int:
 # Bootstrap
 # ---------------------------------------------------------------------------- #
 def main():
+    emulator_tracker.enable_dpi_awareness()
     api = Api()
     port = start_static_server()
     url = f"http://127.0.0.1:{port}/ui/index.html"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -408,6 +409,31 @@ class TestConfigDeIA:
         api.pending_import = {"achievements_meta": {"1": {"title": "X"}}}
         assert api.refine_guide_ai()["ok"] is False
 
+    def test_melhorar_dicas_nao_altera_walkthrough(self, api, monkeypatch):
+        api.set_ai_config("anthropic", "k")
+        original = {"title": "Jogo", "walkthrough": [{"step": 1, "achievements": [{"id": 7}]}],
+                    "guide": [{"title": "Antes", "blocks": []}]}
+        (engine.GAMES_DIR / "jogo.json").write_text(json.dumps(original), encoding="utf-8")
+        monkeypatch.setattr(engine.guide_ai, "refine_tips",
+                            lambda sections, config: [{"title": "Depois", "blocks": []}])
+        assert api.refine_game_tips("jogo")["ok"] is True
+        saved = json.loads((engine.GAMES_DIR / "jogo.json").read_text(encoding="utf-8"))
+        assert saved["walkthrough"] == original["walkthrough"]
+        assert saved["guide"][0]["title"] == "Depois"
+
+    def test_falha_da_ia_preserva_dicas_originais(self, api, monkeypatch):
+        api.set_ai_config("anthropic", "k")
+        original = {"title": "Jogo", "guide": [{"title": "Original", "blocks": []}]}
+        path = engine.GAMES_DIR / "jogo.json"
+        path.write_text(json.dumps(original), encoding="utf-8")
+
+        def falha(*_args):
+            raise engine.guide_ai.GuideAIError("sem rede")
+
+        monkeypatch.setattr(engine.guide_ai, "refine_tips", falha)
+        assert api.refine_game_tips("jogo")["ok"] is False
+        assert json.loads(path.read_text(encoding="utf-8")) == original
+
 
 class TestArtesDoJogo:
     """Capa, tela de título e screenshot: a API devolve as três, e elas dão
@@ -500,6 +526,46 @@ class TestOpcoesDeOverlay:
         api._warn_ui("emulador em tela cheia exclusiva")
         assert "exclusiva" in api.get_bulk_status()["overlay_notice"]
         assert api.get_bulk_status()["overlay_notice"] == ""
+
+    def test_diagnostico_calcula_tamanho_e_dock(self, api):
+        class Tracker:
+            @staticmethod
+            def status():
+                return {"detected": True, "title": "Jogo", "process": "pcsx2-qt.exe",
+                        "rect": (100, 50, 1280, 720), "last_check": 1, "error": ""}
+
+        api._tracker = Tracker()
+        status = api.get_overlay_status()
+        assert status["detected"] is True
+        assert status["process"] == "pcsx2-qt.exe"
+        assert len(status["overlay_size"]) == 2 and len(status["dock"]) == 2
+
+
+class TestAtualizacoes:
+    @pytest.fixture
+    def api(self, tmp_path, monkeypatch):
+        for nome, sub in [("GAMES_DIR", "games"), ("CACHE_DIR", "cache"),
+                          ("BADGES_DIR", "badges"), ("ICONS_DIR", "icons"),
+                          ("ART_DIR", "art")]:
+            monkeypatch.setattr(engine, nome, tmp_path / sub)
+        monkeypatch.setattr(engine, "SECRETS_PATH", tmp_path / "secrets.json")
+        monkeypatch.setattr(engine, "SETTINGS_PATH", tmp_path / "settings.json")
+        return engine.Api()
+
+    def test_versao_aparece_no_estado(self, api):
+        assert api.get_app_state()["version"] == "0.6.0"
+
+    def test_verificacao_automatica_ligada_por_padrao(self, api):
+        assert api.get_app_state()["auto_check_updates"] is True
+
+    def test_toggle_de_update_persiste(self, api):
+        api.set_auto_check_updates(False)
+        assert engine.load_settings()["auto_check_updates"] is False
+
+    def test_lembrar_depois_persiste_timestamp(self, api):
+        result = api.defer_update(24)
+        assert result["remind_until"] > time.time()
+        assert engine.load_settings()["update_remind_until"] == result["remind_until"]
 
 
 class TestCleanWalkthrough:

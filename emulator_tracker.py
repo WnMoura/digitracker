@@ -21,9 +21,12 @@ separada dos backends para ser testável com um localizador falso.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 # ---------------------------------------------------------------------------- #
 # Que janelas são emuladores
@@ -36,9 +39,22 @@ DEFAULT_EMULATORS = [
     "fceux", "mesen", "yuzu", "ryujinx",
 ]
 
+# Executáveis conhecidos resolvem o caso de janelas de renderização cujo título
+# não contém o nome do emulador (comum no PCSX2 Qt).
+DEFAULT_EXECUTABLES = {
+    "dolphin.exe", "retroarch.exe", "pcsx2.exe", "pcsx2-qt.exe",
+    "duckstation.exe", "duckstation-qt.exe", "epsxe.exe", "ppsspp.exe",
+    "mgba.exe", "melonds.exe", "cemu.exe", "rpcs3.exe", "project64.exe",
+    "desmume.exe", "flycast.exe", "snes9x.exe",
+}
+
 # Falsos positivos conhecidos: "dolphin" também é o gerenciador de arquivos do
 # KDE, e a própria janela do app não pode se detectar.
 _EXCLUDES = ["org.kde.dolphin", "dolphin file manager", "digitracker"]
+_AUXILIARY_TITLES = (
+    "settings", "properties", "configuration", "controller settings",
+    "configurações", "preferências", "about pcsx2",
+)
 
 # SHQueryUserNotificationState: 3 = app Direct3D em fullscreen EXCLUSIVO, o
 # único caso em que nenhum overlay aparece por cima.
@@ -49,15 +65,70 @@ QUNS_RUNNING_D3D_FULL_SCREEN = 3
 _MIN_EMU_W, _MIN_EMU_H = 320, 200
 
 
-def is_emulator(title: str, wm_class: str, patterns=None) -> bool:
+def is_emulator(title: str, wm_class: str, patterns=None, process: str = "") -> bool:
     """A janela (título + classe) parece um emulador?"""
-    haystack = f"{title or ''} {wm_class or ''}".lower()
+    process_name = Path(process or "").name.lower()
+    haystack = f"{title or ''} {wm_class or ''} {process_name}".lower()
     if any(x in haystack for x in _EXCLUDES):
         return False
+    if not patterns and process_name in DEFAULT_EXECUTABLES:
+        return True
     for p in (patterns or DEFAULT_EMULATORS):
         if p and p.lower() in haystack:
             return True
     return False
+
+
+def choose_window(candidates, foreground=None, previous=None):
+    """Escolhe uma janela sem oscilar entre launcher, popup e renderização.
+
+    A janela em primeiro plano ganha prioridade (uma renderização recém-aberta
+    do PCSX2 deve substituir o launcher); fora disso, mantemos a escolha anterior
+    enquanto válida e só então usamos a maior área cliente.
+    """
+    candidates = list(candidates or [])
+    if not candidates:
+        return None
+    if foreground:
+        for candidate in candidates:
+            if candidate.get("hwnd") == foreground:
+                return candidate
+    if previous:
+        for candidate in candidates:
+            if candidate.get("hwnd") == previous:
+                return candidate
+    return max(candidates, key=lambda c: c["rect"][2] * c["rect"][3])
+
+
+def is_auxiliary_window(title: str, window_class: str = "") -> bool:
+    text = (title or "").strip().lower()
+    return (window_class or "").strip() == "#32770" or any(
+        marker in text for marker in _AUXILIARY_TITLES
+    )
+
+
+def enable_dpi_awareness() -> bool:
+    """Põe processo e WinForms no mesmo espaço de coordenadas físicas.
+
+    Tenta Per-Monitor v2 e recua para APIs disponíveis em versões antigas do
+    Windows. Deve ser chamado antes de criar a janela pywebview.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        fn = getattr(user32, "SetProcessDpiAwarenessContext", None)
+        if fn:
+            fn.argtypes = [ctypes.c_void_p]
+            if fn(ctypes.c_void_p(-4)):  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+                return True
+        shcore = getattr(ctypes.windll, "shcore", None)
+        if shcore and shcore.SetProcessDpiAwareness(2) in (0, 0x80070005):
+            return True
+        return bool(user32.SetProcessDPIAware())
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------- #
@@ -124,6 +195,7 @@ class OverlayWatcher:
         self.active = False        # o overlay atual foi iniciado por nós
         self.muted = False         # usuário dispensou até o emulador fechar
         self._last_rect = None
+        self._last_identity = None
         self._fs_tratado = False   # já reagimos a ESTA sessão de fullscreen
 
     def notify_manual_exit(self):
@@ -133,6 +205,7 @@ class OverlayWatcher:
             self.active = False
             self.muted = True
             self._last_rect = None
+            self._last_identity = None
 
     def step(self, enabled: bool = True, user_compact: bool = False,
              exclusive: bool = False):
@@ -150,6 +223,7 @@ class OverlayWatcher:
                 self.active = False
             self.muted = False          # emulador fechou: o próximo pode grudar
             self._last_rect = None
+            self._last_identity = None
             self._fs_tratado = False
             return
 
@@ -164,9 +238,11 @@ class OverlayWatcher:
 
         if self.active:
             rect = tuple(win["rect"])
-            if rect != self._last_rect:
+            identity = win.get("hwnd") or (win.get("process"), win.get("title"))
+            if rect != self._last_rect or identity != self._last_identity:
                 self.actions["follow"](rect)
                 self._last_rect = rect
+                self._last_identity = identity
             top = self.actions.get("assert_top")
             if top:
                 top()
@@ -180,13 +256,14 @@ class OverlayWatcher:
         self.actions["enter"](rect)
         self.active = True
         self._last_rect = rect
+        self._last_identity = win.get("hwnd") or (win.get("process"), win.get("title"))
 
 
 # ---------------------------------------------------------------------------- #
 # Backend Windows (ctypes/user32) — plataforma-alvo
 # ---------------------------------------------------------------------------- #
 class WindowsTracker:
-    """Enumera janelas visíveis via user32 e devolve o primeiro emulador."""
+    """Enumera janelas visíveis e escolhe a área de jogo mais provável."""
 
     def __init__(self, patterns=None):
         self.patterns = patterns
@@ -196,33 +273,108 @@ class WindowsTracker:
         self._ctypes = ctypes
         self._wintypes = wintypes
         self.user32 = ctypes.windll.user32
+        self.kernel32 = ctypes.windll.kernel32
+        self._selected_hwnd = None
+        self.last_status = {"detected": False, "error": "Ainda não verificado."}
+
+        self.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self.kernel32.OpenProcess.restype = wintypes.HANDLE
+        self.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        query = getattr(self.kernel32, "QueryFullProcessImageNameW", None)
+        if query:
+            query.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                              ctypes.POINTER(wintypes.DWORD)]
+            query.restype = wintypes.BOOL
+
+    def _process_name(self, hwnd) -> tuple[int, str]:
+        ctypes, wintypes = self._ctypes, self._wintypes
+        pid = wintypes.DWORD(0)
+        self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return 0, ""
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = self.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not handle:
+            return pid.value, ""
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buf))
+            query = getattr(self.kernel32, "QueryFullProcessImageNameW", None)
+            if query and query(handle, 0, buf, ctypes.byref(size)):
+                return pid.value, Path(buf.value).name.lower()
+            return pid.value, ""
+        finally:
+            self.kernel32.CloseHandle(handle)
+
+    def _client_rect(self, hwnd):
+        """Área interna em coordenadas da tela, sem borda/barra de título."""
+        ctypes, wintypes = self._ctypes, self._wintypes
+        rect = wintypes.RECT()
+        origin = wintypes.POINT(0, 0)
+        if (self.user32.GetClientRect(hwnd, ctypes.byref(rect))
+                and self.user32.ClientToScreen(hwnd, ctypes.byref(origin))):
+            width, height = rect.right - rect.left, rect.bottom - rect.top
+            if width > 0 and height > 0:
+                return origin.x, origin.y, width, height
+        outer = wintypes.RECT()
+        if self.user32.GetWindowRect(hwnd, ctypes.byref(outer)):
+            return outer.left, outer.top, outer.right - outer.left, outer.bottom - outer.top
+        return None
 
     def find_emulator_window(self):
         ctypes, wintypes = self._ctypes, self._wintypes
         user32 = self.user32
         found: list[dict] = []
+        checked = 0
+        own_pid = os.getpid()
+        foreground = user32.GetForegroundWindow()
 
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         def enum_cb(hwnd, _lparam):
             if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
                 return True
+            # Tool windows são normalmente popups, barras flutuantes e helpers.
+            GWL_EXSTYLE, WS_EX_TOOLWINDOW = -20, 0x00000080
+            if user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
+                return True
             title = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(hwnd, title, 256)
             cls = ctypes.create_unicode_buffer(256)
             user32.GetClassNameW(hwnd, cls, 256)
-            if is_emulator(title.value, cls.value, self.patterns):
-                r = wintypes.RECT()
-                if user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            if is_auxiliary_window(title.value, cls.value):
+                return True
+            pid, process = self._process_name(hwnd)
+            if pid == own_pid:
+                return True
+            nonlocal checked
+            checked += 1
+            if is_emulator(title.value, cls.value, self.patterns, process):
+                rect = self._client_rect(hwnd)
+                if rect and rect[2] >= _MIN_EMU_W and rect[3] >= _MIN_EMU_H:
                     found.append({
                         "title": title.value,
-                        "rect": (r.left, r.top, r.right - r.left, r.bottom - r.top),
+                        "class": cls.value,
+                        "process": process,
+                        "pid": pid,
+                        "rect": rect,
                         "hwnd": hwnd,
                     })
-                    return False        # o primeiro já basta
             return True
 
         user32.EnumWindows(enum_cb, 0)
-        return found[0] if found else None
+        selected = choose_window(found, foreground=foreground, previous=self._selected_hwnd)
+        if selected:
+            self._selected_hwnd = selected["hwnd"]
+            self.last_status = {**selected, "detected": True, "error": "",
+                                "checked_windows": checked, "last_check": time.time()}
+        else:
+            self._selected_hwnd = None
+            self.last_status = {"detected": False, "error": "Nenhuma janela de emulador encontrada.",
+                                "checked_windows": checked, "last_check": time.time()}
+        return selected
+
+    def status(self) -> dict:
+        return dict(self.last_status)
 
     def make_topmost(self, hwnd):
         """Re-aplica always-on-top. O TopMost do pywebview se perde quando o
@@ -408,6 +560,7 @@ class LinuxTracker:
 
     def __init__(self, patterns=None):
         self.patterns = patterns
+        self.last_status = {"detected": False, "error": "Ainda não verificado."}
 
     @staticmethod
     def _run(cmd) -> str:
@@ -427,8 +580,17 @@ class LinuxTracker:
             if ww < _MIN_EMU_W or hh < _MIN_EMU_H:
                 continue
             if is_emulator(w["title"], w["cls"], self.patterns):
-                return {"title": w["title"], "rect": w["rect"], "hwnd": None}
+                found = {"title": w["title"], "class": w["cls"], "process": "",
+                         "rect": w["rect"], "hwnd": None}
+                self.last_status = {**found, "detected": True, "error": "",
+                                    "last_check": time.time()}
+                return found
+        self.last_status = {"detected": False, "error": "Nenhuma janela de emulador encontrada.",
+                            "last_check": time.time()}
         return None
+
+    def status(self) -> dict:
+        return dict(self.last_status)
 
     def make_topmost(self, _hwnd):
         pass                            # no GTK o on_top do pywebview se sustenta

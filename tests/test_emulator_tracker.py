@@ -62,6 +62,44 @@ class TestIsEmulator:
         assert not et.is_emulator("", "")
         assert not et.is_emulator(None, None)
 
+    def test_pcsx2_e_reconhecido_pelo_executavel_sem_titulo(self):
+        assert et.is_emulator("SLUS-12345", "QtWindow", process="pcsx2-qt.exe")
+
+    def test_executavel_comum_nao_vira_emulador(self):
+        assert not et.is_emulator("Jogo", "QtWindow", process="notepad.exe")
+
+
+class TestEscolhaDeJanela:
+    MAIN = {"hwnd": 10, "title": "PCSX2", "rect": (0, 0, 900, 600)}
+    RENDER = {"hwnd": 20, "title": "Digimon World 4", "process": "pcsx2-qt.exe",
+              "rect": (100, 100, 1280, 720)}
+
+    def test_prefere_renderizacao_em_primeiro_plano(self):
+        assert et.choose_window([self.MAIN, self.RENDER], foreground=20)["hwnd"] == 20
+
+    def test_mantem_a_anterior_quando_foco_esta_no_digitracker(self):
+        assert et.choose_window([self.MAIN, self.RENDER], foreground=99, previous=20)["hwnd"] == 20
+
+    def test_sem_foco_ou_anterior_escolhe_maior_area(self):
+        assert et.choose_window([self.MAIN, self.RENDER])["hwnd"] == 20
+
+    def test_janela_anterior_que_sumiu_nao_prende_a_escolha(self):
+        assert et.choose_window([self.RENDER], previous=10)["hwnd"] == 20
+
+    def test_lista_vazia(self):
+        assert et.choose_window([]) is None
+
+    @pytest.mark.parametrize("title,cls", [
+        ("PCSX2 Settings", "QtWindow"),
+        ("Configurações do controle", "QtWindow"),
+        ("Abrir arquivo", "#32770"),
+    ])
+    def test_identifica_janelas_auxiliares(self, title, cls):
+        assert et.is_auxiliary_window(title, cls)
+
+    def test_janela_do_jogo_nao_e_auxiliar(self):
+        assert not et.is_auxiliary_window("Digimon World 4", "QtWindow")
+
 
 # ---------------------------------------------------------------------------- #
 # Onde o overlay encosta
@@ -145,6 +183,14 @@ class TestOverlayWatcher:
         w.step()
         w.step()
         assert "follow" not in acts.kinds
+
+    def test_troca_de_janela_com_mesmo_retangulo_dispara_follow(self):
+        a = {"title": "PCSX2", "hwnd": 10, "rect": (0, 0, 1280, 720)}
+        b = {"title": "Jogo", "hwnd": 20, "rect": (0, 0, 1280, 720)}
+        w, acts = watcher(a, b)
+        w.step()
+        w.step()
+        assert ("follow", (0, 0, 1280, 720)) in acts.calls
 
     def test_reaplica_o_topmost_enquanto_ativo(self):
         """É isso que impede o overlay de sumir atrás do Dolphin."""
@@ -451,3 +497,8 @@ def test_create_tracker_escolhe_pela_plataforma():
     t = et.create_tracker()
     esperado = et.WindowsTracker if sys.platform == "win32" else et.LinuxTracker
     assert isinstance(t, esperado)
+
+
+def test_dpi_awareness_fora_do_windows_e_inofensiva(monkeypatch):
+    monkeypatch.setattr(et.sys, "platform", "linux")
+    assert et.enable_dpi_awareness() is False

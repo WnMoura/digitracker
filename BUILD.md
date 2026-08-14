@@ -12,7 +12,7 @@ execução (dados graváveis e persistentes — suas credenciais e jogos ficam l
 ## Windows → `DigiTracker.exe`
 
 Pré-requisitos:
-- Python 3.8+ (64 bits) — <https://www.python.org/downloads/windows/>
+- Python 3.12 (64 bits, versão usada pelo CI) — <https://www.python.org/downloads/windows/>
 - Runtime do **WebView2** (já vem no Windows 11 e na maioria dos Windows 10;
   se faltar: <https://developer.microsoft.com/microsoft-edge/webview2/>)
 
@@ -27,6 +27,11 @@ pyinstaller digitracker.spec --noconfirm
 
 O executável sai em `dist\DigiTracker.exe`. É só distribuir esse arquivo único;
 ao rodar, ele cria `config\` e `assets\` na mesma pasta.
+
+Para uma release atualizável, ajuste `APP_VERSION` em `version.py` e crie a tag
+correspondente (`vX.Y.Z`). O workflow executa os testes, gera o EXE e publica
+também `DigiTracker.exe.sha256`, exigido pela instalação automática. Não publique
+manualmente um EXE sem o checksum: o app oferecerá apenas abrir a release.
 
 ## macOS → `DigiTracker`
 

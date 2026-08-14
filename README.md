@@ -306,6 +306,22 @@ pyinstaller digitracker.spec --noconfirm   # saída em dist/
 Lembre: o PyInstaller não faz cross-compile — para gerar `DigiTracker.exe`,
 rode o build em uma máquina **Windows**.
 
+### Atualizações do aplicativo
+
+A partir da v0.6.0, o executável consulta a release estável mais recente ao
+iniciar. Quando houver uma versão nova, mostra as notas e permite baixar,
+validar o SHA-256, instalar e reiniciar sem tocar em `config/` ou `assets/`.
+Também há **Procurar atualizações** em Configurações.
+
+As releases continuam sendo controladas por tags `vX.Y.Z`: o workflow valida
+`APP_VERSION`, roda todos os testes, gera `DigiTracker.exe` e
+`DigiTracker.exe.sha256` e só então publica os dois arquivos. Uma instalação
+anterior à v0.6.0 precisa ser atualizada manualmente uma última vez.
+
+> O atualizador não embute token do GitHub. Portanto, o repositório e as
+> releases precisam estar públicos; em um repositório privado, a API anônima do
+> GitHub responde 404 e o aplicativo não consegue baixar os assets.
+
 ## Notas sobre a API da RetroAchievements
 
 - Base: `https://retroachievements.org/API/` — auth pela Web API Key no

@@ -131,7 +131,11 @@ const S = {
   I: null,               // estado da importação em lote
   autoImport: true,      // espelhar a conta (jogo novo entra sozinho)
   autoOverlay: true,     // grudar no emulador quando ele abrir
+  autoCheckUpdates: true,
+  version: "0.0.0",
   aiReady: false,        // há chave salva para o provedor de IA escolhido
+  aiProviderLabel: "",
+  aiModel: "",
   overlayExitFullscreen: false,  // mandar Alt+Enter ao detectar tela cheia exclusiva
   overlaySecondScreen: false,    // levar o overlay para o monitor livre
   overlayFitEmulator: true,      // dimensionar o overlay conforme a janela do emulador
@@ -212,6 +216,40 @@ const backend = {
   async setOverlayOption(chave, v) {
     if (S.mode === "demo") return { ok: true };
     return window.pywebview.api.set_overlay_option(chave, v);
+  },
+  async setAutoCheckUpdates(v) {
+    if (S.mode === "demo") return { ok: true, auto_check_updates: v };
+    return window.pywebview.api.set_auto_check_updates(v);
+  },
+  async checkForUpdates(force = false) {
+    if (S.mode === "demo") return { ok: true, update_available: false, source_mode: true };
+    return window.pywebview.api.check_for_updates(!!force);
+  },
+  async deferUpdate(hours = 24) {
+    if (S.mode === "demo") return { ok: true };
+    return window.pywebview.api.defer_update(hours);
+  },
+  async startUpdateDownload() {
+    return window.pywebview.api.start_update_download();
+  },
+  async updateStatus() {
+    if (S.mode === "demo") return { ok: true, phase: "current" };
+    return window.pywebview.api.get_update_status();
+  },
+  async installUpdate() {
+    return window.pywebview.api.install_downloaded_update();
+  },
+  async confirmUpdateBoot() {
+    if (S.mode === "demo") return { ok: true };
+    return window.pywebview.api.confirm_update_boot();
+  },
+  async overlayStatus() {
+    if (S.mode === "demo") return { ok: true, detected: false, error: "Modo demonstração" };
+    return window.pywebview.api.get_overlay_status();
+  },
+  async testOverlay() {
+    if (S.mode === "demo") return { ok: true, detected: false, error: "Modo demonstração" };
+    return window.pywebview.api.test_overlay_detection();
   },
   async gamefaqsList(url) {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
@@ -853,9 +891,12 @@ function guideHTML(game) {
   const importBtn = S.mode === "demo" ? "" : `
     <button class="pdf-order-btn gf" id="guide-gamefaqs">🌐 ${secs.length ? "Substituir pelo GameFAQs" : "Importar do GameFAQs"}</button>
     <button class="pdf-order-btn" id="guide-import">📄 ${secs.length ? "Substituir dicas (PDF)" : "Importar dicas do PDF"}</button>`;
-  // IA sobre as dicas já importadas (não mexe nas conquistas): só com guia + chave.
-  const aiBtns = (secs.length && S.aiReady && S.mode !== "demo") ? `
-    <button class="pdf-order-btn ai" id="guide-refine">✨ Refinar dicas</button>
+  // A ação fica visível mesmo sem chave: nesse caso ela leva diretamente à
+  // configuração, em vez de simplesmente "sumir" da interface.
+  const aiMeta = [S.aiProviderLabel, S.aiModel].filter(Boolean).join(" · ");
+  const aiBtns = (secs.length && S.mode !== "demo") ? `
+    <span class="guide-ai-meta">${esc(aiMeta || "Configure um provedor de IA")}</span>
+    <button class="pdf-order-btn ai" id="guide-refine">✨ Melhorar com IA</button>
     <button class="pdf-order-btn" id="guide-translate">🌐 Traduzir (PT-BR)</button>` : "";
   if (!secs.length) {
     return `<div class="list-wrap"><p class="list-title">DICAS & TUTORIAIS</p>
@@ -893,15 +934,19 @@ function guideHTML(game) {
 async function dicasIa(kind) {
   const slug = S.activeSlug;
   if (!slug) return;
+  if (!S.aiReady) {
+    toast("Configure uma chave de IA para continuar.");
+    return enterSettings("ai", { slug, tab: "tips" });
+  }
   const btn = kind === "refine" ? $("#guide-refine") : $("#guide-translate");
-  if (btn) { btn.disabled = true; btn.textContent = kind === "refine" ? "✨ Refinando…" : "🌐 Traduzindo…"; }
+  if (btn) { btn.disabled = true; btn.textContent = kind === "refine" ? "✨ Melhorando…" : "🌐 Traduzindo…"; }
   try {
     const res = kind === "refine"
       ? await backend.refineGameTips(slug)
       : await backend.translateGameTips(slug);
     if (!res || !res.ok) {
       toast(res && res.error ? res.error : "Falha na IA.", true);
-      if (btn) { btn.disabled = false; btn.textContent = kind === "refine" ? "✨ Refinar dicas" : "🌐 Traduzir (PT-BR)"; }
+      if (btn) { btn.disabled = false; btn.textContent = kind === "refine" ? "✨ Melhorar com IA" : "🌐 Traduzir (PT-BR)"; }
       return;
     }
     toast(kind === "refine"
@@ -910,7 +955,7 @@ async function dicasIa(kind) {
     await renderDashboard({ force: true });   // re-render já traz os botões limpos
   } catch (e) {
     toast("Erro: " + e, true);
-    if (btn) { btn.disabled = false; btn.textContent = kind === "refine" ? "✨ Refinar dicas" : "🌐 Traduzir (PT-BR)"; }
+    if (btn) { btn.disabled = false; btn.textContent = kind === "refine" ? "✨ Melhorar com IA" : "🌐 Traduzir (PT-BR)"; }
   }
 }
 
@@ -954,29 +999,53 @@ function bindSidebar() {
    Tela própria, aberta pelo ⚙ da barra de título. Antes o provedor de IA só
    era alcançável dentro do wizard de adicionar jogo — que a importação
    automática fez você nunca abrir. */
-async function enterSettings() {
+async function enterSettings(section = "", returnTo = null) {
   S.view = "settings";
   stopPolling();
-  const [estado, ia, sources, compact] = await Promise.all([
+  const [estado, ia, sources, compact, overlay, update] = await Promise.all([
     backend.appState().catch(() => ({})),
     backend.getAiConfig().catch(() => ({ ok: false })),
     backend.getSourcesConfig().catch(() => ({ ok: false })),
     backend.getCompactConfig().catch(() => null),
+    backend.overlayStatus().catch((e) => ({ ok: false, error: String(e) })),
+    backend.updateStatus().catch((e) => ({ ok: false, error: String(e) })),
   ]);
   S.SET = {
     estado,
     ia: ia && ia.ok ? ia : null,
     sources: sources && sources.ok ? sources.ready : {},
     compact: compact && compact.ok ? compact : { width: 300, height: 232, last: 2, next: 0 },
+    overlay,
+    update,
+    section,
+    returnTo,
   };
   renderSettings();
 }
 
+async function leaveSettings() {
+  const back = S.SET && S.SET.returnTo;
+  if (back) {
+    S.activeSlug = back.slug || S.activeSlug;
+    S.tab = back.tab || "tips";
+  }
+  await enterDashboard();
+}
+
 function renderSettings() {
-  const { estado, ia, sources, compact } = S.SET;
+  const { estado, ia, sources, compact, overlay, update } = S.SET;
   const prov = ia && (ia.providers.find((p) => p.id === ia.provider) || ia.providers[0]);
   const ready = sources || {};
   const cc = compact || { width: 300, height: 232, last: 2, next: 0 };
+  const ov = overlay || {};
+  const ovRect = Array.isArray(ov.rect) ? ov.rect.join(", ") : "—";
+  const ovState = ov.detected
+    ? `${esc(ov.process || "processo desconhecido")} · ${esc(ov.title || "sem título")}`
+    : (ov.error ? esc(ov.error) : "Nenhum emulador detectado agora");
+  const up = update || {};
+  const upText = up.update_available
+    ? `Versão ${esc(up.latest_version)} disponível`
+    : (up.phase === "error" ? esc(up.error || "Falha ao consultar") : "Você está na versão atual");
 
   const chave = (id, txt, sub, ligado) => `
     <div class="set-row">
@@ -1004,6 +1073,18 @@ function renderSettings() {
         </section>
 
         <section class="set-section">
+          <h3>Atualizações</h3>
+          <div class="set-row">
+            <div><div class="set-txt">DigiTracker ${esc(estado.version || S.version)}</div>
+            <div class="set-sub">${upText}</div></div>
+            <button class="btn-ghost" id="set-update-check">Procurar agora</button>
+          </div>
+          ${chave("auto_check_updates", "Procurar atualizações ao iniciar",
+                  "Apenas releases estáveis; a instalação sempre pede confirmação",
+                  S.autoCheckUpdates)}
+        </section>
+
+        <section class="set-section" id="set-ai-section">
           <h3>Inteligência artificial</h3>
           <p class="set-hint">Opcional. Refina o guia importado do GameFAQs: reordena as
             conquistas pelo walkthrough e organiza as dicas. Cobrado pelo provedor que você
@@ -1077,7 +1158,7 @@ function renderSettings() {
                   S.autoImport)}
         </section>
 
-        <section class="set-section">
+        <section class="set-section" id="set-overlay-section">
           <h3>Overlay</h3>
           ${chave("auto_overlay", "Grudar no emulador",
                   "Vira overlay e acompanha a janela quando um emulador abre", S.autoOverlay)}
@@ -1090,6 +1171,16 @@ function renderSettings() {
           ${chave("overlay_fit_emulator", "Ajustar ao tamanho do emulador",
                   "Grudado, o overlay fica proporcional à janela do emulador (cresce em jogo grande, encolhe em janela pequena). Desligado, usa o tamanho manual da seção Modo compacto",
                   S.overlayFitEmulator)}
+          <div class="overlay-diag ${ov.detected ? "ok" : ""}">
+            <div class="set-txt">Diagnóstico de detecção</div>
+            <div class="set-sub">${ovState}</div>
+            <div class="overlay-diag-grid">
+              <span>Área interna</span><code>${esc(ovRect)}</code>
+              <span>Overlay</span><code>${esc((ov.overlay_size || []).join(" × ") || "—")}</code>
+              <span>Posição</span><code>${esc((ov.dock || []).join(", ") || "—")}</code>
+            </div>
+            <button class="btn-ghost" id="overlay-test">Testar detecção agora</button>
+          </div>
         </section>
 
         <section class="set-section">
@@ -1116,7 +1207,7 @@ function renderSettings() {
     </div>
   </div>`;
 
-  $("#set-back").onclick = enterDashboard;
+  $("#set-back").onclick = leaveSettings;
   $("#set-reconnect").onclick = () => { S.mode = "real"; renderSetup(); };
   root.querySelectorAll("[data-toggle]").forEach((b) => {
     b.onclick = () => alternarPreferencia(b.dataset.toggle, b);
@@ -1134,6 +1225,14 @@ function renderSettings() {
     b.onclick = () => salvarFonte(b.dataset.srcClear, true));
   const ccSave = $("#cc-save");
   if (ccSave) ccSave.onclick = salvarCompacto;
+  $("#set-update-check")?.addEventListener("click", () => procurarAtualizacao(true));
+  $("#overlay-test")?.addEventListener("click", testarOverlay);
+  requestAnimationFrame(() => {
+    const target = S.SET.section === "ai" ? $("#set-ai-section")
+      : S.SET.section === "overlay" ? $("#set-overlay-section") : null;
+    target?.scrollIntoView({ block: "start" });
+    if (S.SET.section === "ai") $("#set-key")?.focus();
+  });
 }
 
 /* Salva (ou remove) a credencial de uma fonte de imagem. IGDB tem dois campos
@@ -1177,6 +1276,10 @@ async function alternarPreferencia(chave, botao) {
   botao.setAttribute("aria-checked", String(novo));
   if (chave === "auto_import") { S.autoImport = novo; await backend.setAutoImport(novo); }
   else if (chave === "auto_overlay") { S.autoOverlay = novo; await backend.setAutoOverlay(novo); }
+  else if (chave === "auto_check_updates") {
+    S.autoCheckUpdates = novo;
+    await backend.setAutoCheckUpdates(novo);
+  }
   else {
     if (chave === "overlay_exit_fullscreen") S.overlayExitFullscreen = novo;
     else if (chave === "overlay_fit_emulator") S.overlayFitEmulator = novo;
@@ -1195,10 +1298,149 @@ async function salvarIa(forcarChave) {
   });
   if (!res || !res.ok) return toast("Não foi possível salvar.", true);
   S.aiReady = !!res.ai_ready;
+  const ativo = res.providers.find((p) => p.id === res.provider) || res.providers[0];
+  S.aiProviderLabel = ativo?.label || "";
+  S.aiModel = res.model || ativo?.default_model || "";
   S.SET.ia = res;
   renderSettings();
-  const nome = res.providers.find((p) => p.id === res.provider).label;
+  const nome = ativo.label;
   toast(S.aiReady ? `IA pronta via ${nome}.` : "Chave removida.");
+  if (S.aiReady && S.SET?.returnTo) await leaveSettings();
+}
+
+/* ============================ ATUALIZAÇÕES ============================== */
+let updatePoll = null;
+let updateModalPhase = "idle";
+
+const formatBytes = (value) => {
+  const n = Number(value) || 0;
+  if (!n) return "0 MB";
+  return `${(n / 1024 / 1024).toFixed(n >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
+};
+
+async function procurarAtualizacao(force = false) {
+  let res;
+  try {
+    res = await backend.checkForUpdates(force);
+  } catch (e) {
+    if (force) toast("Não foi possível consultar atualizações: " + e, true);
+    return;
+  }
+  if (S.view === "settings" && S.SET) {
+    S.SET.update = res;
+    renderSettings();
+  }
+  if (!res || !res.ok) {
+    if (force) toast(res?.error || "Não foi possível consultar atualizações.", true);
+    return;
+  }
+  if (res.update_available) return renderUpdateModal(res);
+  if (force) toast(res.source_mode
+    ? `Código-fonte na versão ${res.current_version}; instalação automática disponível apenas no .exe.`
+    : `DigiTracker ${res.current_version} já está atualizado.`);
+}
+
+function closeUpdateModal(force = false) {
+  if (!force && ["downloading", "installing"].includes(updateModalPhase)) return;
+  clearInterval(updatePoll);
+  updatePoll = null;
+  $("#update-modal")?.remove();
+}
+
+function updateNotes(text) {
+  const value = String(text || "Sem notas publicadas para esta versão.").slice(0, 5000);
+  return esc(value).replace(/\r?\n/g, "<br>");
+}
+
+function renderUpdateModal(info) {
+  let el = $("#update-modal");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "update-modal";
+    el.className = "gf-backdrop";
+    document.body.appendChild(el);
+  }
+  const phase = info.phase || "available";
+  updateModalPhase = phase;
+  const total = Number(info.bytes_total || info.download_size || 0);
+  const done = Number(info.bytes_downloaded || 0);
+  const pct = total ? Math.max(0, Math.min(100, Math.round(done * 100 / total))) : 0;
+  const busy = phase === "downloading" || phase === "installing";
+  const action = phase === "ready"
+    ? `<button class="btn-primary" id="update-install">Instalar e reiniciar</button>`
+    : info.installable
+      ? `<button class="btn-primary" id="update-download" ${busy ? "disabled" : ""}>Baixar e instalar</button>`
+      : `<button class="btn-primary" id="update-open">Abrir release no GitHub</button>`;
+
+  el.innerHTML = `<div class="gf-panel update-panel" role="dialog" aria-modal="true" aria-label="Atualização do DigiTracker">
+    <div class="gf-head">
+      <div><div class="gf-title">⬆ ATUALIZAÇÃO DISPONÍVEL</div>
+      <div class="gf-sub">${esc(info.current_version)} → ${esc(info.latest_version)}</div></div>
+      <button class="gf-close" id="update-x" ${busy ? "disabled" : ""}>✕</button>
+    </div>
+    <div class="gf-body">
+      <div class="update-notes">${updateNotes(info.notes)}</div>
+      ${phase === "downloading" ? `<div class="update-progress">
+        <div class="update-progress-bar"><span style="width:${pct}%"></span></div>
+        <div>${pct}% · ${formatBytes(done)} de ${formatBytes(total)}</div>
+      </div>` : ""}
+      ${phase === "ready" ? `<div class="status-msg">✓ Download verificado com SHA-256. Pronto para instalar.</div>` : ""}
+      ${phase === "installing" ? `<div class="status-msg">Fechando o aplicativo para instalar…</div>` : ""}
+      ${info.error ? `<div class="gf-error">${esc(info.error)}</div>` : ""}
+    </div>
+    <div class="gf-foot">
+      <button class="btn-ghost" id="update-later" ${busy ? "disabled" : ""}>Lembrar depois</button>
+      ${action}
+    </div>
+  </div>`;
+
+  $("#update-x")?.addEventListener("click", () => closeUpdateModal());
+  $("#update-later")?.addEventListener("click", async () => {
+    await backend.deferUpdate(24);
+    closeUpdateModal(true);
+  });
+  $("#update-download")?.addEventListener("click", iniciarDownloadAtualizacao);
+  $("#update-install")?.addEventListener("click", instalarAtualizacao);
+  $("#update-open")?.addEventListener("click", () => window.pywebview.api.open_update_release());
+}
+
+async function iniciarDownloadAtualizacao() {
+  const res = await backend.startUpdateDownload();
+  if (!res || !res.ok) {
+    const status = await backend.updateStatus().catch(() => ({}));
+    return renderUpdateModal({ ...status, error: res?.error || "Falha ao iniciar o download." });
+  }
+  renderUpdateModal(res);
+  clearInterval(updatePoll);
+  updatePoll = setInterval(async () => {
+    const status = await backend.updateStatus().catch((e) => ({ ok: false, phase: "error", error: String(e) }));
+    renderUpdateModal(status);
+    if (["ready", "error"].includes(status.phase)) {
+      clearInterval(updatePoll);
+      updatePoll = null;
+    }
+  }, 500);
+}
+
+async function instalarAtualizacao() {
+  const res = await backend.installUpdate();
+  if (!res || !res.ok) {
+    const status = await backend.updateStatus().catch(() => ({}));
+    return renderUpdateModal({ ...status, error: res?.error || "Falha ao iniciar a instalação." });
+  }
+  renderUpdateModal({ ...(await backend.updateStatus()), phase: "installing" });
+}
+
+async function testarOverlay() {
+  const btn = $("#overlay-test");
+  if (btn) { btn.disabled = true; btn.textContent = "Testando…"; }
+  const result = await backend.testOverlay().catch((e) => ({ ok: false, error: String(e) }));
+  if (S.SET) {
+    S.SET.overlay = result;
+    renderSettings();
+  }
+  toast(result.detected ? `Detectado: ${result.process || result.title}`
+    : (result.error || "PCSX2 não detectado."), !result.detected);
 }
 
 /* ========================= IMPORTAR DO GAMEFAQS ========================= */
@@ -2296,6 +2538,8 @@ function bindAtalhos() {
       if ($("#gf-modal")) return closeGameFaqs();
       if ($("#cv-modal")) return closeCoverPicker();
       if ($("#ai-modal")) return $("#ai-modal").remove();
+      if ($("#update-modal")) return closeUpdateModal();
+      if (S.view === "settings") return leaveSettings();
       if (S.view !== "dashboard") return enterDashboard();
       if (S.compact) return toggleCompacto();
       return;
@@ -2362,14 +2606,20 @@ async function boot() {
   }
   try {
     const st = await backend.appState();
+    await backend.confirmUpdateBoot().catch(() => null);
     if (st.auto_import !== undefined) S.autoImport = st.auto_import;
     if (st.auto_overlay !== undefined) S.autoOverlay = st.auto_overlay;
+    if (st.auto_check_updates !== undefined) S.autoCheckUpdates = st.auto_check_updates;
+    if (st.version) S.version = st.version;
     if (st.ai_ready !== undefined) S.aiReady = st.ai_ready;
+    if (st.ai_provider_label !== undefined) S.aiProviderLabel = st.ai_provider_label;
+    if (st.ai_model !== undefined) S.aiModel = st.ai_model;
     if (st.overlay_exit_fullscreen !== undefined) S.overlayExitFullscreen = st.overlay_exit_fullscreen;
     if (st.overlay_second_screen !== undefined) S.overlaySecondScreen = st.overlay_second_screen;
     if (st.overlay_fit_emulator !== undefined) S.overlayFitEmulator = st.overlay_fit_emulator;
     if (S.mode === "real" && !st.configured) renderSetup();
     else enterDashboard();
+    if (S.mode === "real") setTimeout(() => procurarAtualizacao(false), 1200);
   } catch (e) {
     S.mode = "demo";
     document.getElementById("demo-banner").classList.remove("hidden");
