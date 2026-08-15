@@ -263,6 +263,11 @@ class Api:
         self._compact = False
         self._pre_compact_pos: tuple[int, int] | None = None
         self._lock = threading.Lock()
+        self._tips_ai_lock = threading.Lock()
+        self._tips_ai_status = {
+            "ok": True, "phase": "idle", "operation": "",
+            "completed": 0, "total": 0, "message": "", "error": "",
+        }
         self._updates = updater.UpdateManager(APP_VERSION, sys.executable)
 
         for d in (GAMES_DIR, CACHE_DIR, BADGES_DIR, ICONS_DIR, ART_DIR):
@@ -985,7 +990,7 @@ class Api:
         config["api_key"] = self._ai_key(provider)
         return config
 
-    def _process_game_tips(self, slug: str, op) -> dict:
+    def _process_game_tips(self, slug: str, op, progress=None) -> dict:
         """Aplica uma operação de IA (`op(sections, config) -> sections`) às dicas
         de um jogo salvo, substitui `game['guide']` e atualiza o estado. Comum ao
         refinar e ao traduzir. Não mexe em conquistas nem no walkthrough."""
@@ -1000,15 +1005,25 @@ class Api:
             label = guide_ai.PROVIDERS[config["provider"]]["label"]
             return {"ok": False, "error": f"Configure sua chave do {label} para usar a IA."}
         try:
-            novas = op(sections, config)
+            novas = op(sections, config, progress=progress) if progress else op(sections, config)
         except guide_ai.GuideAIError as exc:
             return {"ok": False, "error": str(exc)}
         except Exception as exc:
             return {"ok": False, "error": f"Falha na IA: {exc}"}
         game["guide"] = novas
-        (GAMES_DIR / f"{slug}.json").write_text(
-            json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        path = GAMES_DIR / f"{slug}.json"
+        temporary = path.with_suffix(".json.ai.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(temporary, path)
+        except OSError as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return {"ok": False, "error": f"Não foi possível salvar as dicas: {exc}"}
         with self._lock:
             detail = self.state.get(slug)
             if detail is not None:
@@ -1022,6 +1037,77 @@ class Api:
     def translate_game_tips(self, slug: str) -> dict:
         """Traduz as dicas de um jogo salvo para português com a IA."""
         return self._process_game_tips(slug, guide_ai.translate)
+
+    def get_game_tips_ai_status(self) -> dict:
+        """Progresso da tradução/melhoria em background para a interface."""
+        with self._tips_ai_lock:
+            return dict(self._tips_ai_status)
+
+    def start_game_tips_ai(self, slug: str, operation: str) -> dict:
+        """Inicia tradução ou melhoria sem bloquear a ponte do pywebview."""
+        operations = {
+            "refine": (guide_ai.refine_tips, "Melhorando"),
+            "translate": (guide_ai.translate, "Traduzindo"),
+        }
+        if operation not in operations:
+            return {"ok": False, "error": "Operação de IA desconhecida."}
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        if not (game.get("guide") or []):
+            return {"ok": False, "error": "Este jogo não tem dicas importadas."}
+        config = self._ai_config()
+        if not config["api_key"]:
+            label = guide_ai.PROVIDERS[config["provider"]]["label"]
+            return {"ok": False, "error": f"Configure sua chave do {label} para usar a IA."}
+
+        with self._tips_ai_lock:
+            if self._tips_ai_status.get("phase") == "running":
+                return {**self._tips_ai_status, "ok": False,
+                        "error": "Já existe uma operação de IA em andamento."}
+            self._tips_ai_status = {
+                "ok": True, "phase": "running", "operation": operation,
+                "slug": slug,
+                "completed": 0, "total": 0,
+                "message": f"{operations[operation][1]}: preparando lotes…", "error": "",
+            }
+
+        threading.Thread(
+            target=self._game_tips_ai_worker,
+            args=(slug, operation, operations[operation][0], operations[operation][1]),
+            daemon=True,
+        ).start()
+        return self.get_game_tips_ai_status()
+
+    def _game_tips_ai_worker(self, slug: str, operation: str, op, verb: str) -> None:
+        def progress(completed: int, total: int) -> None:
+            with self._tips_ai_lock:
+                self._tips_ai_status.update({
+                    "completed": completed,
+                    "total": total,
+                    "message": (f"{verb} lote {min(completed + 1, total)} de {total}…"
+                                if completed < total else f"{verb}: validando resultado…"),
+                })
+
+        try:
+            result = self._process_game_tips(slug, op, progress=progress)
+        except Exception as exc:
+            result = {"ok": False, "error": f"Falha inesperada na tarefa de IA: {exc}"}
+        with self._tips_ai_lock:
+            if result.get("ok"):
+                total = self._tips_ai_status.get("total", 0)
+                self._tips_ai_status.update({
+                    "ok": True, "phase": "success", "completed": total,
+                    "sections": result.get("sections", 0),
+                    "message": ("Dicas traduzidas com sucesso."
+                                if operation == "translate" else "Dicas melhoradas com sucesso."),
+                    "error": "",
+                })
+            else:
+                self._tips_ai_status.update({
+                    "ok": False, "phase": "error", "message": "",
+                    "error": result.get("error") or "Falha ao processar as dicas com IA.",
+                })
 
     def _read_guide_sections(self, b64: str):
         """(ok, erro, seções) — extrai do PDF só as seções de dicas/tutoriais

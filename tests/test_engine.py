@@ -434,6 +434,72 @@ class TestConfigDeIA:
         assert api.refine_game_tips("jogo")["ok"] is False
         assert json.loads(path.read_text(encoding="utf-8")) == original
 
+    def test_traducao_em_background_reporta_progresso_e_salva_no_final(self, api, monkeypatch):
+        api.set_ai_config("gemini", "k")
+        original = {"title": "Jogo", "guide": [{
+            "title": "Before", "blocks": [{"type": "p", "text": "Old"}],
+        }]}
+        path = engine.GAMES_DIR / "jogo.json"
+        path.write_text(json.dumps(original), encoding="utf-8")
+
+        def traduz(sections, _config, progress=None):
+            progress(0, 2)
+            progress(1, 2)
+            progress(2, 2)
+            return [{"title": "Depois", "blocks": [{"type": "p", "text": "Novo"}]}]
+
+        monkeypatch.setattr(engine.guide_ai, "translate", traduz)
+        started = api.start_game_tips_ai("jogo", "translate")
+        assert started["phase"] in ("running", "success")
+        limit = time.time() + 2
+        status = api.get_game_tips_ai_status()
+        while status["phase"] == "running" and time.time() < limit:
+            time.sleep(0.01)
+            status = api.get_game_tips_ai_status()
+        assert status["phase"] == "success" and status["completed"] == 2
+        assert json.loads(path.read_text(encoding="utf-8"))["guide"][0]["title"] == "Depois"
+
+    def test_background_impede_operacoes_duplicadas(self, api, monkeypatch):
+        api.set_ai_config("gemini", "k")
+        path = engine.GAMES_DIR / "jogo.json"
+        path.write_text(json.dumps({"title": "J", "guide": [{"title": "T", "blocks": []}]}),
+                        encoding="utf-8")
+
+        def lento(sections, _config, progress=None):
+            progress(0, 1)
+            time.sleep(0.08)
+            progress(1, 1)
+            return sections
+
+        monkeypatch.setattr(engine.guide_ai, "translate", lento)
+        assert api.start_game_tips_ai("jogo", "translate")["ok"] is True
+        duplicate = api.start_game_tips_ai("jogo", "refine")
+        assert duplicate["ok"] is False and "andamento" in duplicate["error"]
+        limit = time.time() + 2
+        while api.get_game_tips_ai_status()["phase"] == "running" and time.time() < limit:
+            time.sleep(0.01)
+
+    def test_background_mantem_arquivo_inteiro_se_um_lote_falha(self, api, monkeypatch):
+        api.set_ai_config("gemini", "k")
+        original = {"title": "J", "guide": [{"title": "Original", "blocks": []}]}
+        path = engine.GAMES_DIR / "jogo.json"
+        path.write_text(json.dumps(original), encoding="utf-8")
+
+        def falha(_sections, _config, progress=None):
+            progress(0, 3)
+            progress(1, 3)
+            raise engine.guide_ai.GuideAIError("lote 2 inválido")
+
+        monkeypatch.setattr(engine.guide_ai, "refine_tips", falha)
+        api.start_game_tips_ai("jogo", "refine")
+        limit = time.time() + 2
+        status = api.get_game_tips_ai_status()
+        while status["phase"] == "running" and time.time() < limit:
+            time.sleep(0.01)
+            status = api.get_game_tips_ai_status()
+        assert status["phase"] == "error" and "lote 2" in status["error"]
+        assert json.loads(path.read_text(encoding="utf-8")) == original
+
 
 class TestArtesDoJogo:
     """Capa, tela de título e screenshot: a API devolve as três, e elas dão
@@ -553,7 +619,7 @@ class TestAtualizacoes:
         return engine.Api()
 
     def test_versao_aparece_no_estado(self, api):
-        assert api.get_app_state()["version"] == "0.6.0"
+        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.6.1"
 
     def test_verificacao_automatica_ligada_por_padrao(self, api):
         assert api.get_app_state()["auto_check_updates"] is True

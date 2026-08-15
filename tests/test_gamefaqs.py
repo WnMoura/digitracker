@@ -76,6 +76,34 @@ def sem_espera(monkeypatch):
 
 
 # ---------------------------------------------------------------------------- #
+# Sessão / Cloudflare
+# ---------------------------------------------------------------------------- #
+class TestSession:
+    def test_prefere_fingerprint_de_chrome_moderno(self, monkeypatch):
+        from curl_cffi import requests as curl_requests
+
+        marker, seen = object(), {}
+
+        def fake_session(**kwargs):
+            seen.update(kwargs)
+            return marker
+
+        monkeypatch.setattr(curl_requests, "Session", fake_session)
+        assert gamefaqs.create_session() is marker
+        assert seen == {"impersonate": "chrome"}
+
+    def test_cloudscraper_continua_como_fallback(self, monkeypatch):
+        import cloudscraper
+        from curl_cffi import requests as curl_requests
+
+        marker = object()
+        monkeypatch.setattr(curl_requests, "Session",
+                            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("sem libcurl")))
+        monkeypatch.setattr(cloudscraper, "create_scraper", lambda **_kwargs: marker)
+        assert gamefaqs.create_session() is marker
+
+
+# ---------------------------------------------------------------------------- #
 # URLs
 # ---------------------------------------------------------------------------- #
 class TestUrls:
@@ -114,6 +142,13 @@ class TestParsingListagem:
     def test_deduplica_o_mesmo_guia(self):
         faqs = gamefaqs.parse_faq_listing(LISTAGEM, BASE)
         assert len(faqs) == 3
+
+    def test_titulo_generico_pode_ser_o_nome_real_do_guia(self):
+        html = '<a href="/ps2/580782-x/faqs/50899">Walkthrough</a>'
+        assert gamefaqs.parse_faq_listing(html, BASE) == [{
+            "id": "50899", "title": "Walkthrough",
+            "url": "https://gamefaqs.gamespot.com/ps2/580782-x/faqs/50899",
+        }]
 
     def test_prefere_o_titulo_mais_descritivo(self):
         faqs = {f["id"]: f["title"] for f in gamefaqs.parse_faq_listing(LISTAGEM, BASE)}

@@ -3,10 +3,12 @@
 Substitui o passo manual que existia antes (rodar um scraper à parte, jogar o
 texto numa IA, montar um PDF e importar): aqui você cola a URL e o app resolve.
 
-A técnica de acesso é a mesma do scraper que já funcionava: `cloudscraper` com
-perfil de Chrome/Windows e **sem headers customizados** — mexer nos headers
-quebra a detecção do desafio do Cloudflare. Somam-se retentativas com espera
-aleatória e um intervalo entre páginas, para não parecer um robô apressado.
+A sessão principal usa `curl_cffi` para reproduzir o TLS/HTTP de um Chrome
+atual. O `cloudscraper` antigo fica como fallback, pois o desafio moderno do
+Cloudflare passou a devolver 403 mesmo com o perfil de navegador configurado.
+Não adicionamos headers customizados: a coerência entre TLS e cabeçalhos é o que
+evita o falso positivo. Somam-se retentativas com espera aleatória e um
+intervalo entre páginas, para não parecer um robô apressado.
 
 Uso responsável: isto é para consumo pessoal, em volume baixo. O texto dos FAQs
 é de autoria de quem escreveu — fica no seu `config/games/*.json` local, não é
@@ -37,21 +39,26 @@ class GameFAQsError(Exception):
 
 
 def create_session():
-    """Sessão que resolve o desafio do Cloudflare.
+    """Sessão com fingerprint de Chrome moderno para o Cloudflare.
 
-    NÃO adicione headers customizados: o cloudscraper monta um conjunto
-    coerente com o navegador que ele finge ser, e sobrescrever qualquer campo
-    faz o desafio falhar.
+    ``curl_cffi`` acompanha as versões atuais do Chrome e hoje consegue acessar
+    o GameFAQs onde o ``cloudscraper`` 1.2.x recebe o desafio 403. O fallback
+    continua útil em plataformas onde o binário nativo não estiver disponível.
     """
     try:
-        import cloudscraper
-    except ImportError as exc:      # pragma: no cover - depende do ambiente
-        raise GameFAQsError(
-            "A biblioteca cloudscraper não está instalada (pip install cloudscraper)."
-        ) from exc
-    return cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "desktop": True}
-    )
+        from curl_cffi import requests as curl_requests
+        return curl_requests.Session(impersonate="chrome")
+    except (ImportError, RuntimeError):
+        try:
+            import cloudscraper
+            return cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "desktop": True}
+            )
+        except ImportError as exc:      # pragma: no cover - depende do ambiente
+            raise GameFAQsError(
+                "As bibliotecas de acesso ao GameFAQs não estão instaladas "
+                "(pip install curl_cffi cloudscraper)."
+            ) from exc
 
 
 # ---------------------------------------------------------------------------- #
@@ -99,8 +106,11 @@ def parse_faq_listing(html: str, base_url: str) -> list[dict]:
         if not m:
             continue
         title = " ".join(a.get_text(" ", strip=True).split())
-        if not title or title.lower() in ("faq", "guide", "walkthrough"):
-            continue                      # rótulo genérico de navegação
+        if not title:
+            continue
+        # "Walkthrough" e "Guide" também podem ser o título real da entrada.
+        # Links repetidos continuam seguros: a deduplicação abaixo conserva o
+        # rótulo mais descritivo quando o mesmo id aparece em outro ponto.
         faq_id = m.group(1)
         prev = found.get(faq_id)
         if prev is None or len(title) > len(prev["title"]):

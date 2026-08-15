@@ -27,6 +27,10 @@ import guide_parser
 
 MAX_TOKENS = 16000
 TIMEOUT = 300           # guias longos levam minutos
+# As dicas podem passar de 100 mil caracteres. Cada lote fica muito abaixo do
+# limite de saída para impedir que o JSON seja cortado no meio pelo provedor.
+SECTIONS_BATCH_MAX_CHARS = 18000
+SECTIONS_BATCH_MAX_COUNT = 16
 
 # Metadados de cada provedor para a interface montar o formulário sozinha.
 PROVIDERS = {
@@ -273,8 +277,19 @@ def _call_gemini(cfg: dict, system: str, user: str, schema: dict) -> dict:
     _raise_for_status(resp, "Gemini")
     try:
         data = resp.json()
-        parts = data["candidates"][0]["content"]["parts"]
+        candidate = data["candidates"][0]
+        finish_reason = str(candidate.get("finishReason") or "").upper()
+        if finish_reason == "MAX_TOKENS":
+            raise GuideAIError(
+                "O Gemini cortou a resposta por limite de tokens. "
+                "Tente novamente; as dicas serão processadas em lotes menores."
+            )
+        if finish_reason and finish_reason not in ("STOP", "FINISH_REASON_UNSPECIFIED"):
+            raise GuideAIError(f"O Gemini interrompeu a resposta: {finish_reason}.")
+        parts = candidate["content"]["parts"]
         text = "".join(p.get("text", "") for p in parts)
+    except GuideAIError:
+        raise
     except (ValueError, KeyError, IndexError) as exc:
         raise GuideAIError("Resposta inesperada do Gemini.") from exc
     return _extract_json(text)
@@ -392,7 +407,7 @@ SECTIONS_SCHEMA = {
                             "type": "object",
                             "properties": {
                                 "type": {"type": "string",
-                                         "enum": ["p", "li", "note", "boss", "step", "subhead"]},
+                                "enum": ["p", "li", "note", "boss", "step", "subhead", "label"]},
                                 "text": {"type": "string"},
                             },
                             "required": ["type", "text"],
@@ -411,7 +426,7 @@ SECTIONS_SCHEMA = {
 
 _SECTIONS_JSON_HINT = (
     "\n\nResponda SOMENTE com JSON válido, sem cercas de código, no formato: "
-    '{"sections": [{"title": "...", "blocks": [{"type": "p|li|note|boss|step|subhead", '
+        '{"sections": [{"title": "...", "blocks": [{"type": "p|li|note|boss|step|subhead|label", '
     '"text": "..."}]}]}. Mantenha o MESMO número de seções e blocos, na mesma ordem, '
     "preservando o `type` de cada bloco."
 )
@@ -446,29 +461,72 @@ def _sections_payload(sections: list) -> str:
     return "SEÇÕES DE DICAS:\n" + json.dumps(slim, ensure_ascii=False)
 
 
-def _apply_sections(data: dict, fallback: list) -> list:
-    """Valida a resposta e devolve seções no formato do app. Se a IA devolver
-    algo inválido/vazio, cai para as seções originais."""
+def _section_batches(sections: list, max_chars: int = SECTIONS_BATCH_MAX_CHARS,
+                     max_count: int = SECTIONS_BATCH_MAX_COUNT) -> list[list]:
+    """Agrupa seções inteiras em lotes pequenos, preservando a ordem.
+
+    Uma seção excepcionalmente grande segue sozinha. Esse caso ainda produz um
+    erro explícito de limite, em vez de salvar parcialmente o guia.
+    """
+    batches, current, current_chars = [], [], 0
+    for section in sections:
+        section_chars = len(json.dumps(section, ensure_ascii=False, separators=(",", ":")))
+        if current and (current_chars + section_chars > max_chars or len(current) >= max_count):
+            batches.append(current)
+            current, current_chars = [], 0
+        current.append(section)
+        current_chars += section_chars
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _apply_sections(data: dict, original: list) -> list:
+    """Valida estritamente um lote e aplica apenas título/texto.
+
+    Metadados locais (``num``, ``n``, ``label`` etc.) são preservados. Uma
+    resposta vazia, truncada ou que mude quantidade/ordem deixa de ser tratada
+    como sucesso silencioso.
+    """
     secs = data.get("sections") if isinstance(data, dict) else None
-    if not isinstance(secs, list) or not secs:
-        return fallback
+    if not isinstance(secs, list) or len(secs) != len(original):
+        raise GuideAIError(
+            "A IA alterou a quantidade de seções. As dicas originais foram mantidas."
+        )
     out = []
-    for i, s in enumerate(secs):
-        if not isinstance(s, dict):
-            continue
-        blocks = []
-        for b in s.get("blocks", []):
-            if isinstance(b, dict) and b.get("text"):
-                t = b.get("type") if b.get("type") in ("p", "li", "note", "boss", "step", "subhead") else "p"
-                blocks.append({"type": t, "text": str(b["text"])})
-        if s.get("title") or blocks:
-            out.append({"num": str(i + 1), "title": str(s.get("title", "")),
-                        "blocks": blocks, "is_achievements": False})
-    return out or fallback
+    for i, (received, source) in enumerate(zip(secs, original), start=1):
+        if not isinstance(received, dict) or not isinstance(received.get("title"), str):
+            raise GuideAIError(f"A IA devolveu a seção {i} em formato inválido.")
+        received_blocks = received.get("blocks")
+        source_blocks = source.get("blocks", [])
+        if not isinstance(received_blocks, list) or len(received_blocks) != len(source_blocks):
+            raise GuideAIError(
+                f"A IA alterou a quantidade de blocos da seção {i}. "
+                "As dicas originais foram mantidas."
+            )
+        merged_blocks = []
+        for j, (block, source_block) in enumerate(zip(received_blocks, source_blocks), start=1):
+            expected_type = source_block.get("type", "p")
+            if (not isinstance(block, dict) or not isinstance(block.get("text"), str)
+                    or block.get("type") != expected_type):
+                raise GuideAIError(
+                    f"A IA alterou a estrutura do bloco {j} da seção {i}. "
+                    "As dicas originais foram mantidas."
+                )
+            merged = dict(source_block)
+            merged["text"] = block["text"]
+            merged_blocks.append(merged)
+        merged_section = dict(source)
+        merged_section["title"] = received["title"]
+        merged_section["blocks"] = merged_blocks
+        merged_section.setdefault("num", str(i))
+        merged_section["is_achievements"] = False
+        out.append(merged_section)
+    return out
 
 
-def _run_sections(sections: list, config: dict, system: str) -> list:
-    """Chama o provedor com um `system` próprio e devolve seções aplicadas."""
+def _run_sections(sections: list, config: dict, system: str, progress=None) -> list:
+    """Processa dicas em lotes e só devolve o conjunto após validar todos."""
     provider = (config.get("provider") or DEFAULT_PROVIDER).strip()
     info = provider_info(provider)
     api_key = (config.get("api_key") or "").strip()
@@ -481,18 +539,27 @@ def _run_sections(sections: list, config: dict, system: str) -> list:
         "model": resolve_model(provider, config.get("model", "")),
         "base_url": resolve_base_url(provider, config.get("base_url", "")),
     }
-    data = _CALLERS[provider](cfg, system, _sections_payload(sections), SECTIONS_SCHEMA)
-    return _apply_sections(data, sections)
+    batches = _section_batches(sections)
+    total = len(batches)
+    if progress:
+        progress(0, total)
+    processed = []
+    for index, batch in enumerate(batches, start=1):
+        data = _CALLERS[provider](cfg, system, _sections_payload(batch), SECTIONS_SCHEMA)
+        processed.extend(_apply_sections(data, batch))
+        if progress:
+            progress(index, total)
+    return processed
 
 
-def refine_tips(sections: list, config: dict) -> list:
+def refine_tips(sections: list, config: dict, progress=None) -> list:
     """Cura as seções de dicas (sem tocar em conquistas/ordem)."""
-    return _run_sections(sections, config, _TIPS_SYSTEM)
+    return _run_sections(sections, config, _TIPS_SYSTEM, progress)
 
 
-def translate(sections: list, config: dict, target: str = "português (Brasil)") -> list:
+def translate(sections: list, config: dict, target: str = "português (Brasil)", progress=None) -> list:
     """Traduz as seções de dicas para `target`."""
-    return _run_sections(sections, config, _translate_system(target))
+    return _run_sections(sections, config, _translate_system(target), progress)
 
 
 def _apply(data: dict, achievements_meta: dict, faq_text: str) -> dict:

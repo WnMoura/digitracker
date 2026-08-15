@@ -136,6 +136,8 @@ const S = {
   aiReady: false,        // há chave salva para o provedor de IA escolhido
   aiProviderLabel: "",
   aiModel: "",
+  tipsAI: null,          // progresso persistente da tradução/melhoria das dicas
+  tipsAIPolling: false,
   overlayExitFullscreen: false,  // mandar Alt+Enter ao detectar tela cheia exclusiva
   overlaySecondScreen: false,    // levar o overlay para o monitor livre
   overlayFitEmulator: true,      // dimensionar o overlay conforme a janela do emulador
@@ -274,6 +276,14 @@ const backend = {
   async translateGameTips(slug) {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
     return window.pywebview.api.translate_game_tips(slug);
+  },
+  async startGameTipsAI(slug, operation) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.start_game_tips_ai(slug, operation);
+  },
+  async gameTipsAIStatus() {
+    if (S.mode === "demo") return { ok: true, phase: "idle" };
+    return window.pywebview.api.get_game_tips_ai_status();
   },
   async getAiConfig() {
     if (S.mode === "demo") return { ok: false };
@@ -894,10 +904,18 @@ function guideHTML(game) {
   // A ação fica visível mesmo sem chave: nesse caso ela leva diretamente à
   // configuração, em vez de simplesmente "sumir" da interface.
   const aiMeta = [S.aiProviderLabel, S.aiModel].filter(Boolean).join(" · ");
+  const task = S.tipsAI?.slug === S.activeSlug ? S.tipsAI : null;
+  const aiBusy = task?.phase === "running";
+  const aiProgress = task && task.phase !== "idle" ? `
+    <div class="guide-ai-status ${task.phase === "error" ? "err" : task.phase === "success" ? "ok" : ""}">
+      ${task.total ? `<div class="guide-ai-progress"><span style="width:${Math.round(100 * (task.completed || 0) / task.total)}%"></span></div>` : ""}
+      <span>${esc(task.error || task.message || "Processando dicas…")}</span>
+    </div>` : "";
   const aiBtns = (secs.length && S.mode !== "demo") ? `
     <span class="guide-ai-meta">${esc(aiMeta || "Configure um provedor de IA")}</span>
-    <button class="pdf-order-btn ai" id="guide-refine">✨ Melhorar com IA</button>
-    <button class="pdf-order-btn" id="guide-translate">🌐 Traduzir (PT-BR)</button>` : "";
+    <button class="pdf-order-btn ai" id="guide-refine" ${aiBusy ? "disabled" : ""}>${aiBusy && task.operation === "refine" ? "✨ Melhorando…" : "✨ Melhorar com IA"}</button>
+    <button class="pdf-order-btn" id="guide-translate" ${aiBusy ? "disabled" : ""}>${aiBusy && task.operation === "translate" ? "🌐 Traduzindo…" : "🌐 Traduzir (PT-BR)"}</button>
+    ${aiProgress}` : "";
   if (!secs.length) {
     return `<div class="list-wrap"><p class="list-title">DICAS & TUTORIAIS</p>
       <p class="guide-empty">Nenhuma dica importada para este jogo.<br>
@@ -938,24 +956,41 @@ async function dicasIa(kind) {
     toast("Configure uma chave de IA para continuar.");
     return enterSettings("ai", { slug, tab: "tips" });
   }
-  const btn = kind === "refine" ? $("#guide-refine") : $("#guide-translate");
-  if (btn) { btn.disabled = true; btn.textContent = kind === "refine" ? "✨ Melhorando…" : "🌐 Traduzindo…"; }
   try {
-    const res = kind === "refine"
-      ? await backend.refineGameTips(slug)
-      : await backend.translateGameTips(slug);
+    const res = await backend.startGameTipsAI(slug, kind);
+    S.tipsAI = res;
     if (!res || !res.ok) {
       toast(res && res.error ? res.error : "Falha na IA.", true);
-      if (btn) { btn.disabled = false; btn.textContent = kind === "refine" ? "✨ Melhorar com IA" : "🌐 Traduzir (PT-BR)"; }
       return;
     }
-    toast(kind === "refine"
-      ? `Dicas refinadas (${res.sections} seções).`
-      : `Dicas traduzidas (${res.sections} seções).`);
-    await renderDashboard({ force: true });   // re-render já traz os botões limpos
+    await renderDashboard({ force: true });
+    acompanharDicasIa();
   } catch (e) {
     toast("Erro: " + e, true);
-    if (btn) { btn.disabled = false; btn.textContent = kind === "refine" ? "✨ Melhorar com IA" : "🌐 Traduzir (PT-BR)"; }
+  }
+}
+
+const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function acompanharDicasIa() {
+  if (S.tipsAIPolling) return;
+  S.tipsAIPolling = true;
+  try {
+    while (true) {
+      const status = await backend.gameTipsAIStatus();
+      S.tipsAI = status;
+      if (S.view === "dashboard") await renderDashboard({ force: true });
+      if (status.phase !== "running") {
+        if (status.phase === "success") toast(status.message || "Dicas processadas com sucesso.");
+        else if (status.phase === "error") toast(status.error || "Falha ao processar as dicas.", true);
+        break;
+      }
+      await esperar(700);
+    }
+  } catch (e) {
+    toast("Não foi possível acompanhar a IA: " + e, true);
+  } finally {
+    S.tipsAIPolling = false;
   }
 }
 
@@ -2614,12 +2649,14 @@ async function boot() {
     if (st.ai_ready !== undefined) S.aiReady = st.ai_ready;
     if (st.ai_provider_label !== undefined) S.aiProviderLabel = st.ai_provider_label;
     if (st.ai_model !== undefined) S.aiModel = st.ai_model;
+    if (S.mode === "real") S.tipsAI = await backend.gameTipsAIStatus().catch(() => null);
     if (st.overlay_exit_fullscreen !== undefined) S.overlayExitFullscreen = st.overlay_exit_fullscreen;
     if (st.overlay_second_screen !== undefined) S.overlaySecondScreen = st.overlay_second_screen;
     if (st.overlay_fit_emulator !== undefined) S.overlayFitEmulator = st.overlay_fit_emulator;
     if (S.mode === "real" && !st.configured) renderSetup();
     else enterDashboard();
     if (S.mode === "real") setTimeout(() => procurarAtualizacao(false), 1200);
+    if (S.tipsAI?.phase === "running") setTimeout(acompanharDicasIa, 100);
   } catch (e) {
     S.mode = "demo";
     document.getElementById("demo-banner").classList.remove("hidden");

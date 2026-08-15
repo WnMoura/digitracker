@@ -162,19 +162,28 @@ SECOES_IA = json_mod.dumps({"sections": [
 
 class TestDicasIA:
     def test_apply_sections_vira_formato_do_app(self):
-        data = {"sections": [{"title": "T", "blocks": [{"type": "note", "text": "x"}]}]}
+        data = {"sections": [{"title": "T", "blocks": [{"type": "boss", "text": "x"}]}]}
         out = guide_ai._apply_sections(data, SECOES)
         assert out[0]["num"] == "1" and out[0]["title"] == "T"
-        assert out[0]["blocks"][0] == {"type": "note", "text": "x"}
+        assert out[0]["blocks"][0] == {"type": "boss", "text": "x"}
         assert out[0]["is_achievements"] is False
 
-    def test_apply_sections_invalido_cai_para_original(self):
-        assert guide_ai._apply_sections({"sections": []}, SECOES) == SECOES
-        assert guide_ai._apply_sections({"nada": 1}, SECOES) == SECOES
+    @pytest.mark.parametrize("data", [{"sections": []}, {"nada": 1}])
+    def test_apply_sections_invalido_falha_explicitamente(self, data):
+        with pytest.raises(guide_ai.GuideAIError, match="originais"):
+            guide_ai._apply_sections(data, SECOES)
 
-    def test_apply_sections_tipo_desconhecido_vira_p(self):
+    def test_apply_sections_nao_deixa_ia_mudar_tipo(self):
         data = {"sections": [{"title": "T", "blocks": [{"type": "xyz", "text": "y"}]}]}
-        assert guide_ai._apply_sections(data, SECOES)[0]["blocks"][0]["type"] == "p"
+        with pytest.raises(guide_ai.GuideAIError, match="estrutura"):
+            guide_ai._apply_sections(data, SECOES)
+
+    def test_apply_sections_preserva_metadados_locais(self):
+        source = [{"num": "9", "title": "T", "extra": 1,
+                   "blocks": [{"type": "step", "text": "old", "n": 7}]}]
+        data = {"sections": [{"title": "Novo", "blocks": [{"type": "step", "text": "new"}]}]}
+        out = guide_ai._apply_sections(data, source)
+        assert out[0]["extra"] == 1 and out[0]["blocks"][0]["n"] == 7
 
     def test_refine_tips_pelo_gemini(self, monkeypatch):
         com_respostas(monkeypatch, gemini_ok(SECOES_IA))
@@ -187,6 +196,35 @@ class TestDicasIA:
         out = guide_ai.translate(SECOES, {"provider": "gemini", "api_key": "k"})
         assert out[0]["blocks"][0]["text"] == "Use fogo."
         assert "portug" in chamadas[0]["body"]["systemInstruction"]["parts"][0]["text"].lower()
+
+    def test_guia_grande_e_dividido_em_lotes_com_progresso(self, monkeypatch):
+        sections = [
+            {"num": str(i), "title": f"S{i}",
+             "blocks": [{"type": "p", "text": "x" * 10000}]}
+            for i in range(3)
+        ]
+        responses = [gemini_ok(json_mod.dumps({"sections": [{
+            "title": f"Traduzida {i}",
+            "blocks": [{"type": "p", "text": "y" * 10000}],
+        }]})) for i in range(3)]
+        calls = com_respostas(monkeypatch, *responses)
+        progress = []
+        out = guide_ai.translate(
+            sections, {"provider": "gemini", "api_key": "k"},
+            progress=lambda done, total: progress.append((done, total)),
+        )
+        assert len(calls) == 3
+        assert progress == [(0, 3), (1, 3), (2, 3), (3, 3)]
+        assert [s["title"] for s in out] == ["Traduzida 0", "Traduzida 1", "Traduzida 2"]
+
+    def test_gemini_avisa_quando_resposta_e_cortada(self, monkeypatch):
+        response = FakeResp({"candidates": [{
+            "finishReason": "MAX_TOKENS",
+            "content": {"parts": [{"text": "{incompleto"}]},
+        }]})
+        com_respostas(monkeypatch, response)
+        with pytest.raises(guide_ai.GuideAIError, match="limite de tokens"):
+            guide_ai.translate(SECOES, {"provider": "gemini", "api_key": "k"})
 
     def test_sem_chave_avisa(self):
         with pytest.raises(guide_ai.GuideAIError, match="chave"):

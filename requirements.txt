@@ -2,8 +2,9 @@ pywebview==5.4
 requests>=2.31
 # Leitura do PDF do guia para ordenar o walkthrough automaticamente.
 pypdf>=4.0
-# Importar guias direto do GameFAQs: cloudscraper resolve o desafio do
-# Cloudflare, BeautifulSoup lê o HTML.
+# Importar guias direto do GameFAQs: curl_cffi imita o TLS de um Chrome atual;
+# cloudscraper fica como fallback e BeautifulSoup lê o HTML.
+curl_cffi>=0.16.0
 cloudscraper>=1.2.71
 beautifulsoup4>=4.12
 # Refino opcional do guia por IA. Só o provedor Anthropic precisa de SDK;
