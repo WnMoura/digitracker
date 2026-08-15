@@ -619,7 +619,7 @@ class TestAtualizacoes:
         return engine.Api()
 
     def test_versao_aparece_no_estado(self, api):
-        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.6.1"
+        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.7.0"
 
     def test_verificacao_automatica_ligada_por_padrao(self, api):
         assert api.get_app_state()["auto_check_updates"] is True

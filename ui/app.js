@@ -118,6 +118,7 @@ const S = {
   mode: "real",          // 'real' | 'demo'
   view: "loading",
   library: [],
+  libraryQuery: "",
   activeSlug: null,
   tab: "walk",           // aba do painel: 'walk' | 'tips'
   onTop: true,
@@ -530,6 +531,7 @@ async function renderDashboard({ force = false } = {}) {
 
   const scroll = captureScroll();
   document.getElementById("app").classList.toggle("compact", S.compact);
+  $("#btn-library").hidden = !!S.compact;
   if (S.compact) {
     root.innerHTML = compactHTML(game);
     bindCompact();
@@ -705,8 +707,12 @@ async function toggleCompact(value) {
 }
 
 function sidebarHTML() {
-  const done = S.library.filter(isMastered);
-  const prog = S.library.filter((g) => !isMastered(g));
+  const query = S.libraryQuery.trim().toLocaleLowerCase("pt-BR");
+  const visible = query
+    ? S.library.filter((g) => g.title.toLocaleLowerCase("pt-BR").includes(query))
+    : S.library;
+  const done = visible.filter(isMastered);
+  const prog = visible.filter((g) => !isMastered(g));
   /* Cápsula de capa: a arte identifica o jogo, a fita diz o que exige ação,
      e a selecionada brilha com a própria cor. */
   const tile = (g) => {
@@ -717,7 +723,9 @@ function sidebarHTML() {
     const capa = g.art?.box
       ? `<img src="${esc(g.art.box)}" alt="">`
       : `<div class="fallback">${esc(initials(g.title))}</div>`;
-    return `<button class="tile ${active ? "active" : ""}" data-slug="${esc(g.slug)}" style="--jogo:${cor}">
+    return `<button class="tile ${active ? "active" : ""}" data-slug="${esc(g.slug)}"
+      data-title="${esc(g.title.toLowerCase())}" style="--jogo:${cor}"
+      title="${esc(g.title)}" aria-label="Abrir ${esc(g.title)}">
       <div class="cover">
         ${capa}
         ${fita ? `<div class="ribbon ${fita.cls}">${fita.txt}</div>` : ""}
@@ -729,19 +737,24 @@ function sidebarHTML() {
       </div>
     </button>`;
   };
-  return `<aside class="sidebar">
+  return `<button class="library-scrim" id="library-scrim" aria-label="Fechar biblioteca"></button>
+  <aside class="sidebar" aria-label="Biblioteca de jogos">
     <div class="sidebar-head">
-      <h2>BIBLIOTECA</h2>
+      <div class="sidebar-title-row"><h2>BIBLIOTECA</h2><span class="library-count">${S.library.length}</span></div>
       <p>${S.library.length} ${S.library.length === 1 ? "jogo" : "jogos"} no ecossistema</p>
+      <label class="library-search" title="Buscar na biblioteca">
+        <span aria-hidden="true">⌕</span>
+        <input id="library-search" type="search" placeholder="Buscar jogo" value="${esc(S.libraryQuery)}" aria-label="Buscar jogo na biblioteca">
+      </label>
     </div>
     <div class="sidebar-list" data-scroll="sidebar">
       ${done.length ? `<p class="section-label done">★ MASTERY</p>${done.map(tile).join("")}<div style="height:8px"></div>` : ""}
-      <p class="section-label progress">◎ EM PROGRESSO</p>
-      ${prog.length ? prog.map(tile).join("") : `<p style="color:var(--text-low);font-size:11px;padding:4px">Nenhum jogo ainda.</p>`}
+      ${prog.length ? `<p class="section-label progress">◎ EM PROGRESSO</p>${prog.map(tile).join("")}` : ""}
+      <p class="library-empty ${visible.length ? "hidden" : ""}" id="library-filter-empty">${query ? "Nenhum jogo encontrado." : "Nenhum jogo ainda."}</p>
     </div>
     <div class="sidebar-foot">
-      <button class="add-btn" id="btn-add">＋ Adicionar Jogo</button>
-      <button class="import-btn" id="btn-import-all" title="Trazer de uma vez todos os jogos em que você já tem conquistas">⤓ Importar meus jogos</button>
+      <button class="add-btn" id="btn-add"><span class="foot-icon">＋</span><span class="foot-label">Adicionar jogo</span></button>
+      <button class="import-btn" id="btn-import-all" title="Trazer de uma vez todos os jogos em que você já tem conquistas"><span class="foot-icon">⤓</span><span class="foot-label">Importar meus jogos</span></button>
     </div>
   </aside>`;
 }
@@ -774,12 +787,17 @@ function mainHTML(game) {
         <div class="hero-scrim"></div>
         <button class="cover-btn" id="btn-cover" title="Escolher a capa no SteamGridDB">🖼 Trocar capa</button>
         <div class="hero-txt">
-          <div class="head-info">
-            <h1>${esc(game.title)}</h1>
-            <p class="plat">${esc(game.platform)}</p>
-            <p class="total">${e}<small>/${t}</small>
-              <small class="sep">obtidas</small>
-              <span class="mst">${mst.percent || 0}% rumo ao Mastery</span></p>
+          <div class="hero-identity">
+            <div class="hero-cover ${arte.box ? "has-art" : ""}">
+              ${arte.box ? `<img src="${esc(arte.box)}" alt="Capa de ${esc(game.title)}">` : `<span>${esc(initials(game.title))}</span>`}
+            </div>
+            <div class="head-info">
+              <h1>${esc(game.title)}</h1>
+              <p class="plat">${esc(game.platform)}</p>
+              <p class="total">${e}<small>/${t}</small>
+                <small class="sep">obtidas</small>
+                <span class="mst">${mst.percent || 0}% rumo ao Mastery</span></p>
+            </div>
           </div>
           <div class="hero-bar" title="Progresso de Mastery: ${mst.hardcore || 0} de ${t} em hardcore">
             <i style="width:${mst.percent || 0}%"></i>
@@ -798,11 +816,11 @@ function mainHTML(game) {
         </div>
         <span class="le-date">${esc(le.date)}</span>
       </div>` : ""}
-      <div class="panel-tabs">
-        <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk">Walkthrough</button>
-        <button class="ptab ${S.tab === "mastery" ? "active" : ""}" data-tab="mastery">Mastery${mst.softcore_only ? `<span class="count">${mst.softcore_only}</span>` : ""}</button>
-        <button class="ptab ${S.tab === "tips" ? "active" : ""}" data-tab="tips">Dicas${tips ? `<span class="count">${tips}</span>` : ""}</button>
-      </div>
+    </div>
+    <div class="panel-tabs">
+      <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk">Walkthrough</button>
+      <button class="ptab ${S.tab === "mastery" ? "active" : ""}" data-tab="mastery">Mastery${mst.softcore_only ? `<span class="count">${mst.softcore_only}</span>` : ""}</button>
+      <button class="ptab ${S.tab === "tips" ? "active" : ""}" data-tab="tips">Dicas${tips ? `<span class="count">${tips}</span>` : ""}</button>
     </div>
     ${S.tab === "tips" ? guideHTML(game) : S.tab === "mastery" ? masteryHTML(game) : walkHTML(game)}
   </main>`;
@@ -898,30 +916,45 @@ function walkHTML(game) {
 /* Renderiza as seções de dicas/tutoriais extraídas do PDF do guia. */
 function guideHTML(game) {
   const secs = game.guide || [];
-  const importBtn = S.mode === "demo" ? "" : `
-    <button class="pdf-order-btn gf" id="guide-gamefaqs">🌐 ${secs.length ? "Substituir pelo GameFAQs" : "Importar do GameFAQs"}</button>
-    <button class="pdf-order-btn" id="guide-import">📄 ${secs.length ? "Substituir dicas (PDF)" : "Importar dicas do PDF"}</button>`;
+  const importBtn = S.mode === "demo" ? "" : secs.length ? `
+    <details class="guide-more">
+      <summary aria-label="Mais opções de importação">Importar/substituir <span>⌄</span></summary>
+      <div class="guide-more-menu">
+        <button class="guide-menu-btn" id="guide-gamefaqs"><span>◎</span><span><b>GameFAQs</b><small>Buscar um guia online</small></span></button>
+        <button class="guide-menu-btn" id="guide-import"><span>▤</span><span><b>Arquivo PDF</b><small>Usar um guia local</small></span></button>
+      </div>
+    </details>` : `
+    <div class="guide-empty-actions">
+      <button class="guide-import-card primary" id="guide-gamefaqs"><span class="guide-import-icon">◎</span><span><b>Importar do GameFAQs</b><small>Busque e escolha um guia online</small></span><span class="guide-arrow">→</span></button>
+      <button class="guide-import-card" id="guide-import"><span class="guide-import-icon">▤</span><span><b>Importar arquivo PDF</b><small>Use um guia salvo no computador</small></span><span class="guide-arrow">→</span></button>
+    </div>`;
   // A ação fica visível mesmo sem chave: nesse caso ela leva diretamente à
   // configuração, em vez de simplesmente "sumir" da interface.
   const aiMeta = [S.aiProviderLabel, S.aiModel].filter(Boolean).join(" · ");
   const task = S.tipsAI?.slug === S.activeSlug ? S.tipsAI : null;
   const aiBusy = task?.phase === "running";
   const aiProgress = task && task.phase !== "idle" ? `
-    <div class="guide-ai-status ${task.phase === "error" ? "err" : task.phase === "success" ? "ok" : ""}">
-      ${task.total ? `<div class="guide-ai-progress"><span style="width:${Math.round(100 * (task.completed || 0) / task.total)}%"></span></div>` : ""}
-      <span>${esc(task.error || task.message || "Processando dicas…")}</span>
+    <div class="guide-ai-status ${task.phase === "error" ? "err" : task.phase === "success" ? "ok" : ""}" role="status" aria-live="polite">
+      <span class="task-icon">${task.phase === "error" ? "!" : task.phase === "success" ? "✓" : "✦"}</span>
+      <div class="task-copy"><b>${task.phase === "running" ? "IA trabalhando no guia" : task.phase === "success" ? "Guia atualizado" : "Ação necessária"}</b>
+        <span>${esc(task.error || task.message || "Processando dicas…")}</span></div>
+      ${task.total ? `<div class="guide-ai-progress" aria-label="Progresso da IA"><span style="width:${Math.round(100 * (task.completed || 0) / task.total)}%"></span></div>` : ""}
     </div>` : "";
   const aiBtns = (secs.length && S.mode !== "demo") ? `
-    <span class="guide-ai-meta">${esc(aiMeta || "Configure um provedor de IA")}</span>
-    <button class="pdf-order-btn ai" id="guide-refine" ${aiBusy ? "disabled" : ""}>${aiBusy && task.operation === "refine" ? "✨ Melhorando…" : "✨ Melhorar com IA"}</button>
-    <button class="pdf-order-btn" id="guide-translate" ${aiBusy ? "disabled" : ""}>${aiBusy && task.operation === "translate" ? "🌐 Traduzindo…" : "🌐 Traduzir (PT-BR)"}</button>
+    <div class="guide-ai-meta"><span class="ai-dot"></span><span>${esc(aiMeta || "IA não configurada")}</span></div>
+    <div class="guide-actions">
+      <button class="guide-action ai" id="guide-refine" ${aiBusy ? "disabled" : ""}>${aiBusy && task.operation === "refine" ? "✦ Melhorando…" : "✦ Melhorar com IA"}</button>
+      <button class="guide-action" id="guide-translate" ${aiBusy ? "disabled" : ""}>${aiBusy && task.operation === "translate" ? "Traduzindo…" : "Traduzir PT-BR"}</button>
+      ${importBtn}
+    </div>
     ${aiProgress}` : "";
   if (!secs.length) {
-    return `<div class="list-wrap"><p class="list-title">DICAS & TUTORIAIS</p>
-      <p class="guide-empty">Nenhuma dica importada para este jogo.<br>
-      Importe um PDF de guia abaixo — só as dicas/tutoriais, <b>sem alterar os troféus</b>.</p>
+    return `<div class="list-wrap"><div class="guide-empty-state">
+      <span class="guide-empty-kicker">GUIA DO JOGO</span>
+      <h2>Comece pelas dicas certas</h2>
+      <p>Nenhuma dica foi importada. Adicione um guia sem alterar conquistas ou a ordem do walkthrough.</p>
       ${importBtn}
-    </div>`;
+    </div></div>`;
   }
   const block = (b) => {
     switch (b.type) {
@@ -940,8 +973,9 @@ function guideHTML(game) {
   </section>`;
   return `<div class="list-wrap guide-wrap">
     <div class="guide-head">
-      <p class="list-title" style="margin:0">DICAS & TUTORIAIS DO GUIA</p>
-      ${importBtn}${aiBtns}
+      <div class="guide-title-block"><p class="list-title">GUIA DO JOGO</p><h2>Dicas & tutoriais</h2>
+        <p>${secs.length} ${secs.length === 1 ? "seção importada" : "seções importadas"}</p></div>
+      ${aiBtns}
     </div>
     ${secs.map(section).join("")}
   </div>`;
@@ -996,7 +1030,25 @@ async function acompanharDicasIa() {
 
 function bindSidebar() {
   root.querySelectorAll(".tile").forEach((b) => {
-    b.onclick = async () => { S.activeSlug = b.dataset.slug; await renderDashboard(); };
+    b.onclick = async () => {
+      S.activeSlug = b.dataset.slug;
+      closeLibraryDrawer();
+      await renderDashboard();
+    };
+  });
+  $("#library-scrim")?.addEventListener("click", closeLibraryDrawer);
+  $("#library-search")?.addEventListener("input", (e) => {
+    S.libraryQuery = e.currentTarget.value;
+    const query = S.libraryQuery.trim().toLocaleLowerCase("pt-BR");
+    let found = 0;
+    root.querySelectorAll(".tile").forEach((tile) => {
+      const show = !query || tile.dataset.title.includes(query);
+      tile.hidden = !show;
+      if (show) found += 1;
+    });
+    const empty = $("#library-filter-empty");
+    empty?.classList.toggle("hidden", found > 0);
+    if (empty) empty.textContent = query ? "Nenhum jogo encontrado." : "Nenhum jogo ainda.";
   });
   root.querySelectorAll(".ptab").forEach((b) => {
     b.onclick = () => { S.tab = b.dataset.tab; renderDashboard(); };
@@ -1068,6 +1120,8 @@ async function leaveSettings() {
 }
 
 function renderSettings() {
+  $("#btn-library").hidden = true;
+  closeLibraryDrawer();
   const { estado, ia, sources, compact, overlay, update } = S.SET;
   const prov = ia && (ia.providers.find((p) => p.id === ia.provider) || ia.providers[0]);
   const ready = sources || {};
@@ -1081,6 +1135,7 @@ function renderSettings() {
   const upText = up.update_available
     ? `Versão ${esc(up.latest_version)} disponível`
     : (up.phase === "error" ? esc(up.error || "Falha ao consultar") : "Você está na versão atual");
+  const settingsSection = S.SET.section || "account";
 
   const chave = (id, txt, sub, ligado) => `
     <div class="set-row">
@@ -1096,9 +1151,22 @@ function renderSettings() {
       <div class="s">Conta, inteligência artificial, biblioteca e overlay</div></div>
     </div>
     <div class="settings">
-      <div class="settings-inner">
+      <div class="settings-shell">
+        <nav class="settings-nav" aria-label="Categorias das configurações">
+          <p>Preferências</p>
+          ${[
+            ["account", "◉", "Conta e atualizações"],
+            ["ai", "✦", "Inteligência artificial"],
+            ["images", "▧", "Fontes de imagem"],
+            ["library", "▦", "Biblioteca"],
+            ["overlay", "▣", "Overlay"],
+            ["compact", "⊡", "Modo compacto"],
+          ].map(([id, icon, label]) => `<button class="set-nav-btn ${settingsSection === id ? "active" : ""}" data-set-target="${id}">
+            <span>${icon}</span><span>${label}</span></button>`).join("")}
+        </nav>
+        <div class="settings-inner">
 
-        <section class="set-section">
+        <section class="set-section" id="set-account-section">
           <h3>Conta</h3>
           <div class="set-row">
             <div><div class="set-txt">RetroAchievements</div>
@@ -1107,7 +1175,7 @@ function renderSettings() {
           </div>
         </section>
 
-        <section class="set-section">
+        <section class="set-section" id="set-updates-section">
           <h3>Atualizações</h3>
           <div class="set-row">
             <div><div class="set-txt">DigiTracker ${esc(estado.version || S.version)}</div>
@@ -1150,7 +1218,7 @@ function renderSettings() {
             </div>` : `<p class="set-hint">Indisponível no modo demonstração.</p>`}
         </section>
 
-        <section class="set-section">
+        <section class="set-section" id="set-images-section">
           <h3>Fontes de imagem</h3>
           <p class="set-hint">Opcional. Liga o botão <b>Trocar arte</b> na tela do jogo: busca
             capas e fundos pelo nome, como no Playnite. Configure uma ou mais fontes — o seletor
@@ -1186,7 +1254,7 @@ function renderSettings() {
           </div>
         </section>
 
-        <section class="set-section">
+        <section class="set-section" id="set-library-section">
           <h3>Biblioteca</h3>
           ${chave("auto_import", "Importar jogos novos automaticamente",
                   "Verifica a cada 5 minutos e traz os jogos em que você começou a jogar",
@@ -1218,7 +1286,7 @@ function renderSettings() {
           </div>
         </section>
 
-        <section class="set-section">
+        <section class="set-section" id="set-compact-section">
           <h3>Modo compacto</h3>
           <p class="set-hint">Tamanho do overlay e quantas conquistas ele mostra. As
             "próximas" em <b>0</b> = mostra quantas couberem na altura; as "últimas obtidas"
@@ -1238,6 +1306,7 @@ function renderSettings() {
           </div>
         </section>
 
+        </div>
       </div>
     </div>
   </div>`;
@@ -1249,6 +1318,20 @@ function renderSettings() {
   });
   root.querySelectorAll("[data-prov]").forEach((b) => {
     b.onclick = () => { S.SET.ia.provider = b.dataset.prov; S.SET.ia.model = ""; renderSettings(); };
+  });
+  root.querySelectorAll("[data-set-target]").forEach((b) => {
+    b.onclick = () => {
+      const id = b.dataset.setTarget;
+      S.SET.section = id;
+      root.querySelectorAll(".set-nav-btn").forEach((item) => item.classList.toggle("active", item === b));
+      const section = id === "account" ? $("#set-account-section")
+        : id === "ai" ? $("#set-ai-section")
+        : id === "images" ? $("#set-images-section")
+        : id === "library" ? $("#set-library-section")
+        : id === "overlay" ? $("#set-overlay-section")
+        : $("#set-compact-section");
+      section?.scrollIntoView({ block: "start", behavior: "smooth" });
+    };
   });
   const salvar = $("#set-ai-save");
   if (salvar) salvar.onclick = () => salvarIa(null);
@@ -1264,7 +1347,10 @@ function renderSettings() {
   $("#overlay-test")?.addEventListener("click", testarOverlay);
   requestAnimationFrame(() => {
     const target = S.SET.section === "ai" ? $("#set-ai-section")
-      : S.SET.section === "overlay" ? $("#set-overlay-section") : null;
+      : S.SET.section === "overlay" ? $("#set-overlay-section")
+      : S.SET.section === "images" ? $("#set-images-section")
+      : S.SET.section === "library" ? $("#set-library-section")
+      : S.SET.section === "compact" ? $("#set-compact-section") : null;
     target?.scrollIntoView({ block: "start" });
     if (S.SET.section === "ai") $("#set-key")?.focus();
   });
@@ -2545,12 +2631,22 @@ function bindWindowControls() {
   });
   $("#btn-pin")?.classList.add("active");
   $("#btn-compact")?.addEventListener("click", () => toggleCompact());
+  $("#btn-library")?.addEventListener("click", () => {
+    const app = document.getElementById("app");
+    const open = app.classList.toggle("library-open");
+    $("#btn-library")?.setAttribute("aria-expanded", String(open));
+  });
   $("#btn-exit-demo")?.addEventListener("click", exitDemo);
   $("#btn-settings")?.addEventListener("click", () => {
     if (S.view === "settings") return enterDashboard();
     enterSettings();
   });
   bindAtalhos();
+}
+
+function closeLibraryDrawer() {
+  document.getElementById("app").classList.remove("library-open");
+  $("#btn-library")?.setAttribute("aria-expanded", "false");
 }
 
 /* ─────────────────────────  ATALHOS DE TECLADO  ─────────────────────────
@@ -2574,6 +2670,7 @@ function bindAtalhos() {
       if ($("#cv-modal")) return closeCoverPicker();
       if ($("#ai-modal")) return $("#ai-modal").remove();
       if ($("#update-modal")) return closeUpdateModal();
+      if (document.getElementById("app").classList.contains("library-open")) return closeLibraryDrawer();
       if (S.view === "settings") return leaveSettings();
       if (S.view !== "dashboard") return enterDashboard();
       if (S.compact) return toggleCompacto();

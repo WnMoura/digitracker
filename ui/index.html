@@ -7,22 +7,23 @@
   <!-- Fontes servidas do disco: o app é offline-first e não deve depender do
        CDN do Google para renderizar corretamente. -->
   <link rel="stylesheet" href="fonts.css" />
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=4" />
 </head>
 <body>
   <div id="app">
     <!-- Barra de título (frameless / arrastável) -->
     <div class="titlebar pywebview-drag-region">
       <span class="dot"></span>
+      <button class="win-btn library-btn" id="btn-library" title="Abrir biblioteca" aria-label="Abrir biblioteca" aria-expanded="false" hidden>☰</button>
       <span class="brand">DIGI<span>TRACKER</span></span>
       <span class="spacer"></span>
       <span class="sync-tag" id="sync-tag"></span>
       <div class="win-btns">
-        <button class="win-btn compact-btn" id="btn-compact" title="Modo compacto (overlay de progresso)">▣</button>
-        <button class="win-btn pin" id="btn-pin" title="Sempre por cima">📌</button>
-        <button class="win-btn" id="btn-settings" title="Configurações">⚙</button>
-        <button class="win-btn" id="btn-min" title="Minimizar">—</button>
-        <button class="win-btn close" id="btn-close" title="Fechar">✕</button>
+        <button class="win-btn compact-btn" id="btn-compact" title="Modo compacto (overlay de progresso)" aria-label="Modo compacto">▣</button>
+        <button class="win-btn pin" id="btn-pin" title="Sempre por cima" aria-label="Sempre por cima">📌</button>
+        <button class="win-btn" id="btn-settings" title="Configurações" aria-label="Configurações">⚙</button>
+        <button class="win-btn" id="btn-min" title="Minimizar" aria-label="Minimizar">—</button>
+        <button class="win-btn close" id="btn-close" title="Fechar" aria-label="Fechar">✕</button>
       </div>
     </div>
 
@@ -45,6 +46,6 @@
   </div>
 
   <div id="toast"></div>
-  <script src="app.js"></script>
+  <script src="app.js?v=4"></script>
 </body>
 </html>

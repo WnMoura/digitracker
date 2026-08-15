@@ -5,4 +5,4 @@ de publicar o executável. O atualizador também usa esta constante para compara
 a instalação local com a release estável mais recente.
 """
 
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.7.0"
