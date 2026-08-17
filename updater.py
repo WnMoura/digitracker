@@ -146,6 +146,10 @@ if errorlevel 1 (
   exit /b 11
 )
 
+rem PyInstaller 6.22+ validates the inherited onefile parent environment.
+rem The helper is intentionally a fresh launcher, so discard the old bootloader
+rem state before starting the replacement executable.
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
 start "" "%TARGET%"
 endlocal
 del /Q "%~f0" >nul 2>&1

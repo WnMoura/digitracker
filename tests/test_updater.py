@@ -154,6 +154,7 @@ def test_helper_tem_backup_rollback_e_reinicio(tmp_path):
     assert "move /Y \"%TARGET%\" \"%BACKUP%\"" in script
     assert "move /Y \"%BACKUP%\" \"%TARGET%\"" in script
     assert "start \"\" \"%TARGET%\"" in script
+    assert 'set "PYINSTALLER_RESET_ENVIRONMENT=1"' in script
     assert 'findstr /C:"%APP_PID%"' in script
 
 
