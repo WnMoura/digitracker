@@ -1,5 +1,8 @@
 # Dependências só para empacotar (não precisa para rodar via `python engine.py`).
-pyinstaller>=6.0
+# PyInstaller 6.22 introduced stricter inherited-parent validation in the
+# onefile bootloader. Keep the release build on the compatible line until all
+# installed versions have the reset-environment updater helper.
+pyinstaller>=6.0,<6.22
 
 # No Windows, o backend EdgeChromium do pywebview usa pythonnet (módulo clr).
 # Normalmente já vem com `pip install pywebview`, mas fixamos aqui por garantia.
