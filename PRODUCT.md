@@ -9,10 +9,16 @@ product
 web
 
 ## Users
-Um único usuário: o próprio autor, jogador de RetroAchievements focado em platinar jogos de Digimon em emulador enquanto escreve guias. O contexto de uso é durante o jogo — a janela fica always-on-top, sem moldura, grudada no canto da janela do emulador e consultada de relance entre uma conquista e outra. Não há multiusuário, contas nem público externo; é uma ferramenta pessoal.
+Jogadores que acompanham conquistas e walkthroughs em diferentes franquias,
+emuladores e plataformas. O contexto principal é durante o jogo: a janela fica
+always-on-top, grudada no emulador e consultada de relance. O produto é local-first
+e de usuário único, mas seus modelos de dados não podem depender de um jogo.
 
 ## Product Purpose
-Acompanhar o progresso das conquistas do RetroAchievements reordenadas pela ordem de um walkthrough, em vez da ordem padrão do site. Funciona como biblioteca de vários jogos, cada um com o progresso separado entre hardcore e softcore e o quanto falta para o Mastery. Cadastrar um jogo e importar guias acontece inteiramente pela interface, sem editar código. Sucesso é saber, sem sair do jogo, qual é a próxima conquista na ordem do guia e o quanto falta para o Mastery.
+Acompanhar progresso e transformar qualquer walkthrough em um guia compacto,
+visual e acionável. RetroAchievements é o primeiro provedor, não uma restrição
+arquitetural. Sucesso é saber, sem sair do jogo, qual é a próxima ação, quais
+riscos são perdíveis e o que cabe na sessão atual, sempre podendo conferir a fonte.
 
 ## Positioning
 Um HUD de conquistas que segue a ordem do seu guia, não a do site — e que vive por cima do emulador em vez de numa aba do navegador.

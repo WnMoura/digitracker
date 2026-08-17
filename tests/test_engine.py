@@ -103,6 +103,72 @@ class TestPickAccent:
         assert engine.Api._pick_accent("novo") in engine.ACCENTS
 
 
+class TestConsoleWindowAndArt:
+    def test_tamanho_adaptativo_tem_fallback_previsivel(self, monkeypatch):
+        monkeypatch.setattr(engine.sys, "platform", "linux")
+        assert engine.adaptive_normal_size() == (1296, 810)
+
+    @pytest.fixture
+    def api(self, tmp_path, monkeypatch):
+        for nome, sub in [
+            ("GAMES_DIR", "games"), ("CACHE_DIR", "cache"),
+            ("BADGES_DIR", "badges"), ("ICONS_DIR", "icons"),
+            ("ART_DIR", "art"), ("GUIDES_DIR", "guides"),
+            ("GUIDE_MEDIA_DIR", "guide-media"),
+        ]:
+            monkeypatch.setattr(engine, nome, tmp_path / sub)
+        monkeypatch.setattr(engine, "SECRETS_PATH", tmp_path / "secrets.json")
+        monkeypatch.setattr(engine, "SETTINGS_PATH", tmp_path / "settings.json")
+        return engine.Api()
+
+    @staticmethod
+    def _write_game(api, payload):
+        path = engine.GAMES_DIR / f"{payload['slug']}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_arte_manual_nunca_e_substituida(self, api, monkeypatch):
+        self._write_game(api, {
+            "slug": "jogo", "title": "Jogo", "art": {"background": "/manual.png"}
+        })
+        called = []
+        monkeypatch.setattr(api, "_search_source", lambda *args: called.append(args))
+        out = api.refresh_game_art("jogo", True)
+        assert out["status"] == "ready" and out["source"] == "manual"
+        assert called == []
+
+    def test_busca_automatica_persiste_origem_e_cache(self, api, monkeypatch):
+        path = self._write_game(api, {
+            "slug": "jogo", "title": "Jogo", "art": {"box": "/box.png"}
+        })
+        monkeypatch.setattr(api, "_source_ready", lambda source: source == "steamgriddb")
+        monkeypatch.setattr(api, "_search_source", lambda source, term: {
+            "ok": True, "heroes": [{"url": "https://cdn/hero.png"}]
+        })
+
+        def fake_download(_url, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"image")
+            return True
+
+        monkeypatch.setattr(engine.image_fetch, "download_image", fake_download)
+        api._enrich_game_art("jogo")
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["art"]["background"].startswith("/assets/art/jogo/background-auto.png")
+        assert saved["art_meta"]["background"]["origin"] == "steamgriddb"
+        assert saved["art_meta"]["background"]["manual"] is False
+
+    def test_sem_fonte_mantem_fallback_da_capa(self, api, monkeypatch):
+        path = self._write_game(api, {
+            "slug": "jogo", "title": "Jogo", "art": {"box": "/box.png"}
+        })
+        monkeypatch.setattr(api, "_source_ready", lambda _source: False)
+        api._enrich_game_art("jogo")
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["art"] == {"box": "/box.png"}
+        assert saved["art_meta"]["auto_status"] == "fallback"
+
+
 class TestSyncGameMastery:
     """O progresso deixou de ser curadoria Normal/Hard: hardcore e softcore vêm
     da RetroAchievements e são exclusivos entre si."""
@@ -619,7 +685,7 @@ class TestAtualizacoes:
         return engine.Api()
 
     def test_versao_aparece_no_estado(self, api):
-        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.7.0"
+        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.8.0"
 
     def test_verificacao_automatica_ligada_por_padrao(self, api):
         assert api.get_app_state()["auto_check_updates"] is True
@@ -632,6 +698,45 @@ class TestAtualizacoes:
         result = api.defer_update(24)
         assert result["remind_until"] > time.time()
         assert engine.load_settings()["update_remind_until"] == result["remind_until"]
+
+
+class TestConfiguracoesPorSessao:
+    @pytest.fixture
+    def api(self, tmp_path, monkeypatch):
+        for nome, sub in [("GAMES_DIR", "games"), ("CACHE_DIR", "cache"),
+                          ("BADGES_DIR", "badges"), ("ICONS_DIR", "icons"),
+                          ("ART_DIR", "art")]:
+            monkeypatch.setattr(engine, nome, tmp_path / sub)
+        monkeypatch.setattr(engine, "SECRETS_PATH", tmp_path / "secrets.json")
+        monkeypatch.setattr(engine, "SETTINGS_PATH", tmp_path / "settings.json")
+        return engine.Api()
+
+    def test_salva_sessao_de_experiencia_de_uma_vez(self, api):
+        result = api.set_settings_session("experience", {
+            "smart_guide_auto": False, "smart_guide_consent": True,
+            "guide_density": "compact", "ui_scale": 125,
+            "reduced_motion": True,
+        })
+        assert result["ok"] is True
+        settings = engine.load_settings()
+        assert settings["smart_guide_auto"] is False
+        assert settings["guide_density"] == "compact"
+        assert settings["ui_scale"] == 125
+
+    def test_recusa_campos_fora_da_sessao(self, api):
+        result = api.set_settings_session("library", {"ui_scale": 120})
+        assert result["ok"] is False
+
+    def test_limita_valores_do_modo_compacto(self, api):
+        result = api.set_settings_session("compact", {
+            "compact_width": 9999, "compact_height": 1,
+            "compact_last": -5, "compact_next": 99,
+        })
+        assert result["ok"] is True
+        assert result["compact_width"] == 640
+        assert result["compact_height"] == 150
+        assert result["compact_last"] == 0
+        assert result["compact_next"] == 10
 
 
 class TestCleanWalkthrough:
@@ -667,3 +772,50 @@ class TestSlugify:
     ])
     def test_slugify(self, titulo, esperado):
         assert engine.slugify(titulo) == esperado
+
+
+class TestGuiaInteligenteApi:
+    @pytest.fixture
+    def api(self, tmp_path, monkeypatch):
+        paths = {
+            "GAMES_DIR": tmp_path / "games", "CACHE_DIR": tmp_path / "cache",
+            "BADGES_DIR": tmp_path / "badges", "ICONS_DIR": tmp_path / "icons",
+            "ART_DIR": tmp_path / "art", "GUIDES_DIR": tmp_path / "guides",
+            "GUIDE_MEDIA_DIR": tmp_path / "guide-media",
+        }
+        for key, value in paths.items():
+            monkeypatch.setattr(engine, key, value)
+        monkeypatch.setattr(engine, "SECRETS_PATH", tmp_path / "secrets.json")
+        monkeypatch.setattr(engine, "SETTINGS_PATH", tmp_path / "settings.json")
+        api = engine.Api()
+        game = {
+            "slug": "jogo", "title": "Jogo", "platform": "Console", "accent": "#fff",
+            "retroachievements_game_id": 1, "walkthrough": [], "achievements_meta": {},
+            "guide": [{"num": "1", "title": "Começo", "blocks": [
+                {"type": "step", "text": "Abra a porta."},
+                {"type": "note", "text": "Salve antes."},
+            ]}],
+        }
+        paths["GAMES_DIR"].mkdir(parents=True, exist_ok=True)
+        (paths["GAMES_DIR"] / "jogo.json").write_text(
+            json.dumps(game, ensure_ascii=False), encoding="utf-8"
+        )
+        return api
+
+    def test_migra_sem_tocar_no_json_original(self, api):
+        before = (engine.GAMES_DIR / "jogo.json").read_text(encoding="utf-8")
+        bundle = api.get_smart_guide("jogo")
+        after = (engine.GAMES_DIR / "jogo.json").read_text(encoding="utf-8")
+        assert bundle["ok"] is True
+        assert bundle["current"]["provider"] == "local"
+        assert before == after
+        assert bundle["status"]["phase"] == "awaiting_consent"
+
+    def test_progresso_e_preferencias_persistem(self, api):
+        bundle = api.get_smart_guide("jogo")
+        block_id = bundle["current"]["chapters"][0]["blocks"][0]["id"]
+        result = api.update_guide_progress("jogo", "complete", block_id, True)
+        assert block_id in result["progress"]["completed"]
+        prefs = api.set_experience_preferences(consent=True, density="compact", ui_scale=125)
+        assert prefs["smart_guide_consent"] is True
+        assert prefs["guide_density"] == "compact" and prefs["ui_scale"] == 125

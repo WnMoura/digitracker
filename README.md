@@ -6,9 +6,23 @@ ordem de um walkthrough/guia** em vez da ordem padrão do site. Funciona como
 biblioteca: vários jogos cadastrados, cada um com o progresso separado entre
 **hardcore** e **softcore** e o quanto falta para o **Mastery**.
 
-Construído para acompanhar platinas de jogos de Digimon enquanto se cria guias
-em PDF — adicionar um jogo novo é feito **inteiramente pela interface**, sem
-editar código.
+Construído para acompanhar jogos de qualquer franquia e plataforma sem embutir
+regras específicas no núcleo. Adicionar jogos, importar fontes e organizar guias
+é feito **inteiramente pela interface**, sem editar código.
+
+## DigiTracker Console e Guia Inteligente (v0.8)
+
+- Interface híbrida DigiTracker/PSN/Steam Deck, responsiva e navegável por
+  mouse, teclado ou controle.
+- Guia em três modos: **Compacto**, **Completo** e **Fonte original**.
+- Fonte imutável, até dez revisões, restauração, favoritos, notas, spoilers,
+  checkpoints e planejador de sessão.
+- Organização genérica por IA: objetivos, checklists, avisos, perdíveis,
+  conquistas, desafios, tabelas, rotas e grafos — sem tipos de uma franquia.
+- Imagens de PDF, anexos locais, Openverse/Wikimedia com atribuição e diagramas
+  SVG gerados localmente a partir de JSON validado.
+- Pacotes `.dtguide` portáteis com fonte, revisões, mídia, atribuições e
+  progresso opcional.
 
 ## Stack
 
@@ -27,6 +41,9 @@ digitracker/
 ├── ra_api.py            # cliente da API da RetroAchievements
 ├── gamefaqs.py          # baixa guias do GameFAQs (cloudscraper)
 ├── guide_ai.py          # refino opcional por IA (Claude, Gemini ou compatível)
+├── smart_guide.py       # schema, revisões, progresso e pacotes portáteis
+├── guide_media.py       # PDF, busca licenciada, mídia local e diagramas
+├── platform_providers.py # contrato neutro; RetroAchievements é o 1º adaptador
 ├── guide_parser.py      # parsing do guia: PDF estruturado e FAQ de texto livre
 ├── emulator_tracker.py  # acha a janela do emulador (overlay gruda nela)
 ├── requirements.txt
@@ -109,12 +126,11 @@ manual: **nada é perdido**.
 > Uso pessoal e em volume baixo. O texto dos guias é de autoria de quem os
 > escreveu — fica no seu `config/games/{slug}.json`, não é para redistribuir.
 
-### Refinar com IA (opcional, provedor à sua escolha)
+### Organizar com IA (opcional, provedor à sua escolha)
 
-Depois de importar, aparece **"✨ Refinar com IA"**. Ele manda o guia + a lista
-de conquistas para o modelo escolhido e recebe de volta uma ordem mais fiel ao
-walkthrough e as dicas reorganizadas em seções limpas — o que antes você fazia à
-mão, agora dentro do app.
+Depois de importar, o app preserva a fonte, cria uma versão compacta local e,
+com consentimento, envia o texto ao modelo escolhido. A resposta vira uma nova
+revisão do Guia Inteligente somente depois de passar pelo schema genérico.
 
 **Você escolhe o provedor** no botão **⚙** ao lado:
 
@@ -163,7 +179,8 @@ simplesmente não casa — não há como a IA fabricar um id.
    dificuldade → similaridade (fuzzy) → com os **pontos** como desempate. Ao
    aplicar o PDF, as conquistas reconhecidas vão para o topo na ordem do guia e
    **as demais continuam logo abaixo na ordem do RA — nada é perdido**. A
-   leitura usa `pypdf` (só PDFs com texto; digitalizados/imagem não têm).
+   leitura usa `pypdf`. PDFs digitalizados recebem diagnóstico claro e podem
+   usar OCR local quando Tesseract, PyMuPDF e pytesseract estiverem disponíveis.
 
    O parser não é amarrado a um guia específico: o cabeçalho/rodapé repetido em
    cada página é descoberto **por repetição**, e a seção que lista as conquistas
@@ -195,15 +212,12 @@ No walkthrough, cada conquista obtida ganha um selo indicando em qual modo caiu.
 > o campo `mode` continuam carregando normalmente — o campo é simplesmente
 > ignorado.
 
-## Dicas & Tutoriais
+## Guia Inteligente
 
-Cada jogo tem três abas no painel: **Walkthrough** (a ordem das conquistas),
-**⚡ Mastery** (o recorte hardcore/softcore) e **Dicas & Tutoriais**. A última
-mostra o conteúdo de guia extraído do PDF —
-mecânicas básicas, escolha de personagem, estratégias de chefe, side quests,
-evoluções, itens e dicas avançadas — formatado em seções, passos, notas e
-cartões de chefe. É só preencher uma vez (ao usar "Ordenar pelo PDF"); o guia
-fica salvo junto do jogo em `config/games/{slug}.json`.
+Cada jogo tem três abas: **Walkthrough**, **Mastery** e **Guia Inteligente**.
+A última oferece leitura compacta, completa ou da fonte, sem alterar o arquivo
+original. Estado e revisões ficam em `config/guides/{slug}/`; mídia aprovada fica
+em `assets/guides/{slug}/` e é preservada pelo atualizador.
 
 ## Sincronização
 
@@ -236,10 +250,13 @@ A faixa no rodapé mostra os atalhos, e todos funcionam:
 
 | Tecla | O que faz |
 |---|---|
-| `↑` `↓` | Troca de jogo na biblioteca |
-| `Tab` | Alterna entre Walkthrough, Mastery e Dicas (`Shift+Tab` volta) |
+| Setas | Navegação espacial entre controles |
+| `[` `]` | Alterna entre Walkthrough, Mastery e Guia Inteligente |
 | `C` | Liga e desliga o modo compacto |
 | `Esc` | Fecha um painel, ou volta ao dashboard |
+
+Controles Xbox e PlayStation usam D-pad/analógico para navegar, A/Cross para
+selecionar, B/Circle para voltar e LB/RB para trocar as abas.
 
 ## Overlay que gruda no emulador
 

@@ -379,3 +379,39 @@ class TestConfiguracao:
     def test_schema_nao_aceita_campos_extras(self):
         """Campos livres abririam espaço para a IA inventar estrutura."""
         assert guide_ai.RESPONSE_SCHEMA["additionalProperties"] is False
+
+
+class TestGuiaInteligente:
+    @staticmethod
+    def resposta():
+        return json_mod.dumps({
+            "title": "Guia", "summary": "Resumo",
+            "chapters": [{
+                "id": "c1", "title": "Começo", "objective": "Avançar",
+                "estimated_minutes": 10,
+                "blocks": [{
+                    "id": "b1", "type": "objective", "title": "Porta",
+                    "text": "Abra a porta.", "items": [], "rows": [],
+                    "source_refs": [{"section": 1, "block": 1, "page": 0}],
+                    "visual_id": "", "estimated_minutes": 2,
+                }],
+            }],
+            "visual_suggestions": [],
+        })
+
+    def test_gera_documento_paralelo_generico(self, monkeypatch):
+        com_respostas(monkeypatch, openai_ok(self.resposta()))
+        source = [{"title": "Parte", "blocks": [{"type": "p", "text": "Abra a porta."}]}]
+        original = json_mod.loads(json_mod.dumps(source))
+        out = guide_ai.generate_smart_guide(
+            source, {"title": "Jogo", "platform": "Console", "achievements_meta": {}},
+            {"provider": "openai", "api_key": "k"},
+        )
+        assert source == original
+        assert out["chapters"][0]["blocks"][0]["type"] == "objective"
+        assert out["provider"] == "openai"
+
+    def test_schema_usa_apenas_blocos_neutros(self):
+        enum = set(guide_ai.SMART_BLOCK_SCHEMA["properties"]["type"]["enum"])
+        assert "digivolution" not in enum
+        assert {"graph", "route", "comparison", "missable"} <= enum

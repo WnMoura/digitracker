@@ -2,6 +2,8 @@ pywebview==5.4
 requests>=2.31
 # Leitura do PDF do guia para ordenar o walkthrough automaticamente.
 pypdf>=4.0
+# Decodificação das imagens incorporadas em PDFs para o Guia Inteligente.
+Pillow>=10.0
 # Importar guias direto do GameFAQs: curl_cffi imita o TLS de um Chrome atual;
 # cloudscraper fica como fallback e BeautifulSoup lê o HTML.
 curl_cffi>=0.16.0

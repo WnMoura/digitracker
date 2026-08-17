@@ -24,6 +24,7 @@ import json
 import requests
 
 import guide_parser
+import smart_guide
 
 MAX_TOKENS = 16000
 TIMEOUT = 300           # guias longos levam minutos
@@ -560,6 +561,163 @@ def refine_tips(sections: list, config: dict, progress=None) -> list:
 def translate(sections: list, config: dict, target: str = "português (Brasil)", progress=None) -> list:
     """Traduz as seções de dicas para `target`."""
     return _run_sections(sections, config, _translate_system(target), progress)
+
+
+# ---------------------------------------------------------------------------- #
+# Guia Inteligente: ao contrário do refino legado, pode reorganizar livremente
+# o conteúdo, mas só dentro de um vocabulário neutro e validado.
+# ---------------------------------------------------------------------------- #
+SMART_BLOCK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "type": {"type": "string", "enum": sorted(smart_guide.BLOCK_TYPES)},
+        "title": {"type": "string"}, "text": {"type": "string"},
+        "items": {"type": "array", "items": {"type": "string"}},
+        "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+        "source_refs": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "section": {"type": "integer"}, "block": {"type": "integer"},
+                "page": {"type": "integer"},
+            },
+            "required": ["section", "block", "page"], "additionalProperties": False,
+        }},
+        "visual_id": {"type": "string"}, "estimated_minutes": {"type": "integer"},
+    },
+    "required": ["id", "type", "title", "text", "items", "rows", "source_refs",
+                 "visual_id", "estimated_minutes"],
+    "additionalProperties": False,
+}
+
+SMART_GUIDE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"}, "summary": {"type": "string"},
+        "chapters": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"}, "title": {"type": "string"},
+                "objective": {"type": "string"}, "estimated_minutes": {"type": "integer"},
+                "blocks": {"type": "array", "items": SMART_BLOCK_SCHEMA},
+            },
+            "required": ["id", "title", "objective", "estimated_minutes", "blocks"],
+            "additionalProperties": False,
+        }},
+        "visual_suggestions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "type": {"type": "string", "enum": ["image", "route", "graph", "comparison", "table"]},
+                "chapter_id": {"type": "string"}, "title": {"type": "string"},
+                "reason": {"type": "string"}, "query": {"type": "string"},
+                "nodes": {"type": "array", "items": {
+                    "type": "object", "properties": {"id": {"type": "string"}, "label": {"type": "string"}},
+                    "required": ["id", "label"], "additionalProperties": False,
+                }},
+                "edges": {"type": "array", "items": {
+                    "type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "label": {"type": "string"}},
+                    "required": ["from", "to", "label"], "additionalProperties": False,
+                }},
+            },
+            "required": ["id", "type", "chapter_id", "title", "reason", "query", "nodes", "edges"],
+            "additionalProperties": False,
+        }},
+    },
+    "required": ["title", "summary", "chapters", "visual_suggestions"],
+    "additionalProperties": False,
+}
+
+SMART_GUIDE_SYSTEM = """Você é um editor de guias de videogame independente de
+franquia e plataforma. Transforme o material em capítulos curtos e acionáveis.
+Não invente fatos, rotas, requisitos, itens ou conquistas. Preserve detalhes que
+ajudam a jogar, mas remova índice, changelog, arte ASCII, créditos e repetição.
+
+Use tipos genéricos: objective/checklist para ações, warning para riscos,
+missable somente quando a fonte indicar que algo pode ser perdido, achievement
+para uma conquista real fornecida, challenge para chefes ou desafios, table e
+comparison para dados comparáveis, route/graph para relações e caminhos, note,
+resource, checkpoint, spoiler e text. Nunca crie um tipo ou regra específica de
+uma franquia. Mecânicas próprias do jogo devem virar texto, tabela ou grafo
+genérico de condições.
+
+Cada bloco deve citar source_refs com os números de seção e bloco recebidos.
+Sugira um visual somente quando ele reduzir ambiguidade; não anexe imagens nem
+invente mapas. Para route/graph, preencha nodes/edges apenas com relações que a
+fonte declara; para imagens use arrays vazios. O campo query será revisado pelo
+usuário antes de qualquer busca.
+Responda em português do Brasil, mantendo nomes próprios, itens, lugares e
+conquistas no idioma oficial da fonte. Retorne apenas o JSON do schema."""
+
+
+def _smart_payload(sections: list, game: dict) -> str:
+    source = []
+    for si, section in enumerate(sections, 1):
+        source.append({
+            "section": si, "title": section.get("title", ""),
+            "blocks": [{
+                "block": bi, "type": block.get("type", "p"),
+                "text": block.get("text", ""), "page": block.get("page") or section.get("page") or 0,
+            } for bi, block in enumerate(section.get("blocks") or [], 1)],
+        })
+    achievements = [{
+        "title": meta.get("title", ""), "description": meta.get("desc", ""),
+    } for meta in (game.get("achievements_meta") or {}).values()]
+    return json.dumps({
+        "game": {"title": game.get("title", ""), "platform": game.get("platform", "")},
+        "real_achievements": achievements, "source_sections": source,
+    }, ensure_ascii=False)
+
+
+def generate_smart_guide(sections: list, game: dict, config: dict, progress=None) -> dict:
+    """Gera um documento novo sem alterar as seções originais."""
+    if not sections:
+        raise GuideAIError("Este jogo não tem dicas para organizar.")
+    provider = (config.get("provider") or DEFAULT_PROVIDER).strip()
+    info = provider_info(provider)
+    api_key = (config.get("api_key") or "").strip()
+    if not api_key:
+        raise GuideAIError(f"Nenhuma chave configurada para {info['label']}.")
+    cfg = {
+        "api_key": api_key, "model": resolve_model(provider, config.get("model", "")),
+        "base_url": resolve_base_url(provider, config.get("base_url", "")),
+    }
+    batches = _section_batches(sections, max_chars=SECTIONS_BATCH_MAX_CHARS)
+    if progress:
+        progress(0, len(batches))
+    chapters, suggestions, summaries = [], [], []
+    offset = 0
+    for index, batch in enumerate(batches):
+        data = _CALLERS[provider](
+            cfg, SMART_GUIDE_SYSTEM, _smart_payload(batch, game), SMART_GUIDE_SCHEMA,
+        )
+        try:
+            clean = smart_guide.validate_document(data)
+        except smart_guide.SmartGuideError as exc:
+            raise GuideAIError(f"A IA devolveu um Guia Inteligente inválido: {exc}") from exc
+        for chapter in clean["chapters"]:
+            chapter["id"] = f"batch{index + 1}_{chapter['id']}"
+            for block in chapter["blocks"]:
+                block["id"] = f"batch{index + 1}_{block['id']}"
+                for ref in block.get("source_refs") or []:
+                    ref["section"] += offset
+            chapters.append(chapter)
+        for suggestion in clean.get("visual_suggestions") or []:
+            suggestion["id"] = f"batch{index + 1}_{suggestion['id']}"
+            suggestions.append(suggestion)
+        if clean.get("summary"):
+            summaries.append(clean["summary"])
+        offset += len(batch)
+        if progress:
+            progress(index + 1, len(batches))
+    document = smart_guide.validate_document({
+        "title": f"Guia Inteligente - {game.get('title') or 'Jogo'}",
+        "summary": " ".join(summaries)[:2_000], "chapters": chapters,
+        "visual_suggestions": suggestions,
+    })
+    document["provider"] = provider
+    document["model"] = cfg["model"]
+    return document
 
 
 def _apply(data: dict, achievements_meta: dict, faq_text: str) -> dict:

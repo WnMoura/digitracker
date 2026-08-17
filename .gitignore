@@ -25,3 +25,5 @@ venv/
 # PyInstaller (digitracker.spec é versionado de propósito)
 build/
 dist/
+build-check/
+dist-check/

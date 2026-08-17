@@ -38,6 +38,7 @@ hiddenimports += ["clr", "clr_loader", "pythonnet", "proxy_tools"]
 
 # pypdf: leitura do PDF do guia (ordenar walkthrough). Garante os submódulos.
 hiddenimports += collect_submodules("pypdf")
+hiddenimports += collect_submodules("PIL")
 
 # curl_cffi inclui a libcurl nativa que imita o TLS de um Chrome atual;
 # cloudscraper fica como fallback. collect_all inclui DLLs e módulos dinâmicos.

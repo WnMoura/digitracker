@@ -120,7 +120,7 @@ const S = {
   library: [],
   libraryQuery: "",
   activeSlug: null,
-  tab: "walk",           // aba do painel: 'walk' | 'tips'
+  tab: "tips",           // aba do painel: overview | walk | mastery | tips
   onTop: true,
   compact: false,        // modo mini-overlay (progresso de conquistas)
   cwTab: "walk",         // aba do overlay compacto: 'walk' (conquistas) | 'tips'
@@ -139,6 +139,17 @@ const S = {
   aiModel: "",
   tipsAI: null,          // progresso persistente da tradução/melhoria das dicas
   tipsAIPolling: false,
+  guideMode: "compact", // compact | full | source
+  guideQuery: "",
+  guideFilter: "all",
+  smartGuideAuto: true,
+  smartGuideConsent: false,
+  guideDensity: "comfortable",
+  uiScale: 100,
+  reducedMotion: false,
+  gamepadLoop: null,
+  gamepadLast: {},
+  smartStatuses: {},
   overlayExitFullscreen: false,  // mandar Alt+Enter ao detectar tela cheia exclusiva
   overlaySecondScreen: false,    // levar o overlay para o monitor livre
   overlayFitEmulator: true,      // dimensionar o overlay conforme a janela do emulador
@@ -157,7 +168,12 @@ const hasBackend = () => typeof window.pywebview !== "undefined" && window.pyweb
 
 const backend = {
   async appState() {
-    if (S.mode === "demo") return { configured: true };
+    if (S.mode === "demo") return {
+      configured: true, version: "0.8.0", auto_import: true,
+      auto_overlay: true, auto_check_updates: true,
+      smart_guide_auto: true, smart_guide_consent: false,
+      guide_density: "comfortable", ui_scale: 100, reduced_motion: false,
+    };
     return window.pywebview.api.get_app_state();
   },
   async library() {
@@ -286,6 +302,53 @@ const backend = {
     if (S.mode === "demo") return { ok: true, phase: "idle" };
     return window.pywebview.api.get_game_tips_ai_status();
   },
+  async smartGuide(slug) {
+    if (S.mode === "demo") return { ok: true };
+    return window.pywebview.api.get_smart_guide(slug);
+  },
+  async startSmartGuide(slug, force = false) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.start_smart_guide(slug, !!force);
+  },
+  async smartGuideStatus(slug) {
+    if (S.mode === "demo") return { ok: true, phase: "idle" };
+    return window.pywebview.api.get_smart_guide_status(slug);
+  },
+  async cancelSmartGuide(slug) { return window.pywebview.api.cancel_smart_guide(slug); },
+  async updateGuideProgress(slug, action, blockId, value) {
+    if (S.mode === "demo") return { ok: true };
+    return window.pywebview.api.update_guide_progress(slug, action, blockId || "", value);
+  },
+  async restoreSmartGuide(slug, revisionId) {
+    return window.pywebview.api.restore_smart_guide_revision(slug, revisionId);
+  },
+  async searchGuideMedia(query, source) {
+    return window.pywebview.api.search_guide_media(query, source || "openverse");
+  },
+  async approveGuideMedia(slug, candidate, confirmed = false) {
+    return window.pywebview.api.approve_guide_media(slug, candidate, !!confirmed);
+  },
+  async addGuideMedia(slug, data, filename, title = "") {
+    return window.pywebview.api.add_guide_media(slug, data, filename, title);
+  },
+  async createGuideDiagram(slug, spec) {
+    return window.pywebview.api.create_guide_diagram(slug, spec);
+  },
+  async broadMediaSearch(query) { return window.pywebview.api.open_broad_media_search(query); },
+  async setExperience(cfg) {
+    if (S.mode === "demo") return { ok: true, ...cfg };
+    return window.pywebview.api.set_experience_preferences(
+      cfg.smart_auto ?? null, cfg.consent ?? null, cfg.density || "",
+      cfg.ui_scale ?? null, cfg.reduced_motion ?? null);
+  },
+  async setSettingsSession(section, payload) {
+    if (S.mode === "demo") return { ok: true, section, ...payload };
+    return window.pywebview.api.set_settings_session(section, payload || {});
+  },
+  async exportGuidePack(slug, includeProgress = true) {
+    return window.pywebview.api.export_guide_pack(slug, !!includeProgress);
+  },
+  async importGuidePack(slug, data) { return window.pywebview.api.import_guide_pack(slug, data); },
   async getAiConfig() {
     if (S.mode === "demo") return { ok: false };
     return window.pywebview.api.get_ai_config();
@@ -313,6 +376,14 @@ const backend = {
   async setGameCover(slug, url, role) {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
     return window.pywebview.api.set_game_cover(slug, url, role || "cover");
+  },
+  async refreshGameArt(slug, force = false) {
+    if (S.mode === "demo") return { ok: true, status: "ready", art: DEMO_GAME(slug)?.art || {} };
+    return window.pywebview.api.refresh_game_art(slug, force);
+  },
+  async gameArtStatus(slug) {
+    if (S.mode === "demo") return { ok: true, status: "ready" };
+    return window.pywebview.api.get_art_enrichment_status(slug);
   },
   async clearGameCover(slug, role) {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
@@ -639,6 +710,19 @@ function cwRow(a, locked) {
 
 /* Aba Dicas do overlay: as seções do guia importado, roláveis. */
 function cwTipsHTML(game) {
+  const smart = game.smart_guide || {};
+  const next = smart.next_objective || {};
+  if (next.block_id) {
+    const current = smart.current || {};
+    const chapter = (current.chapters || []).find((c) => c.id === next.chapter_id) || {};
+    const block = (chapter.blocks || []).find((b) => b.id === next.block_id) || {};
+    const warning = (chapter.blocks || []).find((b) => ["warning", "missable"].includes(b.type) && !(smart.effective_progress?.completed || []).includes(b.id));
+    const previous = (smart.progress?.history || []).slice(-1)[0]?.block_id || "";
+    return `<div class="cw-smart"><p class="cw-sec-label">PRÓXIMO OBJETIVO</p><h3>${esc(next.title)}</h3><p>${esc(next.text)}</p>
+      ${(block.items || []).slice(0, 4).map((item) => `<div class="cw-check">□ ${esc(item.text)}</div>`).join("")}
+      ${warning ? `<div class="cw-warning">! ${esc(warning.title || warning.text)}</div>` : ""}
+      <div class="cw-objective-actions">${previous ? `<button data-cw-undo="${esc(previous)}">← Voltar</button>` : ""}<button class="cw-complete" data-cw-complete="${esc(next.block_id)}">Concluir e avançar</button></div></div>`;
+  }
   const secs = game.guide || [];
   if (!secs.length) {
     return `<p class="cw-empty-sm">Sem dicas importadas para este jogo.<br>Importe um guia na tela completa.</p>`;
@@ -656,6 +740,12 @@ function bindCompact() {
   makeDraggable(root.querySelector(".cw-head"));
   root.querySelectorAll("[data-cwtab]").forEach((b) =>
     b.addEventListener("click", () => { S.cwTab = b.dataset.cwtab; renderDashboard({ force: true }); }));
+  $("[data-cw-complete]")?.addEventListener("click", async (e) => {
+    await atualizarGuia("complete", e.currentTarget.dataset.cwComplete, true);
+  });
+  $("[data-cw-undo]")?.addEventListener("click", async (e) => {
+    await atualizarGuia("complete", e.currentTarget.dataset.cwUndo, false);
+  });
 }
 
 function switchCompactGame(dir) {
@@ -735,13 +825,17 @@ function sidebarHTML() {
         <div class="tile-bar"><i style="width:${m.percent || 0}%"></i></div>
         <div class="tile-num">${m.hardcore || 0} / ${m.total || 0} · ${m.percent || 0}%</div>
       </div>
+      <span class="tile-star" aria-hidden="true">${isMastered(g) ? "★" : "☆"}</span>
     </button>`;
   };
   return `<button class="library-scrim" id="library-scrim" aria-label="Fechar biblioteca"></button>
   <aside class="sidebar" aria-label="Biblioteca de jogos">
+    <div class="console-brand pywebview-drag-region">
+      <span>DigiTracker</span>
+      <button class="console-search-button" type="button" title="Buscar na biblioteca" aria-label="Buscar na biblioteca">⌕</button>
+    </div>
     <div class="sidebar-head">
-      <div class="sidebar-title-row"><h2>BIBLIOTECA</h2><span class="library-count">${S.library.length}</span></div>
-      <p>${S.library.length} ${S.library.length === 1 ? "jogo" : "jogos"} no ecossistema</p>
+      <div class="sidebar-title-row"><h2>BIBLIOTECA</h2><span class="library-chevron">⌄</span></div>
       <label class="library-search" title="Buscar na biblioteca">
         <span aria-hidden="true">⌕</span>
         <input id="library-search" type="search" placeholder="Buscar jogo" value="${esc(S.libraryQuery)}" aria-label="Buscar jogo na biblioteca">
@@ -770,59 +864,113 @@ function mainHTML(game) {
   const le = game.last_earned;
   const tips = (game.guide || []).length;
   const mst = game.mastery || {};
+  const smart = game.smart_guide || {};
+  const next = smart.next_objective || {};
+  const smartDoc = smart.current || {};
+  const smartProgress = smart.effective_progress || smart.progress || {};
+  const smartBlocks = (smartDoc.chapters || []).flatMap((c) => c.blocks || []);
+  const completedSmart = new Set(smartProgress.completed || []);
+  const smartDone = completedSmart.size;
+  const pendingBlocks = smartBlocks.filter((b) => !completedSmart.has(b.id));
+  const nextSteps = pendingBlocks.filter((b) => ["objective", "checklist", "checkpoint", "challenge"].includes(b.type)).slice(0, 3);
+  const pendingMissables = pendingBlocks.filter((b) => b.type === "missable");
+  const missables = pendingMissables.length;
+  const firstMissable = pendingMissables[0] || {};
+  const personalNotes = Object.keys(smartProgress.notes || {}).length;
+  const sessionMinutes = smartProgress.session_minutes || 30;
 
   const cor = corDe(game);
   const arte = game.art || {};
   // Fundo da lista: o wallpaper escolhido (art.background) tem prioridade;
   // depois a capa; e por fim o screenshot in-game, como antes. Uma imagem
   // escolhida ganha a classe .escolhida (mais visível), o screenshot fica sutil.
-  const fundo = arte.background || arte.cover || arte.ingame;
+  const fundo = arte.background || arte.title || arte.ingame || arte.cover || arte.box;
   const escolhido = arte.background || arte.cover;
+  const heroArt = arte.background || arte.title || arte.ingame || arte.cover || arte.box;
   return `<main class="main" data-scroll="main" style="--jogo:${cor}">
     ${fundo ? `<div class="game-bg ${escolhido ? "escolhida" : ""}" style="background-image:url('${esc(fundo)}')"></div>` : ""}
     <div class="game-glow"></div>
     <div class="panel-head">
       <div class="hero">
-        ${arte.title ? `<div class="hero-art" style="background-image:url('${esc(arte.title)}')"></div>` : ""}
+        ${heroArt ? `<div class="hero-art" style="background-image:url('${esc(heroArt)}')"></div>` : ""}
         <div class="hero-scrim"></div>
-        <button class="cover-btn" id="btn-cover" title="Escolher a capa no SteamGridDB">🖼 Trocar capa</button>
+        <button class="cover-btn" id="btn-cover" title="Escolher capa ou fundo">▧ Trocar arte</button>
         <div class="hero-txt">
           <div class="hero-identity">
-            <div class="hero-cover ${arte.box ? "has-art" : ""}">
-              ${arte.box ? `<img src="${esc(arte.box)}" alt="Capa de ${esc(game.title)}">` : `<span>${esc(initials(game.title))}</span>`}
-            </div>
             <div class="head-info">
               <h1>${esc(game.title)}</h1>
-              <p class="plat">${esc(game.platform)}</p>
-              <p class="total">${e}<small>/${t}</small>
-                <small class="sep">obtidas</small>
-                <span class="mst">${mst.percent || 0}% rumo ao Mastery</span></p>
+              <p class="plat"><span>▷</span>${esc(game.genre || "Aventura")} <i>•</i> ${esc(game.platform)} ${game.year ? `<i>•</i> ${esc(game.year)}` : ""} <i>•</i> ${game.players ? esc(game.players) : "1 jogador"}</p>
             </div>
           </div>
-          <div class="hero-bar" title="Progresso de Mastery: ${mst.hardcore || 0} de ${t} em hardcore">
-            <i style="width:${mst.percent || 0}%"></i>
+          <div class="hero-insights">
+            <div class="hero-progress-card">
+              <span>PROGRESSO</span>
+              <div><strong>${mst.percent || pct || 0}%</strong><small>${mst.hardcore || 0}/${t}</small></div>
+              <div class="hero-bar" title="Progresso de Mastery: ${mst.hardcore || 0} de ${t} em hardcore">
+                <i style="width:${mst.percent || 0}%"></i>
+              </div>
+            </div>
+            ${le ? `<div class="hero-achievement-card">
+              <span class="spark">✦</span>
+              <div><small>CONQUISTA RECENTE</small><strong>${esc(le.name)}</strong><p>${esc(le.desc)}</p></div>
+            </div>` : `<div class="hero-achievement-card empty"><span class="spark">◇</span><div><small>PRÓXIMA CONQUISTA</small><strong>Continue sua jornada</strong><p>O progresso aparecerá aqui.</p></div></div>`}
           </div>
+          <button class="hero-continue" data-jump-guide="${esc(next.block_id || "")}"><span>Continuar</span><b>→</b></button>
         </div>
       </div>
-      <div class="chips-row">
-        ${Object.entries(game.modes).map(([k, v]) => modeChip(k, v.earned, v.total)).join("")}
-      </div>
-      ${le ? `<div class="last-earned">
-        <span class="spark">✦</span>
-        <div class="le-body">
-          <p class="le-label">ÚLTIMA CONQUISTA OBTIDA</p>
-          <p class="le-name">${esc(le.name)}</p>
-          <p class="le-desc">${esc(le.desc)}</p>
-        </div>
-        <span class="le-date">${esc(le.date)}</span>
-      </div>` : ""}
     </div>
     <div class="panel-tabs">
-      <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk">Walkthrough</button>
-      <button class="ptab ${S.tab === "mastery" ? "active" : ""}" data-tab="mastery">Mastery${mst.softcore_only ? `<span class="count">${mst.softcore_only}</span>` : ""}</button>
-      <button class="ptab ${S.tab === "tips" ? "active" : ""}" data-tab="tips">Dicas${tips ? `<span class="count">${tips}</span>` : ""}</button>
+      <span class="tab-bumper">LB</span>
+      <button class="ptab ${S.tab === "overview" ? "active" : ""}" data-tab="overview"><b>▦</b> Visão geral</button>
+      <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk"><b>⚑</b> Walkthrough</button>
+      <button class="ptab ${S.tab === "mastery" ? "active" : ""}" data-tab="mastery"><b>♜</b> Conquistas${mst.softcore_only ? `<span class="count">${mst.softcore_only}</span>` : ""}</button>
+      <button class="ptab ${S.tab === "tips" ? "active" : ""}" data-tab="tips"><b>✦</b> Guia Inteligente${(smartDoc.chapters || []).length ? `<span class="count">${smartDoc.chapters.length}</span>` : tips ? `<span class="count">${tips}</span>` : ""}</button>
+      <span class="tab-bumper">RB</span>
     </div>
-    ${S.tab === "tips" ? guideHTML(game) : S.tab === "mastery" ? masteryHTML(game) : walkHTML(game)}
+    ${S.tab === "tips" ? `<div class="guide-commandbar dashboard-commandbar">
+      <label class="guide-search"><span>⌕</span><input id="guide-search" value="${esc(S.guideQuery)}" placeholder="Buscar no guia"></label>
+      <div class="segmented" role="tablist">${[["compact","Compacto"],["full","Completo"],["source","Fonte"]].map(([id,label]) => `<button class="${S.guideMode === id ? "on" : ""}" data-guide-mode="${id}">${label}</button>`).join("")}</div>
+      <select id="guide-filter" aria-label="Filtrar guia"><option value="all">Tudo</option><option value="pending">Pendentes</option><option value="missable">Perdíveis</option><option value="warning">Avisos</option><option value="favorites">Favoritos</option><option value="achievement">Conquistas</option></select>
+      <select id="guide-session" aria-label="Tempo da sessão">${[15,30,45,60,90,120].map((m) => `<option value="${m}" ${Number(sessionMinutes) === m ? "selected" : ""}>${m} min</option>`).join("")}</select>
+    </div>` : ""}
+    ${["tips", "overview"].includes(S.tab) ? `<section class="activity-deck hybrid-dashboard" aria-label="Continuar jogando">
+      <div class="activity-main-grid">
+        <button class="activity-card primary" data-jump-guide="${esc(next.block_id || "")}">
+          <span class="activity-kicker">CONTINUAR DE ONDE PAREI</span>
+          <div class="activity-title-row"><span class="activity-icon">◎</span><div><small>OBJETIVO ATUAL</small><strong>${esc(next.title || (smartDoc.chapters?.length ? "Escolha o próximo objetivo" : "Importe um guia para começar"))}</strong></div></div>
+          <span>${esc(next.text || next.chapter || "O DigiTracker reúne sua próxima ação aqui.")}</span>
+          <i>Ver detalhes do objetivo <b>→</b></i>
+        </button>
+        <div class="activity-card session">
+          <span class="activity-kicker">◷ SESSÃO DE ${sessionMinutes} MIN</span>
+          <strong>${sessionMinutes} min</strong><span>Sessão planejada</span>
+          <i><small>FOCO DA SESSÃO</small>${esc(next.chapter || next.title || "avançar no guia")}</i>
+        </div>
+        <div class="activity-card steps">
+          <span class="activity-kicker">PRÓXIMOS PASSOS</span>
+          <ul>${nextSteps.length ? nextSteps.map((b, i) => `<li class="${i ? "" : "done"}">${esc(b.title || b.text || `Passo ${i + 1}`)}</li>`).join("") : `<li>Organize o guia para receber os próximos passos.</li>`}</ul>
+          <i>${smartDone} concluídos <b>→</b></i>
+        </div>
+        <div class="guide-progress-strip">
+          <span class="progress-trophy">♜</span><div><small>PROGRESSO DE CONQUISTAS</small><strong>${e}/${t} (${pct}%)</strong></div>
+          <div class="guide-progress-bar"><i style="width:${pct}%"></i></div><span>${Math.max(0, t - e)} restantes</span><b>→</b>
+        </div>
+      </div>
+      <aside class="activity-side-grid">
+        <div class="activity-card missable ${missables ? "warn" : "clear"}">
+          <span class="activity-kicker">△ PERDÍVEL</span>
+          <div><strong>${missables}</strong><span>${missables === 1 ? " perdível nesta seção" : " perdíveis pendentes"}</span></div>
+          <p>${esc(firstMissable.title || firstMissable.text || "Nenhum alerta crítico para o próximo objetivo.")}</p>
+          <i>Ver detalhes <b>→</b></i>
+        </div>
+        <button class="activity-card personal-notes" data-jump-guide="${esc(next.block_id || "")}">
+          <span class="activity-kicker">✎ MINHAS ANOTAÇÕES</span>
+          <p>${personalNotes ? `${personalNotes} ${personalNotes === 1 ? "anotação pessoal salva" : "anotações pessoais salvas"}.` : "Adicione suas anotações pessoais sobre estratégias, itens ou lembretes aqui."}</p>
+          <i><b>→</b></i>
+        </button>
+      </aside>
+    </section>` : ""}
+    ${S.tab === "tips" ? guideHTML(game) : S.tab === "mastery" ? masteryHTML(game) : S.tab === "overview" ? guideHTML(game) : walkHTML(game)}
   </main>`;
 }
 
@@ -916,68 +1064,120 @@ function walkHTML(game) {
 /* Renderiza as seções de dicas/tutoriais extraídas do PDF do guia. */
 function guideHTML(game) {
   const secs = game.guide || [];
+  const bundle = game.smart_guide || {};
+  const doc = bundle.current || {};
+  const progress = bundle.effective_progress || bundle.progress || {};
+  const completed = new Set(progress.completed || []);
+  const favorites = new Set(progress.favorites || []);
+  const revealed = new Set(progress.revealed_spoilers || []);
+  const notes = progress.notes || {};
+  const media = bundle.media || [];
+  const mediaById = new Map(media.map((m) => [m.id, m]));
+  const status = S.smartStatuses[S.activeSlug] || bundle.status || {};
+  const mode = S.guideMode || "compact";
+  const query = S.guideQuery.trim().toLocaleLowerCase("pt-BR");
+  const filter = S.guideFilter || "all";
   const importBtn = S.mode === "demo" ? "" : secs.length ? `
-    <details class="guide-more">
-      <summary aria-label="Mais opções de importação">Importar/substituir <span>⌄</span></summary>
+    <details class="guide-more"><summary>Importar/substituir <span>⌄</span></summary>
       <div class="guide-more-menu">
-        <button class="guide-menu-btn" id="guide-gamefaqs"><span>◎</span><span><b>GameFAQs</b><small>Buscar um guia online</small></span></button>
-        <button class="guide-menu-btn" id="guide-import"><span>▤</span><span><b>Arquivo PDF</b><small>Usar um guia local</small></span></button>
-      </div>
-    </details>` : `
+        <button class="guide-menu-btn" id="guide-gamefaqs"><span>◎</span><span><b>GameFAQs</b><small>Buscar guia online</small></span></button>
+        <button class="guide-menu-btn" id="guide-import"><span>▤</span><span><b>Arquivo PDF</b><small>Texto e imagens locais</small></span></button>
+      </div></details>` : `
     <div class="guide-empty-actions">
       <button class="guide-import-card primary" id="guide-gamefaqs"><span class="guide-import-icon">◎</span><span><b>Importar do GameFAQs</b><small>Busque e escolha um guia online</small></span><span class="guide-arrow">→</span></button>
-      <button class="guide-import-card" id="guide-import"><span class="guide-import-icon">▤</span><span><b>Importar arquivo PDF</b><small>Use um guia salvo no computador</small></span><span class="guide-arrow">→</span></button>
+      <button class="guide-import-card" id="guide-import"><span class="guide-import-icon">▤</span><span><b>Importar arquivo PDF</b><small>Inclui imagens incorporadas</small></span><span class="guide-arrow">→</span></button>
     </div>`;
-  // A ação fica visível mesmo sem chave: nesse caso ela leva diretamente à
-  // configuração, em vez de simplesmente "sumir" da interface.
-  const aiMeta = [S.aiProviderLabel, S.aiModel].filter(Boolean).join(" · ");
-  const task = S.tipsAI?.slug === S.activeSlug ? S.tipsAI : null;
-  const aiBusy = task?.phase === "running";
-  const aiProgress = task && task.phase !== "idle" ? `
-    <div class="guide-ai-status ${task.phase === "error" ? "err" : task.phase === "success" ? "ok" : ""}" role="status" aria-live="polite">
-      <span class="task-icon">${task.phase === "error" ? "!" : task.phase === "success" ? "✓" : "✦"}</span>
-      <div class="task-copy"><b>${task.phase === "running" ? "IA trabalhando no guia" : task.phase === "success" ? "Guia atualizado" : "Ação necessária"}</b>
-        <span>${esc(task.error || task.message || "Processando dicas…")}</span></div>
-      ${task.total ? `<div class="guide-ai-progress" aria-label="Progresso da IA"><span style="width:${Math.round(100 * (task.completed || 0) / task.total)}%"></span></div>` : ""}
-    </div>` : "";
-  const aiBtns = (secs.length && S.mode !== "demo") ? `
-    <div class="guide-ai-meta"><span class="ai-dot"></span><span>${esc(aiMeta || "IA não configurada")}</span></div>
-    <div class="guide-actions">
-      <button class="guide-action ai" id="guide-refine" ${aiBusy ? "disabled" : ""}>${aiBusy && task.operation === "refine" ? "✦ Melhorando…" : "✦ Melhorar com IA"}</button>
-      <button class="guide-action" id="guide-translate" ${aiBusy ? "disabled" : ""}>${aiBusy && task.operation === "translate" ? "Traduzindo…" : "Traduzir PT-BR"}</button>
-      ${importBtn}
-    </div>
-    ${aiProgress}` : "";
-  if (!secs.length) {
-    return `<div class="list-wrap"><div class="guide-empty-state">
-      <span class="guide-empty-kicker">GUIA DO JOGO</span>
-      <h2>Comece pelas dicas certas</h2>
-      <p>Nenhuma dica foi importada. Adicione um guia sem alterar conquistas ou a ordem do walkthrough.</p>
-      ${importBtn}
-    </div></div>`;
-  }
-  const block = (b) => {
-    switch (b.type) {
-      case "boss":    return `<div class="g-boss">CHEFE: ${esc(b.text)}</div>`;
-      case "step":    return `<div class="g-step"><span class="g-step-n">#${b.n}</span> ${esc(b.text)}</div>`;
-      case "subhead": return `<div class="g-sub">${esc(b.text)}</div>`;
-      case "note":    return `<div class="g-note">${esc(b.text)}</div>`;
-      case "label":   return `<div class="g-row"><span class="g-lbl">${esc(b.label)}</span> ${esc(b.text)}</div>`;
-      case "li":      return `<div class="g-li">${esc(b.text)}</div>`;
-      default:        return `<p class="g-p">${esc(b.text)}</p>`;
-    }
+  if (!secs.length) return `<div class="list-wrap"><div class="guide-empty-state">
+    <span class="guide-empty-kicker">GUIA INTELIGENTE</span><h2>Transforme informação em próxima ação</h2>
+    <p>Importe qualquer detonado. A fonte permanece intacta e o DigiTracker cria uma versão compacta, pesquisável e reversível.</p>${importBtn}
+  </div></div>`;
+
+  const phaseClass = ["error", "cancelled"].includes(status.phase) ? "err"
+    : ["success", "ready"].includes(status.phase) ? "ok" : "";
+  const statusAction = status.phase === "awaiting_consent"
+    ? `<button class="guide-status-action" id="guide-consent">Revisar e ativar</button>`
+    : status.phase === "awaiting_configuration"
+      ? `<button class="guide-status-action" id="guide-config-ai">Configurar IA</button>`
+      : status.phase === "error"
+        ? `<button class="guide-status-action" id="guide-retry">Tentar novamente</button>` : "";
+  const statusHTML = status.phase && status.phase !== "idle" ? `<div class="guide-ai-status ${phaseClass}" role="status">
+    <span class="task-icon">${status.phase === "running" ? "✦" : status.phase === "error" ? "!" : "✓"}</span>
+      <div class="task-copy"><b>${status.phase === "running" ? "Organizando o guia" : status.phase === "queued" ? "Guia na fila de organização" : status.phase === "awaiting_consent" ? "Sua confirmação é necessária" : status.phase === "awaiting_configuration" ? "IA ainda não configurada" : status.phase === "error" ? "Não foi possível publicar" : "Guia protegido e versionado"}</b>
+      <span>${esc(status.error || status.message || "Fonte original preservada.")}</span></div>
+    ${status.total ? `<div class="guide-ai-progress"><span style="width:${Math.round(100 * (status.completed || 0) / status.total)}%"></span></div>` : ""}
+    ${statusAction}
+  </div>` : "";
+
+  const legacyBlock = (b) => {
+    const cls = { boss: "g-boss", step: "g-step", subhead: "g-sub", note: "g-note", label: "g-row", li: "g-li" }[b.type] || "g-p";
+    return `<div class="${cls}">${esc(b.text)}</div>`;
   };
-  const section = (s) => `<section class="g-section">
-    <p class="g-title">▸ ${esc(s.num)}. ${esc(s.title)}</p>
-    ${(s.blocks || []).map(block).join("")}
-  </section>`;
-  return `<div class="list-wrap guide-wrap">
-    <div class="guide-head">
-      <div class="guide-title-block"><p class="list-title">GUIA DO JOGO</p><h2>Dicas & tutoriais</h2>
-        <p>${secs.length} ${secs.length === 1 ? "seção importada" : "seções importadas"}</p></div>
-      ${aiBtns}
+  const sourceHTML = `<div class="source-notice"><strong>Fonte original</strong><span>Conteúdo importado sem reescrita. Sempre disponível para conferência.</span></div>
+    ${secs.map((s) => `<section class="g-section"><p class="g-title">${esc(s.num)}. ${esc(s.title)}</p>${(s.blocks || []).map(legacyBlock).join("")}</section>`).join("")}`;
+
+  const icon = { objective: "→", checklist: "✓", warning: "!", missable: "◆", achievement: "🏆", challenge: "⚔", table: "▦", comparison: "⇄", image: "▧", route: "↝", graph: "◇", note: "i", spoiler: "◉", resource: "＋", checkpoint: "◷", text: "·" };
+  const visibleTypes = new Set(["objective", "checklist", "warning", "missable", "achievement", "challenge", "checkpoint"]);
+  const blockVisible = (block) => {
+    if (mode === "compact" && !visibleTypes.has(block.type)) return false;
+    const hay = `${block.title || ""} ${block.text || ""} ${(block.items || []).map((i) => i.text).join(" ")}`.toLocaleLowerCase("pt-BR");
+    if (query && !hay.includes(query)) return false;
+    if (filter === "pending" && completed.has(block.id)) return false;
+    if (filter === "favorites" && !favorites.has(block.id)) return false;
+    if (filter !== "all" && !["pending", "favorites"].includes(filter) && block.type !== filter) return false;
+    return true;
+  };
+  const renderBlock = (block) => {
+    const done = completed.has(block.id), favorite = favorites.has(block.id);
+    const hiddenSpoiler = block.type === "spoiler" && !revealed.has(block.id);
+    const visual = mediaById.get(block.visual_id);
+    const items = (block.items || []).length ? `<ul>${block.items.map((item) => `<li>${esc(item.text)}</li>`).join("")}</ul>` : "";
+    const table = (block.rows || []).length ? `<div class="smart-table">${block.rows.map((row) => `<div>${row.map((cell) => `<span>${esc(cell)}</span>`).join("")}</div>`).join("")}</div>` : "";
+    const refs = (block.source_refs || []).length ? `<span class="smart-source">Fonte ${block.source_refs.map((r) => r.page ? `p.${r.page}` : `§${r.section}`).join(", ")}</span>` : "";
+    return `<article class="smart-block type-${block.type} ${done ? "done" : ""}" id="guide-${esc(block.id)}" data-guide-block="${esc(block.id)}">
+      <button class="smart-check" data-guide-action="complete" data-value="${!done}" aria-label="${done ? "Marcar pendente" : "Concluir"}">${done ? "✓" : icon[block.type] || "·"}</button>
+      <div class="smart-content">
+        <div class="smart-block-head"><span class="smart-type">${esc(block.type)}</span>${block.estimated_minutes ? `<span>◷ ${block.estimated_minutes} min</span>` : ""}${refs}</div>
+        ${block.title ? `<h4>${esc(block.title)}</h4>` : ""}
+        ${hiddenSpoiler ? `<button class="spoiler-cover" data-guide-action="reveal" data-value="true">Revelar spoiler</button>` : `<p>${esc(block.text)}</p>${items}${table}${visual ? `<figure><img src="${esc(visual.url)}" alt="${esc(visual.title || "Visual do guia")}"><figcaption>${esc(visual.attribution || visual.source_name || "")}</figcaption></figure>` : ""}`}
+        ${notes[block.id] ? `<div class="smart-note">Sua nota: ${esc(notes[block.id])}</div>` : ""}
+      </div>
+      <div class="smart-actions"><button data-guide-action="favorite" data-value="${!favorite}" title="Favoritar">${favorite ? "★" : "☆"}</button><button data-guide-note="${esc(block.id)}" title="Nota">＋</button></div>
+    </article>`;
+  };
+  const chaptersHTML = (doc.chapters || []).map((chapter, index) => {
+    const blocks = (chapter.blocks || []).filter(blockVisible);
+    if (!blocks.length) return "";
+    const done = (chapter.blocks || []).filter((b) => completed.has(b.id)).length;
+    return `<section class="smart-chapter"><header><span>${String(index + 1).padStart(2, "0")}</span><div><h3>${esc(chapter.title)}</h3><p>${esc(chapter.objective || "")}</p></div><b>${done}/${(chapter.blocks || []).length}</b></header>${blocks.map(renderBlock).join("")}</section>`;
+  }).join("");
+
+  const suggestions = (doc.visual_suggestions || []).filter((v) => v.status !== "rejected");
+  const visualHTML = mode === "full" && (suggestions.length || media.length) ? `<section class="visual-workbench">
+    <div><p class="list-title">RECURSOS VISUAIS</p><h3>Imagens e mapas com origem</h3></div>
+    ${suggestions.map((v) => `<button class="visual-suggestion" ${(["route","graph"].includes(v.type) && (v.nodes || []).length) ? `data-diagram-id="${esc(v.id)}"` : `data-media-query="${esc(v.query)}"`}><span>${icon[v.type] || "▧"}</span><b>${esc(v.title)}</b><small>${esc(v.reason)}</small><i>${(["route","graph"].includes(v.type) && (v.nodes || []).length) ? "Gerar diagrama →" : "Revisar busca →"}</i></button>`).join("")}
+    ${media.length ? `<div class="guide-gallery">${media.map((m) => `<figure><img src="${esc(m.url)}" alt=""><figcaption>${esc(m.title)} · ${esc(m.license || m.source_name)}</figcaption></figure>`).join("")}</div>` : ""}
+  </section>` : "";
+  const revisions = bundle.revisions || [];
+  const blockLookup = new Map((doc.chapters || []).flatMap((chapter) => (chapter.blocks || []).map((block) => [block.id, block.title || block.text || chapter.title])));
+  const revisionHTML = revisions.length ? `<details class="revision-panel"><summary>Histórico de versões (${revisions.length})</summary>${revisions.map((r, i) => `<div><span>${new Date((r.created_at || 0) * 1000).toLocaleString("pt-BR")} · ${esc(r.provider || "local")}</span>${i ? `<button data-restore-revision="${esc(r.revision_id)}">Restaurar</button>` : `<b>ATUAL</b>`}</div>`).join("")}</details>` : "";
+  const completionHistory = (progress.history || []).slice(-12).reverse();
+  const completionHTML = completionHistory.length ? `<details class="revision-panel"><summary>Histórico da jornada (${progress.history.length})</summary>${completionHistory.map((h) => `<div><span>${new Date((h.at || 0) * 1000).toLocaleString("pt-BR")} · ${esc(blockLookup.get(h.block_id) || "Etapa")}</span><b>${esc(h.action === "completed" ? "CONCLUÍDO" : h.action)}</b></div>`).join("")}</details>` : "";
+  const portabilityHTML = S.mode === "demo" ? "" : `<div class="guide-portability"><div><b>Pacote portátil</b><span>Fonte, revisões, atribuições, mídia e progresso opcional.</span></div><button id="guide-pack-export">Exportar</button><button id="guide-pack-import">Importar</button></div>`;
+  let sessionUsed = 0;
+  const sessionBlocks = (doc.chapters || []).flatMap((chapter) => (chapter.blocks || []).map((block) => ({ ...block, chapter: chapter.title })))
+    .filter((block) => !completed.has(block.id) && visibleTypes.has(block.type))
+    .filter((block) => { const minutes = block.estimated_minutes || 5; if (sessionUsed + minutes > (progress.session_minutes || 30)) return false; sessionUsed += minutes; return true; })
+    .slice(0, 6);
+  const sessionHTML = mode !== "source" && sessionBlocks.length ? `<aside class="session-plan"><div><span>SESSÃO DE ${progress.session_minutes || 30} MIN</span><b>${sessionBlocks.length} ações · ~${sessionUsed} min</b></div>${sessionBlocks.map((b) => `<button data-jump-block="${esc(b.id)}"><small>${esc(b.chapter)}</small><strong>${esc(b.title || b.text)}</strong></button>`).join("")}</aside>` : "";
+
+  return `<div class="list-wrap guide-wrap ${S.guideDensity === "compact" ? "density-compact" : ""}">
+    <div class="guide-console-head">
+      <div><p class="list-title">GUIA INTELIGENTE</p><h2>${esc(doc.title || "Guia estruturado")}</h2><p>${esc(doc.summary || "A fonte original está preservada e disponível a qualquer momento.")}</p></div>
+      <div class="guide-actions"><button class="guide-action ai" id="smart-generate" ${["running","queued"].includes(status.phase) ? "disabled" : ""}>✦ ${doc.provider && doc.provider !== "local" ? "Atualizar com IA" : "Organizar com IA"}</button>${importBtn}</div>
     </div>
-    ${secs.map(section).join("")}
+    ${statusHTML}
+    ${sessionHTML}${mode === "source" ? sourceHTML : (chaptersHTML || `<div class="guide-no-results">Nenhum bloco corresponde aos filtros.</div>`)}
+    ${visualHTML}${revisionHTML}${completionHTML}${portabilityHTML}
   </div>`;
 }
 
@@ -1004,6 +1204,107 @@ async function dicasIa(kind) {
   }
 }
 
+async function gerarSmartGuide() {
+  const slug = S.activeSlug;
+  if (!slug || S.mode === "demo") return;
+  if (!S.smartGuideConsent) {
+    toast("Revise e confirme o uso da IA primeiro.");
+    return enterSettings("experience", { slug, tab: "tips" });
+  }
+  if (!S.aiReady) {
+    toast("Configure uma chave de IA para continuar.");
+    return enterSettings("ai", { slug, tab: "tips" });
+  }
+  const res = await backend.startSmartGuide(slug, true).catch((e) => ({ ok: false, error: String(e) }));
+  if (!res?.ok) return toast(res?.error || res?.message || "Não foi possível iniciar.", true);
+  S.smartStatuses[slug] = res;
+  await renderDashboard({ force: true });
+  acompanharSmartGuide(slug);
+}
+
+async function acompanharSmartGuide(slug) {
+  while (S.view === "dashboard") {
+    const status = await backend.smartGuideStatus(slug).catch((e) => ({ phase: "error", error: String(e) }));
+    S.smartStatuses[slug] = status;
+    await renderDashboard({ force: true });
+    if (status.phase !== "running") {
+      if (status.phase === "success") toast("Guia Inteligente publicado.");
+      else if (status.phase === "error") toast(status.error || "Falha ao organizar o guia.", true);
+      if (status.phase === "success") {
+        delete S.smartStatuses[slug];
+        S.library = await backend.library();
+        await renderDashboard({ force: true });
+      }
+      break;
+    }
+    await esperar(800);
+  }
+}
+
+async function atualizarGuia(action, blockId, value) {
+  const res = await backend.updateGuideProgress(S.activeSlug, action, blockId, value)
+    .catch((e) => ({ ok: false, error: String(e) }));
+  if (!res?.ok) return toast(res?.error || "Não foi possível salvar.", true);
+  await renderDashboard({ force: true });
+}
+
+function openGuideMedia(query = "") {
+  S.GM = { query, source: "openverse", results: [], busy: false, error: "" };
+  renderGuideMedia();
+  if (query) searchGuideMedia();
+}
+
+function closeGuideMedia() { document.getElementById("guide-media-modal")?.remove(); S.GM = null; }
+
+function renderGuideMedia() {
+  let modal = document.getElementById("guide-media-modal");
+  if (!modal) { modal = document.createElement("div"); modal.id = "guide-media-modal"; modal.className = "modal-bg"; document.body.appendChild(modal); }
+  const G = S.GM;
+  modal.innerHTML = `<div class="gf-panel media-panel" role="dialog" aria-modal="true" aria-label="Recursos visuais do guia">
+    <div class="gf-head"><div><div class="gf-title">REVISAR RECURSO VISUAL</div><div class="gf-sub">Nada é anexado sem sua aprovação.</div></div><button class="gf-close" id="gm-x">✕</button></div>
+    <div class="gf-body"><div class="cv-sources"><button class="cv-src ${G.source === "openverse" ? "on" : ""}" data-gm-source="openverse">Openverse</button><button class="cv-src ${G.source === "wikimedia" ? "on" : ""}" data-gm-source="wikimedia">Wikimedia</button><button class="cv-src" id="gm-broad">Busca ampla ↗</button></div>
+      <div class="search-box"><span>⌕</span><input id="gm-q" value="${esc(G.query)}" placeholder="O que ajudaria a explicar esta etapa?"><button class="cv-go" id="gm-go">Buscar</button></div>
+      <div class="media-manual"><input id="gm-url" placeholder="Cole aqui a URL direta encontrada na busca ampla"><label><input id="gm-rights" type="checkbox"> Confirmo que posso usar esta imagem</label><button id="gm-url-save">Revisar e salvar URL</button></div>
+      <label class="media-local"><span>＋ Adicionar imagem local</span><input id="gm-file" type="file" accept="image/*"></label>
+      ${G.busy ? `<div class="status-msg">Buscando mídia com licença identificável…</div>` : ""}${G.error ? `<div class="gf-error">${esc(G.error)}</div>` : ""}
+      <div class="media-results">${G.results.map((m, i) => `<article><img src="${esc(m.thumbnail)}" alt=""><div><b>${esc(m.title)}</b><span>${esc(m.creator || "Autor desconhecido")}</span><small>${esc(m.license || "Licença não informada")}</small><button data-gm-approve="${i}">Aprovar e salvar</button></div></article>`).join("")}</div>
+    </div></div>`;
+  $("#gm-x").onclick = closeGuideMedia;
+  modal.querySelectorAll("[data-gm-source]").forEach((b) => b.onclick = () => { G.source = b.dataset.gmSource; renderGuideMedia(); searchGuideMedia(); });
+  $("#gm-go").onclick = () => { G.query = ($("#gm-q")?.value || "").trim(); searchGuideMedia(); };
+  $("#gm-q").onkeydown = (e) => { if (e.key === "Enter") { G.query = e.currentTarget.value.trim(); searchGuideMedia(); } };
+  $("#gm-broad").onclick = () => backend.broadMediaSearch(G.query || ($("#gm-q")?.value || ""));
+  $("#gm-url-save").onclick = async () => {
+    const url = ($("#gm-url")?.value || "").trim(), confirmed = !!$("#gm-rights")?.checked;
+    if (!url || !confirmed) return toast("Cole a URL e confirme o direito de uso.", true);
+    const res = await backend.approveGuideMedia(S.activeSlug, { source:"manual", url, title:"Imagem da busca ampla", creator:"", license:"Uso confirmado pelo usuário", provider:"Busca ampla", landing_url:url }, true);
+    if (!res?.ok) return toast(res?.error || "Falha ao salvar URL.", true);
+    closeGuideMedia(); toast("Imagem salva com confirmação de uso."); await renderDashboard({ force: true });
+  };
+  $("#gm-file").onchange = async (e) => {
+    const file = e.target.files?.[0]; if (!file) return;
+    const data = await fileToBase64(file);
+    const res = await backend.addGuideMedia(S.activeSlug, data, file.name, file.name);
+    if (!res?.ok) return toast(res?.error || "Falha ao anexar.", true);
+    closeGuideMedia(); toast("Imagem local adicionada."); await renderDashboard({ force: true });
+  };
+  modal.querySelectorAll("[data-gm-approve]").forEach((b) => b.onclick = async () => {
+    const candidate = G.results[Number(b.dataset.gmApprove)];
+    b.disabled = true; b.textContent = "Salvando…";
+    const res = await backend.approveGuideMedia(S.activeSlug, candidate, false);
+    if (!res?.ok) { b.disabled = false; b.textContent = "Aprovar e salvar"; return toast(res?.error || "Falha ao salvar.", true); }
+    closeGuideMedia(); toast("Imagem salva com atribuição."); await renderDashboard({ force: true });
+  });
+}
+
+async function searchGuideMedia() {
+  const G = S.GM; if (!G || !G.query) return;
+  G.busy = true; G.error = ""; renderGuideMedia();
+  const res = await backend.searchGuideMedia(G.query, G.source).catch((e) => ({ ok: false, error: String(e) }));
+  if (!S.GM) return;
+  G.busy = false; G.results = res?.results || []; G.error = res?.ok ? "" : (res?.error || "Falha na busca."); renderGuideMedia();
+}
+
 const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function acompanharDicasIa() {
@@ -1014,7 +1315,7 @@ async function acompanharDicasIa() {
       const status = await backend.gameTipsAIStatus();
       S.tipsAI = status;
       if (S.view === "dashboard") await renderDashboard({ force: true });
-      if (status.phase !== "running") {
+      if (!["running", "queued"].includes(status.phase)) {
         if (status.phase === "success") toast(status.message || "Dicas processadas com sucesso.");
         else if (status.phase === "error") toast(status.error || "Falha ao processar as dicas.", true);
         break;
@@ -1037,6 +1338,7 @@ function bindSidebar() {
     };
   });
   $("#library-scrim")?.addEventListener("click", closeLibraryDrawer);
+  $(".console-search-button")?.addEventListener("click", () => $("#library-search")?.focus());
   $("#library-search")?.addEventListener("input", (e) => {
     S.libraryQuery = e.currentTarget.value;
     const query = S.libraryQuery.trim().toLocaleLowerCase("pt-BR");
@@ -1053,8 +1355,42 @@ function bindSidebar() {
   root.querySelectorAll(".ptab").forEach((b) => {
     b.onclick = () => { S.tab = b.dataset.tab; renderDashboard(); };
   });
-  $("#guide-refine")?.addEventListener("click", () => dicasIa("refine"));
-  $("#guide-translate")?.addEventListener("click", () => dicasIa("translate"));
+  $("#smart-generate")?.addEventListener("click", gerarSmartGuide);
+  $("#guide-consent")?.addEventListener("click", () => enterSettings("experience", { slug: S.activeSlug, tab: "tips" }));
+  $("#guide-config-ai")?.addEventListener("click", () => enterSettings("ai", { slug: S.activeSlug, tab: "tips" }));
+  $("#guide-retry")?.addEventListener("click", gerarSmartGuide);
+  root.querySelectorAll("[data-guide-mode]").forEach((b) => b.onclick = () => { S.guideMode = b.dataset.guideMode; renderDashboard({ force: true }); });
+  $("#guide-search")?.addEventListener("input", (e) => {
+    S.guideQuery = e.currentTarget.value;
+    const q = S.guideQuery.trim().toLocaleLowerCase("pt-BR");
+    root.querySelectorAll(".smart-block").forEach((block) => { block.hidden = !!q && !block.textContent.toLocaleLowerCase("pt-BR").includes(q); });
+    root.querySelectorAll(".smart-chapter").forEach((chapter) => { chapter.hidden = !chapter.querySelector(".smart-block:not([hidden])"); });
+  });
+  const guideFilter = $("#guide-filter");
+  if (guideFilter) { guideFilter.value = S.guideFilter; guideFilter.onchange = () => { S.guideFilter = guideFilter.value; renderDashboard({ force: true }); }; }
+  $("#guide-session")?.addEventListener("change", (e) => atualizarGuia("session_minutes", "", Number(e.currentTarget.value)));
+  root.querySelectorAll("[data-jump-block]").forEach((b) => b.onclick = () => document.getElementById(`guide-${b.dataset.jumpBlock}`)?.scrollIntoView({ behavior: "smooth", block: "center" }));
+  root.querySelectorAll("[data-guide-action]").forEach((b) => b.onclick = () => atualizarGuia(
+    b.dataset.guideAction, b.closest("[data-guide-block]")?.dataset.guideBlock || "", b.dataset.value === "true"));
+  root.querySelectorAll("[data-guide-note]").forEach((b) => b.onclick = async () => {
+    const blockId = b.dataset.guideNote;
+    const text = window.prompt("Nota pessoal para este passo:", "");
+    if (text !== null) atualizarGuia("note", blockId, text);
+  });
+  root.querySelectorAll("[data-restore-revision]").forEach((b) => b.onclick = async () => {
+    const res = await backend.restoreSmartGuide(S.activeSlug, b.dataset.restoreRevision);
+    if (!res?.ok) return toast(res?.error || "Falha ao restaurar.", true);
+    toast("Versão restaurada sem apagar o histórico."); await renderDashboard({ force: true });
+  });
+  root.querySelectorAll("[data-media-query]").forEach((b) => b.onclick = () => openGuideMedia(b.dataset.mediaQuery));
+  root.querySelectorAll("[data-diagram-id]").forEach((b) => b.onclick = () => gerarDiagramaSugerido(b.dataset.diagramId));
+  $("#guide-pack-export")?.addEventListener("click", exportGuidePack);
+  $("#guide-pack-import")?.addEventListener("click", importGuidePack);
+  root.querySelectorAll("[data-jump-guide]").forEach((b) => b.onclick = () => {
+    S.tab = "tips"; S.guideMode = "compact"; renderDashboard({ force: true }).then(() => {
+      const id = b.dataset.jumpGuide; (id ? document.getElementById(`guide-${id}`) : $(".guide-console-head"))?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  });
   const gimport = $("#guide-import");
   if (gimport) gimport.onclick = attachGuide;
   const gfaqs = $("#guide-gamefaqs");
@@ -1104,13 +1440,53 @@ async function enterSettings(section = "", returnTo = null) {
     compact: compact && compact.ok ? compact : { width: 300, height: 232, last: 2, next: 0 },
     overlay,
     update,
-    section,
     returnTo,
+    section: section || readSettingsSection(),
+    drafts: {},
+    originals: {},
+    scroll: {},
   };
+  Object.keys(SETTINGS_META).forEach((id) => {
+    S.SET.drafts[id] = settingsSnapshot(id);
+    S.SET.originals[id] = cloneSettings(S.SET.drafts[id]);
+  });
   renderSettings();
 }
 
-async function leaveSettings() {
+async function exportGuidePack() {
+  const res = await backend.exportGuidePack(S.activeSlug, true).catch((e) => ({ ok: false, error: String(e) }));
+  if (!res?.ok) return toast(res?.error || "Falha ao exportar.", true);
+  const bytes = Uint8Array.from(atob(res.data), (c) => c.charCodeAt(0));
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([bytes], { type: "application/zip" }));
+  link.download = res.filename || `${S.activeSlug}.dtguide`;
+  link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  toast("Pacote do guia exportado.");
+}
+
+async function gerarDiagramaSugerido(id) {
+  const game = await backend.game(S.activeSlug);
+  const suggestion = (game?.smart_guide?.current?.visual_suggestions || []).find((v) => v.id === id);
+  if (!suggestion) return toast("Sugestão visual não encontrada.", true);
+  const res = await backend.createGuideDiagram(S.activeSlug, suggestion).catch((e) => ({ ok: false, error: String(e) }));
+  if (!res?.ok) return toast(res?.error || "Falha ao criar diagrama.", true);
+  toast("Diagrama seguro gerado localmente."); await renderDashboard({ force: true });
+}
+
+function importGuidePack() {
+  const input = document.createElement("input"); input.type = "file"; input.accept = ".dtguide,application/zip";
+  input.onchange = async () => {
+    const file = input.files?.[0]; if (!file) return;
+    const data = await fileToBase64(file);
+    const res = await backend.importGuidePack(S.activeSlug, data).catch((e) => ({ ok: false, error: String(e) }));
+    if (!res?.ok) return toast(res?.error || "Pacote inválido.", true);
+    toast("Pacote importado com sucesso."); await renderDashboard({ force: true });
+  };
+  input.click();
+}
+
+async function leaveSettings(force = false) {
+  if (!force && settingsDirty()) return showPendingSettingsModal(null);
   const back = S.SET && S.SET.returnTo;
   if (back) {
     S.activeSlug = back.slug || S.activeSlug;
@@ -1119,241 +1495,167 @@ async function leaveSettings() {
   await enterDashboard();
 }
 
+const SETTINGS_META = {
+  account: ["◉", "Conta e atualizações", "Conta conectada, versão instalada e atualizações estáveis."],
+  experience: ["◈", "Interface e guias", "Aparência, densidade e comportamento do Guia Inteligente."],
+  ai: ["✦", "Inteligência artificial", "Provedor, modelo e credenciais usados para organizar seus guias."],
+  images: ["▧", "Fontes de imagem", "Serviços opcionais para capas, fundos e arte dos jogos."],
+  library: ["▦", "Biblioteca", "Como novos jogos entram automaticamente na sua biblioteca."],
+  overlay: ["▣", "Overlay", "Detecção do emulador, encaixe e diagnóstico em tempo real."],
+  compact: ["⊡", "Modo compacto", "Tamanho e quantidade de informações exibidas no overlay."],
+};
+
+const cloneSettings = (value) => JSON.parse(JSON.stringify(value || {}));
+const settingsLocalKey = "digitracker.settings.section";
+function readSettingsSection() { try { return localStorage.getItem(settingsLocalKey) || "account"; } catch (_) { return "account"; } }
+function writeSettingsSection(id) { try { localStorage.setItem(settingsLocalKey, id); } catch (_) {} }
+
+function settingsSnapshot(section) {
+  const e = S.SET.estado || {};
+  const cc = S.SET.compact || {};
+  if (section === "account") return { auto_check_updates: !!e.auto_check_updates };
+  if (section === "experience") return {
+    smart_guide_auto: !!e.smart_guide_auto, smart_guide_consent: !!e.smart_guide_consent,
+    reduced_motion: !!e.reduced_motion, guide_density: e.guide_density || "comfortable",
+    ui_scale: Number(e.ui_scale || 100),
+  };
+  if (section === "library") return { auto_import: !!e.auto_import };
+  if (section === "overlay") return {
+    auto_overlay: !!e.auto_overlay, overlay_exit_fullscreen: !!e.overlay_exit_fullscreen,
+    overlay_second_screen: !!e.overlay_second_screen, overlay_fit_emulator: !!e.overlay_fit_emulator,
+  };
+  if (section === "compact") return {
+    compact_width: Number(cc.width || 300), compact_height: Number(cc.height || 232),
+    compact_last: Number(cc.last || 2), compact_next: Number(cc.next || 0),
+  };
+  if (section === "ai") return {
+    provider: S.SET.ia?.provider || "", model: S.SET.ia?.model || "", base_url: S.SET.ia?.base_url || "",
+    api_key: "", clear_key: false,
+  };
+  if (section === "images") return {
+    steamgriddb: { key1: "", key2: "", clear: false }, rawg: { key1: "", key2: "", clear: false },
+    igdb: { key1: "", key2: "", clear: false },
+  };
+  return {};
+}
+
+function settingsHasChanges(section) {
+  const draft = S.SET?.drafts?.[section];
+  const original = S.SET?.originals?.[section];
+  return JSON.stringify(draft || {}) !== JSON.stringify(original || {});
+}
+function settingsDirty() { return !!S.SET && settingsHasChanges(S.SET.section); }
+function settingsToggle(key, value, label, sub) {
+  return `<div class="set-row"><div><div class="set-txt">${esc(label)}</div><div class="set-sub">${esc(sub)}</div></div>
+    <button class="switch ${value ? "on" : ""}" data-draft-toggle="${key}" role="switch" aria-checked="${!!value}" aria-label="${esc(label)}"></button></div>`;
+}
+function settingsPanelFrame(id, body) {
+  const meta = SETTINGS_META[id];
+  const dirty = settingsHasChanges(id);
+  return `<section class="settings-panel" data-settings-panel="${id}" aria-labelledby="settings-panel-title">
+    <div class="settings-panel-head"><div><div class="settings-kicker">${meta[0]} CONFIGURAÇÕES / ${esc(meta[1].toUpperCase())}</div>
+      <h2 id="settings-panel-title">${esc(meta[1])}</h2><p>${esc(meta[2])}</p></div>
+      <span class="settings-panel-state ${dirty ? "dirty" : ""}" id="settings-state">${dirty ? "Alterações pendentes" : "Tudo salvo"}</span></div>
+    <div class="settings-panel-scroll" id="settings-panel-scroll">${body}</div>
+    <div class="settings-panel-actions"><button class="btn-ghost" id="settings-discard" ${dirty ? "" : "disabled"}>Descartar</button>
+      <button class="btn-primary" id="settings-save" ${dirty ? "" : "disabled"}>Salvar alterações</button></div>
+  </section>`;
+}
+
 function renderSettings() {
-  $("#btn-library").hidden = true;
-  closeLibraryDrawer();
-  const { estado, ia, sources, compact, overlay, update } = S.SET;
-  const prov = ia && (ia.providers.find((p) => p.id === ia.provider) || ia.providers[0]);
-  const ready = sources || {};
-  const cc = compact || { width: 300, height: 232, last: 2, next: 0 };
-  const ov = overlay || {};
+  $("#btn-library").hidden = true; closeLibraryDrawer();
+  const id = S.SET.section || "account";
+  const { estado, ia, sources, overlay, update } = S.SET;
+  const draft = S.SET.drafts[id] || (S.SET.drafts[id] = settingsSnapshot(id));
+  if (!S.SET.originals[id]) S.SET.originals[id] = cloneSettings(draft);
+  const ov = overlay || {}, ready = sources || {}, up = update || {};
   const ovRect = Array.isArray(ov.rect) ? ov.rect.join(", ") : "—";
-  const ovState = ov.detected
-    ? `${esc(ov.process || "processo desconhecido")} · ${esc(ov.title || "sem título")}`
-    : (ov.error ? esc(ov.error) : "Nenhum emulador detectado agora");
-  const up = update || {};
-  const upText = up.update_available
-    ? `Versão ${esc(up.latest_version)} disponível`
-    : (up.phase === "error" ? esc(up.error || "Falha ao consultar") : "Você está na versão atual");
-  const settingsSection = S.SET.section || "account";
+  const ovState = ov.detected ? `${esc(ov.process || "processo desconhecido")} · ${esc(ov.title || "sem título")}` : (ov.error ? esc(ov.error) : "Nenhum emulador detectado agora");
+  const upText = up.update_available ? `Versão ${esc(up.latest_version)} disponível` : (up.phase === "error" ? esc(up.error || "Falha ao consultar") : "Você está na versão atual");
+  const field = (key, value, type = "text", extra = "") => `<input class="set-field" data-draft-field="${key}" type="${type}" value="${esc(value ?? "")}" ${extra} />`;
+  const panel = id === "account" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Conta conectada</h3><div class="set-row"><div><div class="set-txt">RetroAchievements</div><div class="set-sub">${estado.username ? esc(estado.username) : "não conectada"}</div></div><button class="btn-ghost" id="set-reconnect">Trocar conta</button></div></div>
+    <div class="settings-card"><h3>Atualizações</h3><div class="set-row"><div><div class="set-txt">DigiTracker ${esc(estado.version || S.version)}</div><div class="set-sub">${upText}</div></div><button class="btn-ghost" id="set-update-check">Procurar agora</button></div>${settingsToggle("auto_check_updates", draft.auto_check_updates, "Procurar atualizações ao iniciar", "Apenas releases estáveis; a instalação sempre pede confirmação")}</div>`)
+  : id === "experience" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Experiência DigiTracker Console</h3><p class="set-hint">Combina a apresentação cinematográfica da PSN, a navegação do Steam Deck e a identidade do DigiTracker. O Guia Inteligente nunca apaga sua fonte importada.</p>${settingsToggle("smart_guide_auto", draft.smart_guide_auto, "Organizar guias automaticamente", "Depois de cada importação, cria uma revisão compacta e validada")}${settingsToggle("smart_guide_consent", draft.smart_guide_consent, "Permitir envio do guia à IA", "O provedor configurado pode cobrar pelo processamento. Imagens pesquisadas continuam exigindo aprovação")}${settingsToggle("reduced_motion", draft.reduced_motion, "Reduzir animações", "Remove transições de profundidade e movimentos não essenciais")}</div><div class="settings-card"><div class="experience-grid"><div><label class="set-label">Densidade</label><select class="set-field" data-draft-field="guide_density"><option value="comfortable" ${draft.guide_density === "comfortable" ? "selected" : ""}>Confortável adaptável</option><option value="compact" ${draft.guide_density === "compact" ? "selected" : ""}>Compacta</option></select></div><div><label class="set-label">Escala da interface: <b id="settings-scale-label">${draft.ui_scale}%</b></label><input class="set-range" data-draft-field="ui_scale" type="range" min="80" max="140" step="5" value="${draft.ui_scale}"></div></div></div>`)
+  : id === "ai" ? settingsPanelFrame(id, ia ? `<div class="settings-card"><h3>Provedor ativo</h3><div class="ai-providers">${ia.providers.map((p) => `<button class="ai-prov ${p.id === draft.provider ? "on" : ""}" data-settings-provider="${esc(p.id)}"><span class="ai-prov-name">${esc(p.label)}</span>${p.has_key ? `<span class="ai-prov-ok">✓ chave salva</span>` : ""}</button>`).join("")}</div></div><div class="settings-card"><label class="set-label">Chave da API${(ia.providers.find((p) => p.id === draft.provider) || {}).has_key ? " (salva — deixe em branco para manter)" : ""}</label>${field("api_key", "", "password", `placeholder="${((ia.providers.find((p) => p.id === draft.provider) || {}).has_key) ? "••••••••••••••••" : "cole a chave aqui"}" autocomplete="off"`)}<button class="btn-ghost settings-inline-action ${draft.clear_key ? "selected" : ""}" data-ai-clear>${draft.clear_key ? "Chave será removida" : "Remover chave salva"}</button><label class="set-label">Modelo</label>${field("model", draft.model, "text", "autocomplete=off")}${(ia.providers.find((p) => p.id === draft.provider) || {}).needs_base_url ? `<label class="set-label">Endpoint (OpenRouter, Ollama, LM Studio…)</label>${field("base_url", draft.base_url, "text", "autocomplete=off")}` : ""}<p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.</p></div>` : `<div class="settings-card"><h3>Inteligência artificial</h3><p class="set-hint">Indisponível no modo demonstração.</p></div>`)
+  : id === "images" ? settingsPanelFrame(id, `<p class="set-hint settings-intro">Configure as fontes opcionais de capas e fundos. As credenciais só serão enviadas quando você salvar esta sessão.</p>${[["steamgriddb","SteamGridDB","Capas da comunidade.",ready.steamgriddb],["rawg","RAWG","Fundos e screenshots para jogos retrô.",ready.rawg],["igdb","IGDB","Capas de qualidade via Twitch.",ready.igdb]].map(([key,label,sub,has]) => `<div class="src-cfg settings-card"><h3>${label} ${has ? "✓" : ""}</h3><p class="set-hint">${sub}</p>${field(`${key}.key1`, "", key === "igdb" ? "text" : "password", `placeholder="${has ? "•••••••• (salva — em branco mantém)" : (key === "igdb" ? "Twitch Client ID" : "chave da API")}" autocomplete="off"`)}${key === "igdb" ? field(`${key}.key2`, "", "password", `placeholder="${has ? "•••• (segredo salvo — em branco mantém)" : "Twitch Client Secret"}" autocomplete="off"`) : ""}<button class="btn-ghost settings-inline-action ${draft[key].clear ? "selected" : ""}" data-source-clear="${key}">${draft[key].clear ? "Fonte será removida" : "Remover credencial salva"}</button></div>`).join("")}`)
+  : id === "library" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Entrada de jogos</h3>${settingsToggle("auto_import", draft.auto_import, "Importar jogos novos automaticamente", "Verifica a cada 5 minutos e traz os jogos em que você começou a jogar")}</div>`)
+  : id === "overlay" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Comportamento</h3>${settingsToggle("auto_overlay", draft.auto_overlay, "Grudar no emulador", "Vira overlay e acompanha a janela quando um emulador abre")}${settingsToggle("overlay_exit_fullscreen", draft.overlay_exit_fullscreen, "Sair do fullscreen exclusivo", "Manda Alt+Enter para o emulador quando autorizado")}${settingsToggle("overlay_second_screen", draft.overlay_second_screen, "Usar o segundo monitor", "Leva o overlay para a tela que o jogo não ocupa")}${settingsToggle("overlay_fit_emulator", draft.overlay_fit_emulator, "Ajustar ao tamanho do emulador", "Mantém o overlay proporcional à janela do emulador")}</div><div class="overlay-diag settings-card ${ov.detected ? "ok" : ""}"><h3>Diagnóstico de detecção</h3><div class="set-sub">${ovState}</div><div class="overlay-diag-grid"><span>Área interna</span><code>${esc(ovRect)}</code><span>Overlay</span><code>${esc((ov.overlay_size || []).join(" × ") || "—")}</code><span>Posição</span><code>${esc((ov.dock || []).join(", ") || "—")}</code></div><button class="btn-ghost" id="overlay-test">Testar detecção agora</button></div>`)
+  : settingsPanelFrame(id, `<div class="settings-card"><h3>Dimensões e conteúdo</h3><p class="set-hint">Defina o tamanho do overlay e quantas conquistas ele mostra.</p><div class="set-grid2"><div><label class="set-label">Largura (px)</label>${field("compact_width", draft.compact_width, "number", "min=240 max=640")}</div><div><label class="set-label">Altura (px)</label>${field("compact_height", draft.compact_height, "number", "min=150 max=900")}</div><div><label class="set-label">Últimas obtidas</label>${field("compact_last", draft.compact_last, "number", "min=0 max=10")}</div><div><label class="set-label">Próximas (0 = auto)</label>${field("compact_next", draft.compact_next, "number", "min=0 max=10")}</div></div></div>`);
 
-  const chave = (id, txt, sub, ligado) => `
-    <div class="set-row">
-      <div><div class="set-txt">${esc(txt)}</div><div class="set-sub">${esc(sub)}</div></div>
-      <button class="switch ${ligado ? "on" : ""}" data-toggle="${id}" role="switch"
-              aria-checked="${!!ligado}" aria-label="${esc(txt)}"></button>
-    </div>`;
-
-  root.innerHTML = `<div class="view">
-    <div class="wiz-head">
-      <button class="back" id="set-back" title="Voltar">←</button>
-      <div><div class="t">Configurações</div>
-      <div class="s">Conta, inteligência artificial, biblioteca e overlay</div></div>
-    </div>
-    <div class="settings">
-      <div class="settings-shell">
-        <nav class="settings-nav" aria-label="Categorias das configurações">
-          <p>Preferências</p>
-          ${[
-            ["account", "◉", "Conta e atualizações"],
-            ["ai", "✦", "Inteligência artificial"],
-            ["images", "▧", "Fontes de imagem"],
-            ["library", "▦", "Biblioteca"],
-            ["overlay", "▣", "Overlay"],
-            ["compact", "⊡", "Modo compacto"],
-          ].map(([id, icon, label]) => `<button class="set-nav-btn ${settingsSection === id ? "active" : ""}" data-set-target="${id}">
-            <span>${icon}</span><span>${label}</span></button>`).join("")}
-        </nav>
-        <div class="settings-inner">
-
-        <section class="set-section" id="set-account-section">
-          <h3>Conta</h3>
-          <div class="set-row">
-            <div><div class="set-txt">RetroAchievements</div>
-            <div class="set-sub">${estado.username ? esc(estado.username) : "não conectada"}</div></div>
-            <button class="btn-ghost" id="set-reconnect">Trocar conta</button>
-          </div>
-        </section>
-
-        <section class="set-section" id="set-updates-section">
-          <h3>Atualizações</h3>
-          <div class="set-row">
-            <div><div class="set-txt">DigiTracker ${esc(estado.version || S.version)}</div>
-            <div class="set-sub">${upText}</div></div>
-            <button class="btn-ghost" id="set-update-check">Procurar agora</button>
-          </div>
-          ${chave("auto_check_updates", "Procurar atualizações ao iniciar",
-                  "Apenas releases estáveis; a instalação sempre pede confirmação",
-                  S.autoCheckUpdates)}
-        </section>
-
-        <section class="set-section" id="set-ai-section">
-          <h3>Inteligência artificial</h3>
-          <p class="set-hint">Opcional. Refina o guia importado do GameFAQs: reordena as
-            conquistas pelo walkthrough e organiza as dicas. Cobrado pelo provedor que você
-            escolher; sem chave, a importação continua funcionando pela heurística.</p>
-          ${ia ? `
-            <div class="ai-providers">
-              ${ia.providers.map((p) => `
-                <button class="ai-prov ${p.id === ia.provider ? "on" : ""}" data-prov="${esc(p.id)}">
-                  <span class="ai-prov-name">${esc(p.label)}</span>
-                  ${p.has_key ? `<span class="ai-prov-ok">✓ chave salva</span>` : ""}
-                </button>`).join("")}
-            </div>
-            <label class="set-label" for="set-key">Chave da API${prov.has_key ? " (salva — deixe em branco para manter)" : ""}</label>
-            <input class="set-field" id="set-key" type="password" autocomplete="off" spellcheck="false"
-                   placeholder="${prov.has_key ? "••••••••••••••••" : "cole a chave aqui"}" />
-            <label class="set-label" for="set-model">Modelo</label>
-            <input class="set-field" id="set-model" autocomplete="off" spellcheck="false"
-                   value="${esc(ia.model || "")}" placeholder="${esc(prov.default_model)}" />
-            ${prov.needs_base_url ? `
-              <label class="set-label" for="set-base">Endpoint (OpenRouter, Ollama, LM Studio…)</label>
-              <input class="set-field" id="set-base" autocomplete="off" spellcheck="false"
-                     value="${esc(ia.base_url || "")}" placeholder="${esc(prov.default_base_url || "")}" />` : ""}
-            <p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.
-              Obter em <span class="ai-link">${esc(prov.key_url || "")}</span></p>
-            <div style="display:flex;gap:8px">
-              <button class="btn-primary" id="set-ai-save">Salvar</button>
-              <button class="btn-ghost" id="set-ai-clear">Remover chave</button>
-            </div>` : `<p class="set-hint">Indisponível no modo demonstração.</p>`}
-        </section>
-
-        <section class="set-section" id="set-images-section">
-          <h3>Fontes de imagem</h3>
-          <p class="set-hint">Opcional. Liga o botão <b>Trocar arte</b> na tela do jogo: busca
-            capas e fundos pelo nome, como no Playnite. Configure uma ou mais fontes — o seletor
-            deixa alternar entre elas. As chaves ficam só em <code>config/secrets.json</code>.</p>
-
-          <div class="src-cfg">
-            <label class="set-label" for="src-steamgriddb">SteamGridDB${ready.steamgriddb ? " ✓" : ""}</label>
-            <input class="set-field" id="src-steamgriddb" type="password" autocomplete="off" spellcheck="false"
-                   placeholder="${ready.steamgriddb ? "••••••••  (salva — em branco mantém)" : "chave da API"}" />
-            <p class="set-hint">Capas da comunidade. Obter em <span class="ai-link">steamgriddb.com/profile/preferences/api</span></p>
-            <div class="src-btns"><button class="btn-primary" data-src-save="steamgriddb">Salvar</button>
-              <button class="btn-ghost" data-src-clear="steamgriddb">Remover</button></div>
-          </div>
-
-          <div class="src-cfg">
-            <label class="set-label" for="src-rawg">RAWG${ready.rawg ? " ✓" : ""}</label>
-            <input class="set-field" id="src-rawg" type="password" autocomplete="off" spellcheck="false"
-                   placeholder="${ready.rawg ? "••••••••  (salva — em branco mantém)" : "chave da API"}" />
-            <p class="set-hint">Base gigante, ótima para retrô (fundos/screenshots). Obter em <span class="ai-link">rawg.io/apidocs</span></p>
-            <div class="src-btns"><button class="btn-primary" data-src-save="rawg">Salvar</button>
-              <button class="btn-ghost" data-src-clear="rawg">Remover</button></div>
-          </div>
-
-          <div class="src-cfg">
-            <label class="set-label" for="src-igdb-id">IGDB${ready.igdb ? " ✓" : ""}</label>
-            <input class="set-field" id="src-igdb-id" autocomplete="off" spellcheck="false"
-                   placeholder="${ready.igdb ? "•••• (Client ID salvo — em branco mantém)" : "Twitch Client ID"}" />
-            <input class="set-field" id="src-igdb-secret" type="password" autocomplete="off" spellcheck="false"
-                   style="margin-top:6px" placeholder="${ready.igdb ? "•••• (Client Secret salvo — em branco mantém)" : "Twitch Client Secret"}" />
-            <p class="set-hint">Capas de qualidade (retrô). Crie um app em <span class="ai-link">dev.twitch.tv/console/apps</span> e use o Client ID + Secret.</p>
-            <div class="src-btns"><button class="btn-primary" data-src-save="igdb">Salvar</button>
-              <button class="btn-ghost" data-src-clear="igdb">Remover</button></div>
-          </div>
-        </section>
-
-        <section class="set-section" id="set-library-section">
-          <h3>Biblioteca</h3>
-          ${chave("auto_import", "Importar jogos novos automaticamente",
-                  "Verifica a cada 5 minutos e traz os jogos em que você começou a jogar",
-                  S.autoImport)}
-        </section>
-
-        <section class="set-section" id="set-overlay-section">
-          <h3>Overlay</h3>
-          ${chave("auto_overlay", "Grudar no emulador",
-                  "Vira overlay e acompanha a janela quando um emulador abre", S.autoOverlay)}
-          ${chave("overlay_exit_fullscreen", "Sair do fullscreen exclusivo",
-                  "Manda Alt+Enter para o emulador. Nenhum overlay aparece sobre tela cheia exclusiva, então esta é a única forma de continuar vendo o progresso num monitor só",
-                  S.overlayExitFullscreen)}
-          ${chave("overlay_second_screen", "Usar o segundo monitor",
-                  "Com dois monitores, leva o overlay para a tela que o jogo não ocupa",
-                  S.overlaySecondScreen)}
-          ${chave("overlay_fit_emulator", "Ajustar ao tamanho do emulador",
-                  "Grudado, o overlay fica proporcional à janela do emulador (cresce em jogo grande, encolhe em janela pequena). Desligado, usa o tamanho manual da seção Modo compacto",
-                  S.overlayFitEmulator)}
-          <div class="overlay-diag ${ov.detected ? "ok" : ""}">
-            <div class="set-txt">Diagnóstico de detecção</div>
-            <div class="set-sub">${ovState}</div>
-            <div class="overlay-diag-grid">
-              <span>Área interna</span><code>${esc(ovRect)}</code>
-              <span>Overlay</span><code>${esc((ov.overlay_size || []).join(" × ") || "—")}</code>
-              <span>Posição</span><code>${esc((ov.dock || []).join(", ") || "—")}</code>
-            </div>
-            <button class="btn-ghost" id="overlay-test">Testar detecção agora</button>
-          </div>
-        </section>
-
-        <section class="set-section" id="set-compact-section">
-          <h3>Modo compacto</h3>
-          <p class="set-hint">Tamanho do overlay e quantas conquistas ele mostra. As
-            "próximas" em <b>0</b> = mostra quantas couberem na altura; as "últimas obtidas"
-            ficam fixas nesse número.</p>
-          <div class="set-grid2">
-            <div><label class="set-label" for="cc-w">Largura (px)</label>
-              <input class="set-field" id="cc-w" type="number" min="240" max="640" value="${cc.width}" /></div>
-            <div><label class="set-label" for="cc-h">Altura (px)</label>
-              <input class="set-field" id="cc-h" type="number" min="150" max="900" value="${cc.height}" /></div>
-            <div><label class="set-label" for="cc-last">Últimas obtidas</label>
-              <input class="set-field" id="cc-last" type="number" min="0" max="10" value="${cc.last}" /></div>
-            <div><label class="set-label" for="cc-next">Próximas (0 = auto)</label>
-              <input class="set-field" id="cc-next" type="number" min="0" max="10" value="${cc.next}" /></div>
-          </div>
-          <div style="display:flex;gap:8px;margin-top:10px">
-            <button class="btn-primary" id="cc-save">Salvar</button>
-          </div>
-        </section>
-
-        </div>
-      </div>
-    </div>
-  </div>`;
-
+  root.innerHTML = `<div class="view"><div class="wiz-head"><button class="back" id="set-back" title="Voltar">←</button><div><div class="t">Configurações</div><div class="s">Central de controle · sessão independente</div></div></div><div class="settings"><div class="settings-shell"><nav class="settings-nav" aria-label="Categorias das configurações"><p>Preferências</p>${Object.entries(SETTINGS_META).map(([key,meta]) => `<button class="set-nav-btn ${id === key ? "active" : ""}" data-set-target="${key}"><span>${meta[0]}</span><span>${esc(meta[1])}</span>${settingsHasChanges(key) ? "<i>•</i>" : ""}</button>`).join("")}</nav><main class="settings-inner">${panel}</main></div></div></div>`;
+  const scroll = $("#settings-panel-scroll");
+  if (scroll) { scroll.scrollTop = S.SET.scroll?.[id] || 0; scroll.onscroll = () => { S.SET.scroll[id] = scroll.scrollTop; }; }
   $("#set-back").onclick = leaveSettings;
-  $("#set-reconnect").onclick = () => { S.mode = "real"; renderSetup(); };
-  root.querySelectorAll("[data-toggle]").forEach((b) => {
-    b.onclick = () => alternarPreferencia(b.dataset.toggle, b);
-  });
-  root.querySelectorAll("[data-prov]").forEach((b) => {
-    b.onclick = () => { S.SET.ia.provider = b.dataset.prov; S.SET.ia.model = ""; renderSettings(); };
-  });
-  root.querySelectorAll("[data-set-target]").forEach((b) => {
-    b.onclick = () => {
-      const id = b.dataset.setTarget;
-      S.SET.section = id;
-      root.querySelectorAll(".set-nav-btn").forEach((item) => item.classList.toggle("active", item === b));
-      const section = id === "account" ? $("#set-account-section")
-        : id === "ai" ? $("#set-ai-section")
-        : id === "images" ? $("#set-images-section")
-        : id === "library" ? $("#set-library-section")
-        : id === "overlay" ? $("#set-overlay-section")
-        : $("#set-compact-section");
-      section?.scrollIntoView({ block: "start", behavior: "smooth" });
-    };
-  });
-  const salvar = $("#set-ai-save");
-  if (salvar) salvar.onclick = () => salvarIa(null);
-  const limpar = $("#set-ai-clear");
-  if (limpar) limpar.onclick = () => salvarIa("");
-  root.querySelectorAll("[data-src-save]").forEach((b) =>
-    b.onclick = () => salvarFonte(b.dataset.srcSave, false));
-  root.querySelectorAll("[data-src-clear]").forEach((b) =>
-    b.onclick = () => salvarFonte(b.dataset.srcClear, true));
-  const ccSave = $("#cc-save");
-  if (ccSave) ccSave.onclick = salvarCompacto;
+  $("#set-reconnect")?.addEventListener("click", () => { S.mode = "real"; renderSetup(); });
   $("#set-update-check")?.addEventListener("click", () => procurarAtualizacao(true));
   $("#overlay-test")?.addEventListener("click", testarOverlay);
-  requestAnimationFrame(() => {
-    const target = S.SET.section === "ai" ? $("#set-ai-section")
-      : S.SET.section === "overlay" ? $("#set-overlay-section")
-      : S.SET.section === "images" ? $("#set-images-section")
-      : S.SET.section === "library" ? $("#set-library-section")
-      : S.SET.section === "compact" ? $("#set-compact-section") : null;
-    target?.scrollIntoView({ block: "start" });
-    if (S.SET.section === "ai") $("#set-key")?.focus();
-  });
+  $("#settings-save")?.addEventListener("click", () => saveSettingsSession());
+  $("#settings-discard")?.addEventListener("click", () => discardSettingsSession());
+  root.querySelectorAll("[data-set-target]").forEach((b) => b.addEventListener("click", () => requestSettingsSection(b.dataset.setTarget)));
+  root.querySelectorAll("[data-draft-toggle]").forEach((b) => b.addEventListener("click", () => { const key = b.dataset.draftToggle; S.SET.drafts[id][key] = !S.SET.drafts[id][key]; b.classList.toggle("on", S.SET.drafts[id][key]); b.setAttribute("aria-checked", String(S.SET.drafts[id][key])); markSettingsDirty(); }));
+  root.querySelectorAll("[data-draft-field]").forEach((input) => input.addEventListener("input", () => { setDraftValue(input.dataset.draftField, input.value); if (input.dataset.draftField === "ui_scale") $("#settings-scale-label").textContent = `${input.value}%`; markSettingsDirty(); }));
+  root.querySelectorAll("[data-settings-provider]").forEach((b) => b.addEventListener("click", () => { S.SET.drafts.ai.provider = b.dataset.settingsProvider; S.SET.drafts.ai.model = ""; S.SET.drafts.ai.base_url = ""; markSettingsDirty(); renderSettings(); }));
+  $("[data-ai-clear]")?.addEventListener("click", () => { S.SET.drafts.ai.clear_key = !S.SET.drafts.ai.clear_key; renderSettings(); });
+  root.querySelectorAll("[data-source-clear]").forEach((b) => b.addEventListener("click", () => { const key = b.dataset.sourceClear; S.SET.drafts.images[key].clear = !S.SET.drafts.images[key].clear; renderSettings(); }));
+}
+
+function setDraftValue(path, value) {
+  const parts = String(path).split("."); let obj = S.SET.drafts[S.SET.section];
+  for (let i = 0; i < parts.length - 1; i++) obj = obj[parts[i]];
+  const key = parts[parts.length - 1]; obj[key] = ["ui_scale", "compact_width", "compact_height", "compact_last", "compact_next"].includes(key) ? Number(value) : value;
+}
+function markSettingsDirty() {
+  const dirty = settingsDirty(); const state = $("#settings-state"); const save = $("#settings-save"); const discard = $("#settings-discard");
+  if (state) { state.textContent = dirty ? "Alterações pendentes" : "Tudo salvo"; state.classList.toggle("dirty", dirty); }
+  if (save) save.disabled = !dirty; if (discard) discard.disabled = !dirty;
+  root.querySelectorAll(".set-nav-btn").forEach((b) => { const key = b.dataset.setTarget; const dot = b.querySelector("i"); const has = settingsHasChanges(key); if (has && !dot) b.insertAdjacentHTML("beforeend", "<i>•</i>"); if (!has && dot) dot.remove(); });
+}
+function discardSettingsSession() { const id = S.SET.section; S.SET.drafts[id] = cloneSettings(S.SET.originals[id]); renderSettings(); toast("Alterações descartadas."); }
+function requestSettingsSection(id) {
+  if (id === S.SET.section) return;
+  if (settingsDirty()) return showPendingSettingsModal(id);
+  switchSettingsSection(id);
+}
+function switchSettingsSection(id) { S.SET.section = id; writeSettingsSection(id); if (!S.SET.drafts[id]) { S.SET.drafts[id] = settingsSnapshot(id); S.SET.originals[id] = cloneSettings(S.SET.drafts[id]); } renderSettings(); }
+function showPendingSettingsModal(target = null) {
+  $("#settings-pending-modal")?.remove();
+  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="settings-pending-modal"><div class="gf-panel settings-pending"><h3>Alterações não salvas</h3><p>Você tem alterações pendentes nesta sessão. O que deseja fazer?</p><div class="settings-pending-actions"><button class="btn-primary" id="pending-save">Salvar e continuar</button><button class="btn-ghost" id="pending-discard">Descartar alterações</button><button class="btn-ghost" id="pending-cancel">Continuar editando</button></div></div></div>`);
+  $("#pending-save").onclick = async () => { if (await saveSettingsSession()) { $("#settings-pending-modal")?.remove(); if (target) switchSettingsSection(target); else leaveSettings(true); } };
+  $("#pending-discard").onclick = () => { discardSettingsSession(); $("#settings-pending-modal")?.remove(); if (target) switchSettingsSection(target); else leaveSettings(true); };
+  $("#pending-cancel").onclick = () => $("#settings-pending-modal")?.remove();
+}
+
+async function saveSettingsSession() {
+  const id = S.SET.section, draft = S.SET.drafts[id]; if (!settingsDirty()) return true;
+  const save = $("#settings-save"); if (save) { save.disabled = true; save.textContent = "Salvando…"; }
+  let res;
+  try {
+    if (id === "ai") {
+      res = await backend.setAiConfig({ provider: draft.provider, api_key: draft.clear_key ? "" : (draft.api_key || null), model: draft.model, base_url: draft.base_url });
+      if (res?.ok) S.SET.ia = res;
+    } else if (id === "images") {
+      res = { ok: true, ready: S.SET.sources || {} };
+      for (const key of ["steamgriddb", "rawg", "igdb"]) {
+        const item = draft[key]; const hasInput = item.key1 || item.key2 || item.clear;
+        if (!hasInput) continue;
+        const saved = await backend.setSourceKey(key, item.clear ? "" : (item.key1 || null), item.clear ? "" : (item.key2 || null));
+        if (!saved?.ok) { res = saved; break; } res.ready = saved.ready || res.ready;
+      }
+      if (res.ok) S.SET.sources = res.ready;
+    } else {
+      const payload = id === "compact" ? draft : draft;
+      res = await backend.setSettingsSession(id, payload);
+    }
+  } catch (e) { res = { ok: false, error: String(e) }; }
+  if (!res?.ok) { if (save) { save.disabled = false; save.textContent = "Salvar alterações"; } toast(res?.error || "Não foi possível salvar.", true); return false; }
+  S.SET.originals[id] = cloneSettings(draft); S.SET.drafts[id] = cloneSettings(draft);
+  const e = S.SET.estado || {}; Object.assign(e, res); S.SET.estado = e;
+  if (id === "experience") { S.smartGuideAuto = !!draft.smart_guide_auto; S.smartGuideConsent = !!draft.smart_guide_consent; S.reducedMotion = !!draft.reduced_motion; S.guideDensity = draft.guide_density; S.uiScale = Number(draft.ui_scale); applyExperience(); }
+  if (id === "account") S.autoCheckUpdates = !!draft.auto_check_updates;
+  if (id === "library") S.autoImport = !!draft.auto_import;
+  if (id === "overlay") { S.autoOverlay = !!draft.auto_overlay; S.overlayExitFullscreen = !!draft.overlay_exit_fullscreen; S.overlaySecondScreen = !!draft.overlay_second_screen; S.overlayFitEmulator = !!draft.overlay_fit_emulator; }
+  if (id === "compact") S.compactCfg = { ok: true, width: draft.compact_width, height: draft.compact_height, last: draft.compact_last, next: draft.compact_next };
+  renderSettings(); toast("Sessão salva com sucesso."); return true;
 }
 
 /* Salva (ou remove) a credencial de uma fonte de imagem. IGDB tem dois campos
@@ -1401,12 +1703,39 @@ async function alternarPreferencia(chave, botao) {
     S.autoCheckUpdates = novo;
     await backend.setAutoCheckUpdates(novo);
   }
+  else if (["smart_guide_auto", "smart_guide_consent", "reduced_motion"].includes(chave)) {
+    if (chave === "smart_guide_auto") S.smartGuideAuto = novo;
+    else if (chave === "smart_guide_consent") S.smartGuideConsent = novo;
+    else S.reducedMotion = novo;
+    await backend.setExperience({
+      smart_auto: chave === "smart_guide_auto" ? novo : null,
+      consent: chave === "smart_guide_consent" ? novo : null,
+      reduced_motion: chave === "reduced_motion" ? novo : null,
+    });
+    applyExperience();
+  }
   else {
     if (chave === "overlay_exit_fullscreen") S.overlayExitFullscreen = novo;
     else if (chave === "overlay_fit_emulator") S.overlayFitEmulator = novo;
     else S.overlaySecondScreen = novo;
     await backend.setOverlayOption(chave, novo);
   }
+}
+
+function applyExperience() {
+  document.documentElement.style.setProperty("--ui-scale", String(S.uiScale / 100));
+  document.documentElement.dataset.density = S.guideDensity;
+  document.documentElement.classList.toggle("reduced-motion", !!S.reducedMotion);
+}
+
+async function salvarExperiencia() {
+  S.guideDensity = $("#set-density")?.value || "comfortable";
+  S.uiScale = Number($("#set-scale")?.value || 100);
+  const res = await backend.setExperience({ density: S.guideDensity, ui_scale: S.uiScale });
+  if (!res?.ok) return toast("Não foi possível salvar a aparência.", true);
+  applyExperience();
+  toast("Aparência aplicada.");
+  renderSettings();
 }
 
 async function salvarIa(forcarChave) {
@@ -2224,20 +2553,30 @@ function enterWizard1() {
   S.view = "wizard1";
   stopPolling();
   S.W = { results: [], query: "" };
-  root.innerHTML = `<div class="view">
+  root.innerHTML = `<div class="view wizard-view wizard-search-view">
     ${wizHeadHTML(1)}
     <div class="wiz-body">
-      <p style="color:var(--text-mid);font-size:12px;margin-bottom:12px">Busque o jogo na RetroAchievements — a lista completa de conquistas é carregada automaticamente.</p>
-      <div class="search-box">
-        <span style="color:var(--text-low)">🔍</span>
-        <input id="wiz-q" placeholder="digite o nome do jogo…" autocomplete="off" spellcheck="false" />
-      </div>
+      <section class="wizard-search-stage">
+        <div class="wizard-intro">
+          <span>RETROACHIEVEMENTS</span>
+          <h1>Encontre seu próximo jogo</h1>
+          <p>Pesquise pelo título. Conquistas, progresso e arte serão preparados automaticamente para a sua biblioteca.</p>
+        </div>
+        <div class="wizard-search-panel">
+          <label for="wiz-q">BUSCAR NO CATÁLOGO</label>
+          <div class="search-box">
+            <span aria-hidden="true">⌕</span>
+            <input id="wiz-q" placeholder="Digite o nome do jogo…" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="wizard-source-notes"><span>✓ Progresso sincronizado</span><span>✓ Guia original preservado</span><span>✓ Arte enriquecida em segundo plano</span></div>
+        </div>
+      </section>
       <div id="wiz-results"></div>
     </div>
   </div>`;
   $("#wiz-back").onclick = enterDashboard;
   const input = $("#wiz-q");
-  input.focus();
+  input.focus({ preventScroll: true });
   let timer;
   input.oninput = () => {
     clearTimeout(timer);
@@ -2652,7 +2991,41 @@ function closeLibraryDrawer() {
 /* ─────────────────────────  ATALHOS DE TECLADO  ─────────────────────────
    O rodapé anuncia essas teclas, então elas precisam existir. Também é a
    navegação por teclado que o app não tinha. */
-const ABAS = ["walk", "mastery", "tips"];
+const ABAS = ["overview", "walk", "mastery", "tips"];
+
+function visibleFocusables() {
+  return [...document.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled]), summary, [tabindex]:not([tabindex='-1'])")]
+    .filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== "hidden"; });
+}
+
+function spatialMove(direction) {
+  const items = visibleFocusables();
+  if (!items.length) return;
+  const current = items.includes(document.activeElement) ? document.activeElement : null;
+  if (!current) { items[0].focus(); return; }
+  const from = current.getBoundingClientRect();
+  const fx = from.left + from.width / 2, fy = from.top + from.height / 2;
+  let best = null, score = Infinity;
+  for (const item of items) {
+    if (item === current) continue;
+    const r = item.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const dx = x - fx, dy = y - fy;
+    if ((direction === "left" && dx >= -2) || (direction === "right" && dx <= 2)
+      || (direction === "up" && dy >= -2) || (direction === "down" && dy <= 2)) continue;
+    const primary = ["left", "right"].includes(direction) ? Math.abs(dx) : Math.abs(dy);
+    const secondary = ["left", "right"].includes(direction) ? Math.abs(dy) : Math.abs(dx);
+    const candidate = primary + secondary * 2.25;
+    if (candidate < score) { score = candidate; best = item; }
+  }
+  if (best) { best.focus({ preventScroll: true }); best.scrollIntoView({ block: "nearest", inline: "nearest" }); }
+}
+
+function cyclePanelTab(dir) {
+  if (S.view !== "dashboard" || S.compact) return;
+  const i = ABAS.indexOf(S.tab);
+  S.tab = ABAS[(i + dir + ABAS.length) % ABAS.length];
+  renderDashboard({ force: true }).then(() => $(".ptab.active")?.focus());
+}
 
 function bindAtalhos() {
   document.addEventListener("keydown", async (e) => {
@@ -2681,17 +3054,37 @@ function bindAtalhos() {
 
     if (S.view !== "dashboard") return;
 
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-      e.preventDefault();
-      return trocarJogo(e.key === "ArrowDown" ? 1 : -1);
+    if (["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight"].includes(e.key)) {
+      e.preventDefault(); return spatialMove(e.key.replace("Arrow", "").toLowerCase());
     }
-    if (e.key === "Tab") {
-      e.preventDefault();
-      const i = ABAS.indexOf(S.tab);
-      S.tab = ABAS[(i + (e.shiftKey ? -1 : 1) + ABAS.length) % ABAS.length];
-      return renderDashboard({ force: true });
-    }
+    if (e.key === "[" || e.key === "]") { e.preventDefault(); return cyclePanelTab(e.key === "]" ? 1 : -1); }
   });
+}
+
+function startGamepadNavigation() {
+  if (S.gamepadLoop) return;
+  const pulse = (key, active, fn) => {
+    const now = performance.now(), state = S.gamepadLast[key] || { active: false, at: 0 };
+    if (active && (!state.active || now - state.at > 230)) { fn(); state.at = now; }
+    state.active = active; S.gamepadLast[key] = state;
+  };
+  const frame = () => {
+    const pad = [...(navigator.getGamepads?.() || [])].find(Boolean);
+    if (pad) {
+      const pressed = (i) => !!pad.buttons[i]?.pressed;
+      pulse("up", pressed(12) || pad.axes[1] < -.65, () => spatialMove("up"));
+      pulse("down", pressed(13) || pad.axes[1] > .65, () => spatialMove("down"));
+      pulse("left", pressed(14) || pad.axes[0] < -.65, () => spatialMove("left"));
+      pulse("right", pressed(15) || pad.axes[0] > .65, () => spatialMove("right"));
+      pulse("accept", pressed(0), () => document.activeElement?.click?.());
+      pulse("back", pressed(1), () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+      pulse("lb", pressed(4), () => cyclePanelTab(-1));
+      pulse("rb", pressed(5), () => cyclePanelTab(1));
+      pulse("compact", pressed(9), toggleCompacto);
+    }
+    S.gamepadLoop = requestAnimationFrame(frame);
+  };
+  S.gamepadLoop = requestAnimationFrame(frame);
 }
 
 async function trocarJogo(dir) {
@@ -2728,6 +3121,7 @@ async function exitDemo() {
 
 async function boot() {
   bindWindowControls();
+  startGamepadNavigation();
   S.mode = hasBackend() ? "real" : "demo";
   if (S.mode === "demo") document.getElementById("demo-banner").classList.remove("hidden");
   // atalho de dev: ?screen=wizard2 abre direto o Passo 2 com dados de exemplo
@@ -2746,6 +3140,12 @@ async function boot() {
     if (st.ai_ready !== undefined) S.aiReady = st.ai_ready;
     if (st.ai_provider_label !== undefined) S.aiProviderLabel = st.ai_provider_label;
     if (st.ai_model !== undefined) S.aiModel = st.ai_model;
+    if (st.smart_guide_auto !== undefined) S.smartGuideAuto = st.smart_guide_auto;
+    if (st.smart_guide_consent !== undefined) S.smartGuideConsent = st.smart_guide_consent;
+    if (st.guide_density) S.guideDensity = st.guide_density;
+    if (st.ui_scale) S.uiScale = st.ui_scale;
+    if (st.reduced_motion !== undefined) S.reducedMotion = st.reduced_motion;
+    applyExperience();
     if (S.mode === "real") S.tipsAI = await backend.gameTipsAIStatus().catch(() => null);
     if (st.overlay_exit_fullscreen !== undefined) S.overlayExitFullscreen = st.overlay_exit_fullscreen;
     if (st.overlay_second_screen !== undefined) S.overlaySecondScreen = st.overlay_second_screen;
@@ -2779,7 +3179,7 @@ window.addEventListener("DOMContentLoaded", () => {
 function DEMO_LIB() {
   return DEMO.map((g) => ({
     slug: g.slug, title: g.title, platform: g.platform, accent: g.accent,
-    modes: g.modes, mastery: g.mastery, icon: g.icon || "",
+    modes: g.modes, mastery: g.mastery, icon: g.icon || "", art: g.art || {},
   }));
 }
 function DEMO_GAME(slug) { return DEMO.find((g) => g.slug === slug) || null; }
@@ -2814,6 +3214,8 @@ function DEMO_IMPORT() {
 const DEMO = [
   {
     slug: "digimon_world_4", title: "Digimon World 4", platform: "GameCube", accent: "#D62839",
+    genre: "RPG", year: "2005", players: "1–4 jogadores",
+    art: { background: "/ui/assets/demo-digital-world-hero.png", title: "/ui/assets/demo-digital-world-hero.png", box: "/ui/assets/demo-digital-world-hero.png" },
     modes: { hardcore: { total: 6, earned: 1 }, softcore: { total: 6, earned: 2 } },
     mastery: { total: 6, hardcore: 1, earned: 3, softcore_only: 2, remaining: 5, percent: 17, complete: false, softcore_ids: [2, 4] },
     next_ids: [3, 6, 8],
@@ -2846,9 +3248,28 @@ const DEMO = [
         { type: "note", text: "Algumas conquistas do RetroAchievements são incompatíveis com multiplayer — jogue solo." },
       ]},
     ],
+    smart_guide: {
+      status: { phase: "ready", message: "Fonte original preservada · revisão local pronta" },
+      current: { title: "Rota essencial · Digimon World 4", summary: "Objetivos e alertas organizados sem aplicar regras fixas de franquia.", provider: "local", chapters: [
+        { id: "demo-c1", title: "Preparação antes da rota", objective: "Evitar perda de progresso e preparar o equipamento.", blocks: [
+          { id: "demo-b1", type: "warning", title: "Salve antes de entrar", text: "O Save Keeper fica no HomeServer. Confirme o salvamento antes de iniciar uma dungeon.", items: [], rows: [], source_refs: [{section:1,block:4,page:0}], estimated_minutes: 1 },
+          { id: "demo-b2", type: "checklist", title: "Preparação rápida", text: "", items: [{id:"i1",text:"Escolha uma arma de ataque à distância."},{id:"i2",text:"Revise itens de cura e MP."}], rows: [], source_refs: [{section:1,block:3,page:0}], estimated_minutes: 3 },
+        ]},
+        { id: "demo-c2", title: "Goblin Pass e encontro principal", objective: "Cruzar as pontes e concluir o desafio da área.", blocks: [
+          { id: "demo-b3", type: "objective", title: "Atravesse Goblin Pass", text: "Na segunda ponte, vire à esquerda e siga ao sul.", items: [], rows: [], source_refs: [{section:2,block:3,page:0}], estimated_minutes: 12 },
+          { id: "demo-b4", type: "challenge", title: "Blossomon", text: "Mantenha distância máxima e use ataques Shot para evitar contato.", items: [], rows: [], source_refs: [{section:2,block:5,page:0}], estimated_minutes: 8 },
+          { id: "demo-b5", type: "missable", title: "Condição de sessão", text: "Algumas conquistas citadas pela fonte exigem uma sessão solo.", items: [], rows: [], source_refs: [{section:3,block:2,page:0}], estimated_minutes: 0 },
+        ]},
+      ], visual_suggestions: [{id:"demo-v1",type:"route",chapter_id:"demo-c2",title:"Mapa esquemático de Goblin Pass",reason:"A sequência de pontes e a conversão ao sul ficam mais claras visualmente.",query:"Goblin Pass Digimon World 4 map"}] },
+      progress: { completed: ["demo-b1"], favorites: ["demo-b5"], revealed_spoilers: [], notes: {"demo-b3":"Fazer o farm antes do chefe."}, checkpoint: "demo-b1", history: [], session_minutes: 30 },
+      effective_progress: { completed: ["demo-b1"], favorites: ["demo-b5"], revealed_spoilers: [], notes: {"demo-b3":"Fazer o farm antes do chefe."}, checkpoint: "demo-b1", history: [], session_minutes: 30 },
+      next_objective: { chapter_id:"demo-c1", chapter:"Preparação antes da rota", block_id:"demo-b2", type:"checklist", title:"Preparação rápida", text:"Escolha uma arma de ataque à distância." },
+      revisions: [{revision_id:"demo-r1",created_at:1770000000,provider:"local",model:"structured-fallback"}], media: [],
+    },
   },
   {
     slug: "digimon_world_2", title: "Digimon World 2", platform: "PlayStation", accent: "#F5C518",
+    art: { box: "/ui/assets/demo-digital-dungeon-cover.png" },
     modes: { hardcore: { total: 2, earned: 2 }, softcore: { total: 2, earned: 0 } },
     mastery: { total: 2, hardcore: 2, earned: 2, softcore_only: 0, remaining: 0, percent: 100, complete: true, softcore_ids: [] },
     next_ids: [],
@@ -2860,6 +3281,7 @@ const DEMO = [
   },
   {
     slug: "digimon_digital_card_battle", title: "Digimon Digital Card Battle", platform: "PlayStation", accent: "#2DE2E6",
+    art: { box: "/ui/assets/demo-digital-card-cover.png" },
     modes: { hardcore: { total: 3, earned: 0 }, softcore: { total: 3, earned: 1 } },
     mastery: { total: 3, hardcore: 0, earned: 1, softcore_only: 1, remaining: 3, percent: 0, complete: false, softcore_ids: [1] },
     next_ids: [2, 3],

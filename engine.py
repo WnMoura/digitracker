@@ -9,6 +9,7 @@ RetroAchievements a cada 30s e mantém o estado de cada jogo em memória.
 from __future__ import annotations
 
 import base64
+import ctypes
 import io
 import json
 import os
@@ -19,6 +20,8 @@ import threading
 import time
 import unicodedata
 import webbrowser
+import zipfile
+from functools import lru_cache
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
@@ -36,10 +39,13 @@ import webview
 import emulator_tracker
 import gamefaqs
 import guide_ai
+import guide_media
 import guide_parser
 import igdb
 import image_fetch
+import platform_providers
 import rawg
+import smart_guide
 import steamgriddb
 import updater
 from ra_api import RAClient, RAError, RARateLimited, fmt_date
@@ -74,6 +80,8 @@ SETTINGS_PATH = CONFIG_DIR / "settings.json"
 BADGES_DIR = DATA_DIR / "assets" / "badges"
 ICONS_DIR = DATA_DIR / "assets" / "icons"   # ícones dos jogos (RA ImageIcon)
 ART_DIR = DATA_DIR / "assets" / "art"       # capa, tela de título e screenshot
+GUIDES_DIR = CONFIG_DIR / "guides"           # fontes, revisões e progresso do guia
+GUIDE_MEDIA_DIR = DATA_DIR / "assets" / "guides"
 
 # Artes que a RetroAchievements devolve por jogo, além do ícone. A capa
 # identifica o jogo na biblioteca; a tela de título vira o cabeçalho; o
@@ -105,6 +113,11 @@ DEFAULT_SETTINGS = {
     "ai_provider": "",     # provedor do refino por IA (vazio = padrão)
     "ai_model": "",        # modelo específico (vazio = o padrão do provedor)
     "ai_base_url": "",     # endpoint próprio, para provedores compatíveis
+    "smart_guide_auto": True,       # organizar novos guias após importar
+    "smart_guide_consent": False,   # confirmação única de envio/custo da IA
+    "guide_density": "comfortable", # comfortable | compact
+    "ui_scale": 100,
+    "reduced_motion": False,
     "compact_width": 300,   # tamanho do overlay compacto (ajustável pelo usuário)
     "compact_height": 232,
     "compact_last": 2,      # quantas conquistas OBTIDAS mostrar no compacto
@@ -144,6 +157,25 @@ def slugify(text: str) -> str:
     return re.sub(r"[-\s]+", "_", text) or "jogo"
 
 
+def adaptive_normal_size() -> tuple[int, int]:
+    """Usa 90% da área útil do monitor principal, limitado ao canvas console.
+
+    O fallback mantém os testes e plataformas não-Windows independentes das
+    APIs de monitor. A DPI awareness é ativada antes desta consulta no boot.
+    """
+    usable_w, usable_h = 1440, 900
+    if sys.platform == "win32":
+        try:
+            from ctypes import wintypes
+            rect = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                usable_w = max(1, rect.right - rect.left)
+                usable_h = max(1, rect.bottom - rect.top)
+        except (AttributeError, OSError):
+            pass
+    return min(1600, round(usable_w * .90)), min(960, round(usable_h * .90))
+
+
 def load_secrets() -> dict | None:
     if not SECRETS_PATH.exists():
         return None
@@ -165,8 +197,9 @@ def load_settings() -> dict:
     if isinstance(saved, dict):
         settings["auto_import"] = bool(saved.get("auto_import", True))
         settings["auto_overlay"] = bool(saved.get("auto_overlay", True))
-        for chave in ("overlay_exit_fullscreen", "overlay_second_screen"):
-            settings[chave] = bool(saved.get(chave, False))
+        for chave in ("overlay_exit_fullscreen", "overlay_second_screen", "smart_guide_auto",
+                      "smart_guide_consent", "reduced_motion"):
+            settings[chave] = bool(saved.get(chave, settings[chave]))
         settings["overlay_fit_emulator"] = bool(saved.get("overlay_fit_emulator", True))
         settings["auto_check_updates"] = bool(saved.get("auto_check_updates", True))
         remind = saved.get("update_remind_until", 0)
@@ -180,6 +213,12 @@ def load_settings() -> dict:
             value = saved.get(key)
             if isinstance(value, str):
                 settings[key] = value
+        density = saved.get("guide_density")
+        if density in ("comfortable", "compact"):
+            settings["guide_density"] = density
+        scale = saved.get("ui_scale")
+        if isinstance(scale, (int, float)) and not isinstance(scale, bool):
+            settings["ui_scale"] = max(80, min(140, int(scale)))
         for key in ("compact_width", "compact_height", "compact_last", "compact_next"):
             value = saved.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -234,7 +273,65 @@ def extract_pdf_text(source) -> str:
     from pypdf import PdfReader  # import tardio: só carrega ao usar o recurso
 
     reader = PdfReader(source)
-    return "\n".join((page.extract_text() or "") for page in reader.pages)
+    text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    if _normalize_text(text) or not pdf_ocr_available():
+        return text
+    try:
+        source.seek(0)
+        return extract_pdf_text_ocr(source.read())
+    except (AttributeError, OSError):
+        return text
+
+
+@lru_cache(maxsize=1)
+def pdf_ocr_available() -> bool:
+    """OCR é uma capacidade opcional: evita inflar o executável para quem não usa."""
+    try:
+        import fitz  # PyMuPDF
+        import pytesseract
+        pytesseract.get_tesseract_version()
+        return bool(fitz and pytesseract)
+    except Exception:
+        return False
+
+
+def extract_pdf_text_ocr(raw: bytes) -> str:
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("OCR não está instalado neste ambiente.") from exc
+    pages = []
+    with fitz.open(stream=raw, filetype="pdf") as document:
+        for page in document:
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+            pages.append(pytesseract.image_to_string(image, lang="por+eng"))
+    return "\n".join(pages)
+
+
+def annotate_pdf_pages(sections: list, raw: bytes) -> list:
+    """Associa seções/blocos à página em que seu texto aparece, sem reescrever."""
+    try:
+        from pypdf import PdfReader
+        page_texts = [_normalize_text(page.extract_text() or "")
+                      for page in PdfReader(io.BytesIO(raw)).pages]
+    except Exception:
+        return sections
+    last_page = 1
+    for section in sections:
+        title = _normalize_text(section.get("title", ""))
+        match = next((index + 1 for index, text in enumerate(page_texts)
+                      if title and title[:80] in text), last_page)
+        section["page"] = match
+        last_page = match
+        for block in section.get("blocks") or []:
+            needle = _normalize_text(block.get("text", ""))[:100]
+            block_page = next((index + 1 for index, text in enumerate(page_texts)
+                               if needle and needle in text), match)
+            block["page"] = block_page
+    return sections
 
 
 # ---------------------------------------------------------------------------- #
@@ -262,13 +359,23 @@ class Api:
         self.index_building = False
         self._compact = False
         self._pre_compact_pos: tuple[int, int] | None = None
+        self._pre_compact_size: tuple[int, int] | None = None
+        self._normal_size = NORMAL_SIZE
+        self._art_status: dict[str, dict] = {}
+        self._art_lock = threading.Lock()
         self._lock = threading.Lock()
         self._tips_ai_lock = threading.Lock()
         self._tips_ai_status = {
             "ok": True, "phase": "idle", "operation": "",
             "completed": 0, "total": 0, "message": "", "error": "",
         }
+        self._smart_ai_lock = threading.Lock()
+        self._smart_ai_status: dict[str, dict] = {}
+        self._smart_ai_queue: list[str] = []
         self._updates = updater.UpdateManager(APP_VERSION, sys.executable)
+        self._guides = smart_guide.SmartGuideStore(GUIDES_DIR)
+        self._guide_media = guide_media.GuideMediaLibrary(GUIDES_DIR, GUIDE_MEDIA_DIR)
+        self._platforms = platform_providers.ProviderRegistry()
 
         for d in (GAMES_DIR, CACHE_DIR, BADGES_DIR, ICONS_DIR, ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
@@ -276,8 +383,17 @@ class Api:
         secrets = load_secrets()
         if secrets and secrets.get("username") and secrets.get("api_key"):
             self._client = RAClient(secrets["username"], secrets["api_key"], CACHE_DIR)
+            self._platforms.register(platform_providers.RetroAchievementsProvider(self._client))
 
     # ------------------------ status / configuração ------------------------- #
+    def _platform_progress(self, game_id: int) -> dict:
+        provider = self._platforms.get("retroachievements")
+        if provider:
+            return provider.game_progress(str(game_id))
+        if self._client:  # compatibilidade com clientes falsos nos testes
+            return self._client.get_game_info_and_user_progress(int(game_id))
+        raise RAError("RetroAchievements não configurado.")
+
     def get_app_state(self) -> dict:
         ai_provider, ai_label, ai_model = self._ai_summary()
         return {
@@ -298,7 +414,20 @@ class Api:
             "ai_provider_label": ai_label,
             "ai_model": ai_model,
             "covers_ready": bool(self._covers_key()),  # idem: só se há chave
+            "smart_guide_auto": bool(self.settings.get("smart_guide_auto", True)),
+            "smart_guide_consent": bool(self.settings.get("smart_guide_consent", False)),
+            "guide_density": self.settings.get("guide_density", "comfortable"),
+            "ui_scale": self.settings.get("ui_scale", 100),
+            "reduced_motion": bool(self.settings.get("reduced_motion", False)),
+            "platform_providers": self._platforms.describe(),
+            "pdf_ocr_available": pdf_ocr_available(),
         }
+
+    def get_pdf_capabilities(self) -> dict:
+        return {"ok": True, "text": True, "embedded_images": True,
+                "ocr": pdf_ocr_available(),
+                "ocr_hint": ("OCR local pronto." if pdf_ocr_available() else
+                             "Para PDFs digitalizados, instale Tesseract, PyMuPDF e pytesseract.")}
 
     def _ai_summary(self) -> tuple[str, str, str]:
         provider = self.settings.get("ai_provider") or guide_ai.DEFAULT_PROVIDER
@@ -394,6 +523,7 @@ class Api:
             encoding="utf-8",
         )
         self._client = client
+        self._platforms.register(platform_providers.RetroAchievementsProvider(client))
         self._kick_sync()
         self._ensure_index_async()
         self._schedule_auto_import()   # já traz a biblioteca inteira no login
@@ -410,17 +540,25 @@ class Api:
                     "slug": g["slug"],
                     "title": g["title"],
                     "platform": g["platform"],
+                    "genre": g.get("genre", ""),
+                    "year": g.get("year", ""),
+                    "players": g.get("players", ""),
+                    "provider_id": g.get("provider_id", "retroachievements"),
                     "icon": g.get("icon", ""),
                     "art": g.get("art", {}),
+                    "art_meta": g.get("art_meta", {}),
                     "accent": g["accent"],
                     "modes": g["modes"],
                     "mastery": g["mastery"],
                 }
             )
         summaries.sort(key=lambda s: s["title"].lower())
+        for summary in summaries:
+            self._schedule_art_enrichment(summary["slug"])
         return summaries
 
     def get_game(self, slug: str) -> dict | None:
+        self._schedule_art_enrichment(slug)
         with self._lock:
             return self.state.get(slug)
 
@@ -459,6 +597,104 @@ class Api:
         if value:
             self._schedule_auto_import()
         return {"ok": True, "auto_import": value}
+
+    def set_experience_preferences(self, smart_auto=None, consent=None,
+                                   density: str = "", ui_scale=None,
+                                   reduced_motion=None) -> dict:
+        """Preferências do Guia Inteligente e da interface responsiva."""
+        with self._lock:
+            if smart_auto is not None:
+                self.settings["smart_guide_auto"] = bool(smart_auto)
+            if consent is not None:
+                self.settings["smart_guide_consent"] = bool(consent)
+            if density in ("comfortable", "compact"):
+                self.settings["guide_density"] = density
+            if ui_scale is not None:
+                try:
+                    self.settings["ui_scale"] = max(80, min(140, int(ui_scale)))
+                except (TypeError, ValueError):
+                    pass
+            if reduced_motion is not None:
+                self.settings["reduced_motion"] = bool(reduced_motion)
+            save_settings(self.settings)
+            result = {
+                key: self.settings[key] for key in (
+                    "smart_guide_auto", "smart_guide_consent", "guide_density",
+                    "ui_scale", "reduced_motion",
+                )
+            }
+        if result["smart_guide_auto"] and result["smart_guide_consent"] and self._ai_key():
+            self._resume_pending_smart_guides()
+        return {"ok": True, **result}
+
+    def set_settings_session(self, section: str, payload: dict | None = None) -> dict:
+        """Persiste preferências não sensíveis de uma sessão de Configurações.
+
+        A UI mantém um rascunho por painel e só chama esta ponte ao confirmar
+        "Salvar alterações". Credenciais continuam fora deste método e passam
+        pelos setters protegidos de IA/fontes de imagem.
+        """
+        section = str(section or "").strip().lower()
+        payload = payload if isinstance(payload, dict) else {}
+        allowed = {
+            "account": {"auto_check_updates"},
+            "experience": {"smart_guide_auto", "smart_guide_consent",
+                           "guide_density", "ui_scale", "reduced_motion"},
+            "library": {"auto_import"},
+            "overlay": {"auto_overlay", "overlay_exit_fullscreen",
+                        "overlay_second_screen", "overlay_fit_emulator"},
+            "compact": {"compact_width", "compact_height", "compact_last",
+                        "compact_next"},
+        }
+        if section not in allowed:
+            return {"ok": False, "error": "Sessão de configurações desconhecida."}
+        unknown = set(payload) - allowed[section]
+        if unknown:
+            return {"ok": False, "error": "Campo inválido na sessão."}
+
+        with self._lock:
+            for key, value in payload.items():
+                if key in {
+                    "auto_check_updates", "auto_import", "auto_overlay",
+                    "overlay_exit_fullscreen", "overlay_second_screen",
+                    "overlay_fit_emulator", "smart_guide_auto",
+                    "smart_guide_consent", "reduced_motion",
+                }:
+                    self.settings[key] = bool(value)
+                elif key == "guide_density":
+                    if value not in ("comfortable", "compact"):
+                        return {"ok": False, "error": "Densidade inválida."}
+                    self.settings[key] = value
+                elif key == "ui_scale":
+                    try:
+                        self.settings[key] = max(80, min(140, int(value)))
+                    except (TypeError, ValueError):
+                        return {"ok": False, "error": "Escala inválida."}
+                elif key in {"compact_width", "compact_height", "compact_last", "compact_next"}:
+                    try:
+                        number = int(value)
+                    except (TypeError, ValueError):
+                        return {"ok": False, "error": "Valor numérico inválido."}
+                    limits = {
+                        "compact_width": (240, 640),
+                        "compact_height": (150, 900),
+                        "compact_last": (0, 10),
+                        "compact_next": (0, 10),
+                    }[key]
+                    self.settings[key] = max(limits[0], min(limits[1], number))
+            save_settings(self.settings)
+            result = {key: self.settings[key] for key in allowed[section]
+                      if key in self.settings}
+
+        if section == "library" and result.get("auto_import"):
+            self._schedule_auto_import()
+        if section == "experience" and result.get("smart_guide_auto") \
+                and result.get("smart_guide_consent") and self._ai_key():
+            self._resume_pending_smart_guides()
+        if section == "compact" and self._compact and self._window:
+            w, h = self._compact_size()
+            self._window_op(lambda: self._window.resize(w, h))
+        return {"ok": True, "section": section, **result}
 
     # --------------------------- busca (wizard p1) -------------------------- #
     def search_games(self, query: str) -> dict:
@@ -632,7 +868,7 @@ class Api:
     def _import_one(self, game_id: int) -> tuple[str, list]:
         """Cria config/games/{slug}.json para um jogo. Devolve (slug, badges a
         baixar). Não baixa ícone de conquista — isso fica para a 2ª fase."""
-        progress = self._client.get_game_info_and_user_progress(int(game_id))
+        progress = self._platform_progress(int(game_id))
         title = progress.get("Title", "Jogo")
         slug = slugify(title)
         achievements = self._client.parse_achievements(progress)
@@ -657,6 +893,8 @@ class Api:
             "art": self._download_art(slug, progress),
             "accent": self._pick_accent(slug),
             "retroachievements_game_id": int(game_id),
+            "provider_id": "retroachievements",
+            "external_game_id": str(int(game_id)),
             "walkthrough": [{
                 "step": 1,
                 "area": "Ordem RetroAchievements",
@@ -686,7 +924,7 @@ class Api:
         if not self._client:
             return {"ok": False, "error": "Não configurado."}
         try:
-            progress = self._client.get_game_info_and_user_progress(int(game_id))
+            progress = self._platform_progress(int(game_id))
         except RAError as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -720,6 +958,8 @@ class Api:
             "icon": icon_url,
             "art": self._download_art(slug, progress),
             "retroachievements_game_id": int(game_id),
+            "provider_id": "retroachievements",
+            "external_game_id": str(int(game_id)),
             "achievements_meta": {
                 str(a["id"]): {
                     "title": a["title"],
@@ -766,6 +1006,9 @@ class Api:
             "art": self.pending_import.get("art", {}),
             "accent": payload.get("accent", accent),
             "retroachievements_game_id": self.pending_import["retroachievements_game_id"],
+            "provider_id": self.pending_import.get("provider_id", "retroachievements"),
+            "external_game_id": self.pending_import.get(
+                "external_game_id", str(self.pending_import["retroachievements_game_id"])),
             "walkthrough": steps,
             "achievements_meta": self.pending_import["achievements_meta"],
             "guide": payload.get("guide") or [],   # dicas/tutoriais extraídos do PDF
@@ -773,6 +1016,16 @@ class Api:
         (GAMES_DIR / f"{slug}.json").write_text(
             json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        source_meta = dict(self.pending_import.get("guide_source") or {"source": "import"})
+        pending_pdf = self.pending_import.get("guide_pdf_raw")
+        if pending_pdf:
+            try:
+                media = self._guide_media.extract_pdf(slug, pending_pdf, source_meta.get("filename", ""))
+                source_meta["media_ids"] = [item["id"] for item in media["images"]]
+                source_meta["pages"] = media.get("pages", 0)
+            except guide_media.GuideMediaError:
+                pass
+        self._capture_smart_source(game, source_meta)
         self.pending_import = None
         self._sync_game(game)  # popula o estado imediatamente
         return {"ok": True, "slug": slug}
@@ -798,7 +1051,9 @@ class Api:
         if not _normalize_text(text):
             return {
                 "ok": False,
-                "error": "O PDF não tem texto extraível (parece ser digitalizado/imagem).",
+                "error": ("O PDF parece digitalizado e o OCR local não conseguiu extrair texto. "
+                          "Instale Tesseract + PyMuPDF/pytesseract ou use um PDF com texto."),
+                "diagnostic": "scanned_pdf", "ocr_available": pdf_ocr_available(),
             }
 
         parsed = guide_parser.parse_guide(text)
@@ -808,10 +1063,13 @@ class Api:
         # Seções de dicas/tutoriais (exclui a lista de conquistas, já mostrada
         # no walkthrough).
         guide_sections = [s for s in parsed["sections"] if not s.get("is_achievements")]
+        annotate_pdf_pages(guide_sections, raw)
 
         order["ok"] = True
         order["filename"] = filename
         order["guide"] = guide_sections
+        self.pending_import["guide_pdf_raw"] = raw
+        self.pending_import["guide_source"] = {"source": "pdf", "filename": filename}
         return order
 
     # ---------------------- importar guia do GameFAQs ----------------------- #
@@ -846,6 +1104,9 @@ class Api:
         )
         # guardado para o refino por IA, que reusa o mesmo texto sem rebaixar
         self.last_faq = {"title": faq["title"], "text": text, "url": url}
+        self.pending_import["guide_source"] = {
+            "source": "gamefaqs", "filename": faq["title"], "url": url,
+        }
 
         order["ok"] = True
         order["filename"] = faq["title"] or "GameFAQs"
@@ -882,6 +1143,9 @@ class Api:
                 detail["guide"] = sections
         if detail is None:
             self._sync_game(game)
+        self._capture_smart_source(game, {
+            "source": "gamefaqs", "filename": faq["title"], "url": url,
+        })
         return {"ok": True, "sections": len(sections), "filename": faq["title"]}
 
     # ------------------ refinar o guia com IA (opcional) -------------------- #
@@ -938,6 +1202,9 @@ class Api:
             self.settings["ai_model"] = (model or "").strip()
             self.settings["ai_base_url"] = (base_url or "").strip()
             save_settings(self.settings)
+
+        if self._ai_key(provider):
+            self._resume_pending_smart_guides()
 
         return self.get_ai_config()
 
@@ -1109,6 +1376,284 @@ class Api:
                     "error": result.get("error") or "Falha ao processar as dicas com IA.",
                 })
 
+    # -------------------------- Guia Inteligente --------------------------- #
+    def _capture_smart_source(self, game: dict, metadata: dict | None = None) -> dict:
+        """Captura a fonte sem substituir o guia legado e agenda a curadoria."""
+        sections = game.get("guide") or []
+        if not sections:
+            return {"ok": False, "error": "Este jogo não tem dicas importadas."}
+        try:
+            source = self._guides.ensure_source(
+                game["slug"], game.get("title", ""), sections, metadata or {},
+            )
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+        self._maybe_schedule_smart_guide(game["slug"])
+        return {"ok": True, "source_hash": source["hash"]}
+
+    def _maybe_schedule_smart_guide(self, slug: str, force: bool = False) -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game or not (game.get("guide") or []):
+            return {"ok": False, "error": "Jogo ou guia não encontrado."}
+        source = self._guides.source(slug)
+        current = self._guides.current(slug)
+        status = self._guides.status(slug)
+        if status.get("phase") in {"running", "queued"}:
+            return {"ok": True, **status}
+        if not force and current.get("source_hash") == source.get("hash") \
+                and current.get("provider") not in ("", "local"):
+            return {"ok": True, **self._guides.set_status(slug, "ready", message="Guia Inteligente atualizado.")}
+        if not force and status.get("phase") == "error":
+            return {"ok": False, **status}
+        if not self.settings.get("smart_guide_auto", True) and not force:
+            return {"ok": True, **self._guides.set_status(slug, "ready", message="Organização automática desativada.")}
+        if not self.settings.get("smart_guide_consent", False):
+            return {"ok": False, **self._guides.set_status(
+                slug, "awaiting_consent",
+                message="Confirme o envio do guia e possíveis custos da IA.",
+            )}
+        config = self._ai_config()
+        if not config["api_key"]:
+            return {"ok": False, **self._guides.set_status(
+                slug, "awaiting_configuration",
+                message="Configure um provedor de IA para organizar automaticamente.",
+            )}
+        return self.start_smart_guide(slug, force=True)
+
+    def _resume_pending_smart_guides(self) -> None:
+        if not (self.settings.get("smart_guide_auto", True)
+                and self.settings.get("smart_guide_consent", False) and self._ai_key()):
+            return
+        for path in GAMES_DIR.glob("*.json"):
+            game = load_game_file(path)
+            if game and game.get("guide"):
+                status = self._guides.status(game["slug"])
+                current = self._guides.current(game["slug"])
+                if status.get("phase") in {"awaiting_configuration", "awaiting_consent", "ready", "idle"} \
+                        and current.get("provider") in ("", "local"):
+                    self._maybe_schedule_smart_guide(game["slug"])
+
+    def get_smart_guide(self, slug: str) -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        if game.get("guide") and not self._guides.source(slug):
+            self._capture_smart_source(game, {"source": "migration"})
+        bundle = self._guides.bundle(slug)
+        bundle["media"] = self._guide_media.list(slug)
+        # Conquistas reais já obtidas funcionam como sinais de progresso sem
+        # ler memória ou saves. A associação é conservadora: nome exato no bloco.
+        with self._lock:
+            state = self.state.get(slug) or {}
+            earned_names = [a.get("name", "") for a in state.get("achievements", []) if a.get("earned")]
+        external_completed = []
+        normalized = [_normalize_text(name) for name in earned_names if name]
+        current = bundle.get("current") or {}
+        for chapter in current.get("chapters") or []:
+            for block in chapter.get("blocks") or []:
+                haystack = _normalize_text(f"{block.get('title', '')} {block.get('text', '')}")
+                if block.get("type") == "achievement" and any(name and name in haystack for name in normalized):
+                    external_completed.append(block.get("id"))
+        if external_completed:
+            effective = dict(bundle.get("progress") or {})
+            effective["completed"] = sorted(set(effective.get("completed") or []) | set(external_completed))
+            bundle["effective_progress"] = effective
+            bundle["next_objective"] = self._guides.next_objective(current, effective)
+        else:
+            bundle["effective_progress"] = bundle.get("progress") or {}
+        bundle["external_completed"] = external_completed
+        return bundle
+
+    def get_smart_guide_status(self, slug: str = "") -> dict:
+        if slug:
+            with self._smart_ai_lock:
+                running = dict(self._smart_ai_status.get(slug) or {})
+            return running or {"ok": True, "slug": slug, **self._guides.status(slug)}
+        with self._smart_ai_lock:
+            return {"ok": True, "tasks": list(self._smart_ai_status.values())}
+
+    def start_smart_guide(self, slug: str, force: bool = False) -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game or not (game.get("guide") or []):
+            return {"ok": False, "error": "Este jogo não tem dicas importadas."}
+        if not self.settings.get("smart_guide_consent", False):
+            return {"ok": False, **self._guides.set_status(
+                slug, "awaiting_consent", message="Confirme o uso da IA nas Configurações.",
+            )}
+        config = self._ai_config()
+        if not config["api_key"]:
+            return {"ok": False, **self._guides.set_status(
+                slug, "awaiting_configuration", message="Configure uma chave de IA.",
+            )}
+        with self._smart_ai_lock:
+            task = self._smart_ai_status.get(slug) or {}
+            if task.get("phase") in {"running", "queued"}:
+                return {"ok": False, **task, "error": "Este guia já está sendo organizado."}
+            busy = any(item.get("phase") == "running" for item in self._smart_ai_status.values())
+            task = {
+                "ok": True, "slug": slug, "phase": "queued" if busy else "running", "completed": 0,
+                "total": 0, "message": ("Aguardando a organização anterior…" if busy else
+                                          "Preparando o Guia Inteligente…"), "error": "",
+                "cancel_requested": False,
+            }
+            self._smart_ai_status[slug] = task
+            if busy:
+                self._smart_ai_queue.append(slug)
+        self._guides.set_status(slug, task["phase"], message=task["message"])
+        if not busy:
+            threading.Thread(target=self._smart_guide_worker, args=(slug,), daemon=True).start()
+        return dict(task)
+
+    def cancel_smart_guide(self, slug: str) -> dict:
+        with self._smart_ai_lock:
+            task = self._smart_ai_status.get(slug)
+            if not task or task.get("phase") not in {"running", "queued"}:
+                return {"ok": False, "error": "Nenhuma organização em andamento."}
+            if task.get("phase") == "queued":
+                self._smart_ai_queue = [item for item in self._smart_ai_queue if item != slug]
+                task.update({"ok": False, "phase": "cancelled", "message": "", "error": "Operação cancelada."})
+                self._guides.set_status(slug, "cancelled", error=task["error"], message="")
+                return dict(task)
+            task["cancel_requested"] = True
+            task["message"] = "Cancelamento solicitado…"
+            return dict(task)
+
+    def _smart_guide_worker(self, slug: str) -> None:
+        with self._smart_ai_lock:
+            self._smart_ai_status.setdefault(slug, {}).update({
+                "phase": "running", "message": "Preparando o Guia Inteligente…",
+            })
+        def progress(completed: int, total: int) -> None:
+            with self._smart_ai_lock:
+                task = self._smart_ai_status[slug]
+                if task.get("cancel_requested"):
+                    raise guide_ai.GuideAIError("Operação cancelada.")
+                task.update({
+                    "completed": completed, "total": total,
+                    "message": (f"Organizando lote {min(completed + 1, total)} de {total}…"
+                                if completed < total else "Validando e publicando…"),
+                })
+                message = task["message"]
+            self._guides.set_status(slug, "running", message=message,
+                                    completed=completed, total=total)
+
+        game = load_game_file(GAMES_DIR / f"{slug}.json") or {}
+        config = self._ai_config()
+        try:
+            document = guide_ai.generate_smart_guide(
+                game.get("guide") or [], game, config, progress=progress,
+            )
+            source = self._guides.source(slug)
+            revision = self._guides.publish(
+                slug, document, source.get("hash", ""),
+                document.get("provider", config["provider"]), document.get("model", ""),
+            )
+            status = self._guides.set_status(
+                slug, "success", message="Guia Inteligente publicado.",
+                revision_id=revision["revision_id"],
+            )
+            with self._smart_ai_lock:
+                self._smart_ai_status[slug].update({"ok": True, **status})
+        except Exception as exc:
+            cancelled = "cancelada" in str(exc).lower()
+            phase = "cancelled" if cancelled else "error"
+            status = self._guides.set_status(slug, phase, error=str(exc), message="")
+            with self._smart_ai_lock:
+                self._smart_ai_status[slug].update({"ok": False, **status})
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if game:
+            self._sync_game(game)
+        next_slug = ""
+        with self._smart_ai_lock:
+            while self._smart_ai_queue and not next_slug:
+                candidate = self._smart_ai_queue.pop(0)
+                if (self._smart_ai_status.get(candidate) or {}).get("phase") == "queued":
+                    next_slug = candidate
+        if next_slug:
+            threading.Thread(target=self._smart_guide_worker, args=(next_slug,), daemon=True).start()
+
+    def update_guide_progress(self, slug: str, action: str, block_id: str = "", value=None) -> dict:
+        try:
+            progress = self._guides.update_progress(slug, action, block_id, value)
+            return {"ok": True, "progress": progress,
+                    "next_objective": self._guides.next_objective(self._guides.current(slug), progress)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def restore_smart_guide_revision(self, slug: str, revision_id: str) -> dict:
+        try:
+            revision = self._guides.restore(slug, revision_id)
+            return {"ok": True, "revision": revision}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def compare_smart_guide_revisions(self, slug: str, older: str, newer: str = "") -> dict:
+        def load(revision_id: str) -> dict:
+            if not revision_id:
+                return self._guides.current(slug)
+            safe = re.sub(r"[^a-zA-Z0-9_-]", "", revision_id)
+            return load_game_file(self._guides.directory(slug) / "revisions" / f"{safe}.json") or {}
+        before, after = load(older), load(newer)
+        if not before or not after:
+            return {"ok": False, "error": "Revisão não encontrada."}
+        count = lambda doc: sum(len(ch.get("blocks") or []) for ch in doc.get("chapters") or [])
+        return {"ok": True, "before": {"revision_id": before.get("revision_id"),
+                                        "chapters": len(before.get("chapters") or []), "blocks": count(before)},
+                "after": {"revision_id": after.get("revision_id"),
+                           "chapters": len(after.get("chapters") or []), "blocks": count(after)}}
+
+    def export_guide_pack(self, slug: str, include_progress: bool = True) -> dict:
+        try:
+            filename, encoded = self._guides.export_pack(
+                slug, bool(include_progress), GUIDE_MEDIA_DIR / slug,
+            )
+            return {"ok": True, "filename": filename, "data": encoded}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def import_guide_pack(self, slug: str, encoded: str) -> dict:
+        try:
+            return self._guides.import_pack(slug, encoded, GUIDE_MEDIA_DIR / slug)
+        except (smart_guide.SmartGuideError, zipfile.BadZipFile) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def search_guide_media(self, query: str, source: str = "openverse") -> dict:
+        try:
+            return {"ok": True, "results": self._guide_media.search(query, source)}
+        except guide_media.GuideMediaError as exc:
+            return {"ok": False, "error": str(exc), "results": []}
+
+    def approve_guide_media(self, slug: str, candidate: dict,
+                            rights_confirmed: bool = False) -> dict:
+        try:
+            item = self._guide_media.approve_remote(slug, candidate, bool(rights_confirmed))
+            return {"ok": True, "media": item}
+        except guide_media.GuideMediaError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def add_guide_media(self, slug: str, encoded: str, filename: str, title: str = "") -> dict:
+        try:
+            return {"ok": True, "media": self._guide_media.add_local(slug, encoded, filename, title)}
+        except guide_media.GuideMediaError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def remove_guide_media(self, slug: str, media_id: str) -> dict:
+        return {"ok": self._guide_media.remove(slug, media_id)}
+
+    def create_guide_diagram(self, slug: str, spec: dict) -> dict:
+        try:
+            return {"ok": True, "media": self._guide_media.create_diagram(slug, spec)}
+        except guide_media.GuideMediaError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def open_broad_media_search(self, query: str) -> dict:
+        from urllib.parse import quote_plus
+        query = re.sub(r"\s+", " ", str(query or "")).strip()[:300]
+        if not query:
+            return {"ok": False, "error": "Busca vazia."}
+        webbrowser.open(f"https://www.google.com/search?tbm=isch&q={quote_plus(query)}")
+        return {"ok": True, "requires_rights_confirmation": True}
+
     def _read_guide_sections(self, b64: str):
         """(ok, erro, seções) — extrai do PDF só as seções de dicas/tutoriais
         (remove a seção que lista as conquistas)."""
@@ -1118,9 +1663,11 @@ class Api:
         except Exception as exc:
             return False, f"Não foi possível ler o PDF: {exc}", []
         if not _normalize_text(text):
-            return False, "O PDF não tem texto extraível (parece ser digitalizado/imagem).", []
+            return False, ("O PDF parece digitalizado. Instale Tesseract + "
+                           "PyMuPDF/pytesseract para habilitar OCR local."), []
         parsed = guide_parser.parse_guide(text)
         guide = [s for s in parsed["sections"] if not s.get("is_achievements")]
+        annotate_pdf_pages(guide, raw)
         if not guide:
             return False, "Não encontrei seções de dicas/tutoriais neste PDF.", []
         return True, "", guide
@@ -1131,6 +1678,14 @@ class Api:
         ok, err, guide = self._read_guide_sections(b64)
         if not ok:
             return {"ok": False, "error": err}
+        if self.pending_import is not None:
+            try:
+                self.pending_import["guide_pdf_raw"] = base64.b64decode(
+                    (b64 or "").split(",", 1)[-1], validate=True
+                )
+                self.pending_import["guide_source"] = {"source": "pdf", "filename": filename}
+            except ValueError:
+                pass
         return {"ok": True, "filename": filename, "guide": guide}
 
     def attach_guide_pdf(self, slug: str, b64: str, filename: str = "") -> dict:
@@ -1153,7 +1708,17 @@ class Api:
                 detail["guide"] = guide
         if detail is None:
             self._sync_game(game)
-        return {"ok": True, "sections": len(guide), "filename": filename}
+        media = {"images": [], "image_count": 0, "scanned": False}
+        try:
+            raw = base64.b64decode((b64 or "").split(",", 1)[-1], validate=True)
+            media = self._guide_media.extract_pdf(slug, raw, filename)
+        except (ValueError, guide_media.GuideMediaError):
+            pass  # o texto já foi importado; falha de imagem não desfaz o guia
+        self._capture_smart_source(game, {
+            "source": "pdf", "filename": filename,
+            "pages": media.get("pages", 0), "media_ids": [m["id"] for m in media["images"]],
+        })
+        return {"ok": True, "sections": len(guide), "filename": filename, "media": media}
 
     # --------------------- seletor de artes (multi-fonte) ------------------- #
     # A arte escolhida vira art.cover (retrato: overlay/lateral) e/ou
@@ -1180,6 +1745,109 @@ class Api:
     def get_sources_config(self) -> dict:
         """Quais fontes de imagem têm chave configurada (nunca devolve a chave)."""
         return {"ok": True, "ready": {s: self._source_ready(s) for s in self._SOURCE_KEYS}}
+
+    def get_art_enrichment_status(self, slug: str) -> dict:
+        """Estado estável e sem credenciais da busca automática de hero art."""
+        with self._art_lock:
+            status = dict(self._art_status.get(slug) or {})
+        if status:
+            return {"ok": status.get("status") != "error", **status}
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "status": "error", "error": "Jogo não encontrado."}
+        meta = dict(game.get("art_meta") or {})
+        return {"ok": True, "status": meta.get("auto_status", "idle"),
+                "art_meta": meta}
+
+    def refresh_game_art(self, slug: str, force: bool = False) -> dict:
+        """Enfileira a busca sem bloquear o WebView e nunca troca arte manual."""
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "status": "error", "error": "Jogo não encontrado."}
+        return self._schedule_art_enrichment(slug, bool(force), explicit=True)
+
+    def _set_art_status(self, slug: str, status: str, **extra) -> dict:
+        payload = {"status": status, "updated_at": time.time(), **extra}
+        with self._art_lock:
+            self._art_status[slug] = payload
+        return payload
+
+    def _schedule_art_enrichment(self, slug: str, force: bool = False,
+                                 explicit: bool = False) -> dict:
+        if not slug:
+            return {"ok": False, "status": "error", "error": "Jogo inválido."}
+        with self._art_lock:
+            current = self._art_status.get(slug) or {}
+            if current.get("status") in ("queued", "fetching"):
+                return {"ok": True, **current}
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "status": "error", "error": "Jogo não encontrado."}
+        art = dict(game.get("art") or {})
+        meta = dict(game.get("art_meta") or {})
+        bg_meta = dict(meta.get("background") or {})
+        # Campos background antigos vieram do seletor manual. A ausência de
+        # metadados, portanto, é tratada como escolha do usuário.
+        if art.get("background") and bg_meta.get("manual", True):
+            ready = self._set_art_status(slug, "ready", source="manual")
+            return {"ok": True, **ready, "art": art}
+        if art.get("background") and not force:
+            ready = self._set_art_status(slug, "ready", source=bg_meta.get("origin", "cache"))
+            return {"ok": True, **ready, "art": art}
+        last_attempt = float(meta.get("last_attempt_at") or 0)
+        if not (force or explicit) and last_attempt and time.time() - last_attempt < 86400:
+            status = meta.get("auto_status", "fallback")
+            cached = self._set_art_status(slug, status, source="cache")
+            return {"ok": True, **cached, "art": art}
+        queued = self._set_art_status(slug, "queued")
+        threading.Thread(target=self._enrich_game_art, args=(slug,), daemon=True).start()
+        return {"ok": True, **queued, "art": art}
+
+    def _enrich_game_art(self, slug: str) -> None:
+        self._set_art_status(slug, "fetching")
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            self._set_art_status(slug, "error", error="Jogo não encontrado.")
+            return
+        art = dict(game.get("art") or {})
+        meta = dict(game.get("art_meta") or {})
+        bg_meta = dict(meta.get("background") or {})
+        if art.get("background") and bg_meta.get("manual", True):
+            self._set_art_status(slug, "ready", source="manual")
+            return
+        errors = []
+        picked = None
+        for source in ("steamgriddb", "rawg", "igdb"):
+            if not self._source_ready(source):
+                continue
+            result = self._search_source(source, game.get("title", ""))
+            if not result.get("ok"):
+                errors.append(f"{self._SOURCE_LABEL[source]}: {result.get('error', 'falha')}")
+                continue
+            heroes = result.get("heroes") or []
+            if heroes and heroes[0].get("url"):
+                picked = (source, heroes[0]["url"])
+                break
+        now = time.time()
+        meta["last_attempt_at"] = now
+        if picked:
+            source, url = picked
+            dest = ART_DIR / slug / "background-auto.png"
+            if image_fetch.download_image(url, dest):
+                art["background"] = f"/assets/art/{slug}/background-auto.png?v={int(now)}"
+                meta["background"] = {"origin": source, "source_url": url,
+                                      "manual": False, "updated_at": now}
+                meta["auto_status"] = "ready"
+                self._persist_art(slug, game, art, meta)
+                self._set_art_status(slug, "ready", source=source, art=art)
+                return
+            errors.append(f"{self._SOURCE_LABEL[source]}: download recusado")
+        meta["auto_status"] = "error" if errors else "fallback"
+        if errors:
+            meta["last_error"] = " · ".join(errors)
+        self._persist_art(slug, game, art, meta)
+        self._set_art_status(slug, meta["auto_status"],
+                             error=meta.get("last_error", ""), art=art)
 
     def set_source_key(self, source: str, key1: str = None, key2: str = None) -> dict:
         """Grava as credenciais de uma fonte. Fontes de 1 campo usam `key1`; o
@@ -1343,6 +2011,7 @@ class Api:
         if any(r not in self._ROLE_FILE for r in roles):
             return {"ok": False, "error": f"Papel inválido: {role}"}
         art = dict(game.get("art") or {})
+        art_meta = dict(game.get("art_meta") or {})
         stamp = int(time.time())
         for r in roles:
             dest = ART_DIR / slug / self._ROLE_FILE[r]
@@ -1350,8 +2019,11 @@ class Api:
                 return {"ok": False,
                         "error": "Não consegui baixar a imagem (o servidor recusou ou não é uma imagem)."}
             art[self._ROLE_ART[r]] = f"/assets/art/{slug}/{self._ROLE_FILE[r]}?v={stamp}"
-        self._persist_art(slug, game, art)
-        return {"ok": True, "art": art}
+            art_meta[r] = {"origin": "manual", "source_url": url,
+                           "manual": True, "updated_at": time.time()}
+        art_meta["auto_status"] = "ready"
+        self._persist_art(slug, game, art, art_meta)
+        return {"ok": True, "art": art, "art_meta": art_meta}
 
     def clear_game_cover(self, slug: str, role: str = "cover") -> dict:
         """Volta à arte padrão da RA no papel pedido (`cover`, `background` ou
@@ -1361,20 +2033,27 @@ class Api:
             return {"ok": False, "error": "Jogo não encontrado."}
         roles = ["cover", "background"] if role == "both" else [role]
         art = dict(game.get("art") or {})
+        art_meta = dict(game.get("art_meta") or {})
         for r in roles:
             if r not in self._ROLE_FILE:
                 continue
             art.pop(self._ROLE_ART[r], None)
+            art_meta.pop(r, None)
             try:
                 (ART_DIR / slug / self._ROLE_FILE[r]).unlink(missing_ok=True)
             except OSError:
                 pass
-        self._persist_art(slug, game, art)
-        return {"ok": True, "art": art}
+        art_meta["auto_status"] = "idle"
+        art_meta["last_attempt_at"] = 0
+        self._persist_art(slug, game, art, art_meta)
+        return {"ok": True, "art": art, "art_meta": art_meta}
 
-    def _persist_art(self, slug: str, game: dict, art: dict) -> None:
+    def _persist_art(self, slug: str, game: dict, art: dict,
+                     art_meta: dict | None = None) -> None:
         """Grava o `art` no config do jogo e reflete no estado ao vivo."""
         game["art"] = art
+        if art_meta is not None:
+            game["art_meta"] = art_meta
         (GAMES_DIR / f"{slug}.json").write_text(
             json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -1382,6 +2061,8 @@ class Api:
             detail = self.state.get(slug)
             if detail is not None:
                 detail["art"] = art
+                if art_meta is not None:
+                    detail["art_meta"] = art_meta
 
     # ------------------------- controles da janela -------------------------- #
     # IMPORTANTE: as operacoes de janela do pywebview (destroy/minimize/on_top)
@@ -1441,6 +2122,10 @@ class Api:
             if value:
                 if not self._pre_compact_pos:
                     self._pre_compact_pos = (win.x, win.y)
+                    self._pre_compact_size = (
+                        int(getattr(win, "width", None) or self._normal_size[0]),
+                        int(getattr(win, "height", None) or self._normal_size[1]),
+                    )
                 w, h = size or self._compact_size()
                 win.resize(w, h)
                 pos = dock
@@ -1454,10 +2139,11 @@ class Api:
                 if pos:
                     _move_after_resize(win, pos)
             else:
-                win.resize(*NORMAL_SIZE)
+                win.resize(*(self._pre_compact_size or self._normal_size))
                 if self._pre_compact_pos:
                     _move_after_resize(win, self._pre_compact_pos)
                     self._pre_compact_pos = None
+                self._pre_compact_size = None
 
         if win:
             self._window_op(op)
@@ -1772,8 +2458,8 @@ class Api:
         limited = False
         if self._client:
             try:
-                progress = self._client.get_game_info_and_user_progress(
-                    game["retroachievements_game_id"]
+                progress = self._platform_progress(
+                    int(game.get("external_game_id") or game["retroachievements_game_id"])
                 )
                 earned_map = self._client.parse_achievements(progress)
                 # garante badges em cache (jogo pode ter sido editado)
@@ -1877,12 +2563,39 @@ class Api:
             "softcore_ids": [r["id"] for r in softcore_only],
         }
 
+        smart_bundle = {}
+        if game.get("guide"):
+            if not self._guides.source(slug):
+                self._capture_smart_source(game, {"source": "migration"})
+            smart_bundle = self._guides.bundle(slug)
+            smart_bundle["media"] = self._guide_media.list(slug)
+            document = smart_bundle.get("current") or {}
+            effective = dict(smart_bundle.get("progress") or {})
+            completed = set(effective.get("completed") or [])
+            earned_names = [_normalize_text(row["name"]) for row in ordered if row["earned"]]
+            external = []
+            for chapter in document.get("chapters") or []:
+                for block in chapter.get("blocks") or []:
+                    haystack = _normalize_text(f"{block.get('title', '')} {block.get('text', '')}")
+                    if block.get("type") == "achievement" and any(name and name in haystack for name in earned_names):
+                        completed.add(block.get("id"))
+                        external.append(block.get("id"))
+            effective["completed"] = sorted(completed)
+            smart_bundle["effective_progress"] = effective
+            smart_bundle["external_completed"] = external
+            smart_bundle["next_objective"] = self._guides.next_objective(document, effective)
+
         detail = {
             "slug": slug,
             "title": game["title"],
             "platform": game["platform"],
+            "genre": game.get("genre", ""),
+            "year": game.get("year", ""),
+            "players": game.get("players", ""),
+            "provider_id": game.get("provider_id", "retroachievements"),
             "icon": game.get("icon", ""),
             "art": game.get("art", {}),
+            "art_meta": game.get("art_meta", {}),
             "accent": game.get("accent", ACCENTS[0]),
             "modes": modes,
             "mastery": mastery,
@@ -1890,6 +2603,7 @@ class Api:
             "next_ids": next_ids,
             "last_earned": last_earned,
             "guide": game.get("guide", []),   # seções de dicas/tutoriais do PDF
+            "smart_guide": smart_bundle,
         }
         with self._lock:
             self.state[slug] = detail
@@ -1969,6 +2683,8 @@ def start_static_server() -> int:
 def main():
     emulator_tracker.enable_dpi_awareness()
     api = Api()
+    normal_size = adaptive_normal_size()
+    api._normal_size = normal_size
     port = start_static_server()
     url = f"http://127.0.0.1:{port}/ui/index.html"
 
@@ -1976,8 +2692,8 @@ def main():
         "DigiTracker",
         url=url,
         js_api=api,
-        width=NORMAL_SIZE[0],
-        height=NORMAL_SIZE[1],
+        width=normal_size[0],
+        height=normal_size[1],
         min_size=COMPACT_MIN,    # permite encolher até o menor overlay ajustável
         frameless=True,
         easy_drag=False,      # arrasto via .pywebview-drag-region
