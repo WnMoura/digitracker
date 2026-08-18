@@ -169,7 +169,7 @@ const hasBackend = () => typeof window.pywebview !== "undefined" && window.pyweb
 const backend = {
   async appState() {
     if (S.mode === "demo") return {
-      configured: true, version: "0.8.2", auto_import: true,
+      configured: true, version: "0.8.3", auto_import: true,
       auto_overlay: true, auto_check_updates: true,
       smart_guide_auto: true, smart_guide_consent: false,
       guide_density: "comfortable", ui_scale: 100, reduced_motion: false,
