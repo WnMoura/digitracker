@@ -813,6 +813,14 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
 .cw-count { font-size: 10px; font-weight: 600; color: var(--text-2); padding: 2px 7px; border-radius: var(--pill); background: rgba(0, 0, 0, .4); }
 .cw-count small { color: var(--text-3); }
 .cw-pct { font-size: 10px; font-weight: 800; color: rgb(var(--ink-deep)); padding: 2px 7px; border-radius: var(--pill); background: var(--jogo); }
+.cw-exit {
+  flex: 0 0 20px; width: 20px; height: 20px; padding: 0;
+  display: grid; place-items: center; border: 1px solid rgba(255,255,255,.18);
+  border-radius: 50%; color: var(--text-2); background: rgba(0,0,0,.28);
+  font-size: 15px; line-height: 1; cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.cw-exit:hover { color: var(--text); border-color: var(--deck-cyan); background: rgba(72,199,255,.16); }
 /* Conteúdo abaixo da faixa: rola quando não cabe (útil na aba Dicas). A barra
    de rolagem fica oculta — o overlay é pequeno e ganharia uma faixa cinza à
    direita; a rolagem pela roda do mouse continua funcionando. */

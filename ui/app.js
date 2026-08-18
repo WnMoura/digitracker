@@ -408,6 +408,7 @@ const backend = {
    ele chama esta função para a interface acompanhar na hora. */
 window.onOverlayChanged = async (compact) => {
   S.compact = !!compact;
+  syncInputMode();
   const btn = document.getElementById("btn-compact");
   if (btn) {
     btn.classList.toggle("active", S.compact);
@@ -647,6 +648,7 @@ function compactHTML(game) {
         <span class="cw-count" title="Em hardcore, o que vale Mastery">${mst.hardcore || 0}<small>/${t}</small></span>
         <span class="cw-pct">${mst.percent || 0}%</span>
       </span>
+      <button class="cw-exit" id="cw-exit" title="Sair do modo compacto" aria-label="Sair do modo compacto">×</button>
     </div>
     <div class="cw-content" data-scroll="compact">${conteudo}</div>
   </div>`;
@@ -737,6 +739,7 @@ function cwTipsHTML(game) {
 function bindCompact() {
   $("#cw-prev")?.addEventListener("click", () => switchCompactGame(-1));
   $("#cw-next")?.addEventListener("click", () => switchCompactGame(1));
+  $("#cw-exit")?.addEventListener("click", () => toggleCompact(false));
   makeDraggable(root.querySelector(".cw-head"));
   root.querySelectorAll("[data-cwtab]").forEach((b) =>
     b.addEventListener("click", () => { S.cwTab = b.dataset.cwtab; renderDashboard({ force: true }); }));
@@ -787,6 +790,7 @@ function makeDraggable(el) {
    aparece no hover do próprio overlay, já que a barra some no compacto). */
 async function toggleCompact(value) {
   S.compact = value !== undefined ? !!value : !S.compact;
+  syncInputMode();
   const btn = document.getElementById("btn-compact");
   if (btn) {
     btn.classList.toggle("active", S.compact);
@@ -3029,6 +3033,11 @@ function cyclePanelTab(dir) {
 
 function bindAtalhos() {
   document.addEventListener("keydown", async (e) => {
+    // O overlay fica sobre o jogo. Não deixe os atalhos globais (setas, C,
+    // Esc etc.) consumirem a entrada enquanto o usuário joga com teclado.
+    // Cliques continuam funcionando porque esta proteção cobre somente
+    // eventos de teclado.
+    if (S.compact) return;
     // não sequestra digitação em campos de texto
     const alvo = e.target;
     if (alvo && (alvo.tagName === "INPUT" || alvo.tagName === "TEXTAREA" || alvo.isContentEditable)) {
@@ -3061,14 +3070,26 @@ function bindAtalhos() {
   });
 }
 
+function stopGamepadNavigation() {
+  if (S.gamepadLoop !== null) cancelAnimationFrame(S.gamepadLoop);
+  S.gamepadLoop = null;
+  S.gamepadLast = {};
+}
+
 function startGamepadNavigation() {
-  if (S.gamepadLoop) return;
+  if (S.compact || S.gamepadLoop !== null) return;
   const pulse = (key, active, fn) => {
     const now = performance.now(), state = S.gamepadLast[key] || { active: false, at: 0 };
     if (active && (!state.active || now - state.at > 230)) { fn(); state.at = now; }
     state.active = active; S.gamepadLast[key] = state;
   };
   const frame = () => {
+    // O controle deve permanecer exclusivamente com o jogo quando o
+    // DigiTracker estiver encaixado como overlay compacto.
+    if (S.compact) {
+      stopGamepadNavigation();
+      return;
+    }
     const pad = [...(navigator.getGamepads?.() || [])].find(Boolean);
     if (pad) {
       const pressed = (i) => !!pad.buttons[i]?.pressed;
@@ -3082,9 +3103,24 @@ function startGamepadNavigation() {
       pulse("rb", pressed(5), () => cyclePanelTab(1));
       pulse("compact", pressed(9), toggleCompacto);
     }
+    if (S.compact) {
+      stopGamepadNavigation();
+      return;
+    }
     S.gamepadLoop = requestAnimationFrame(frame);
   };
   S.gamepadLoop = requestAnimationFrame(frame);
+}
+
+function syncInputMode() {
+  if (S.compact) {
+    stopGamepadNavigation();
+    // Evita que um botão previamente focado receba um "A" atrasado ao
+    // alternar para o overlay. O mouse continua podendo focar os controles.
+    document.activeElement?.blur?.();
+  } else {
+    startGamepadNavigation();
+  }
 }
 
 async function trocarJogo(dir) {
@@ -3097,6 +3133,7 @@ async function trocarJogo(dir) {
 async function toggleCompacto() {
   const btn = $("#btn-compact");
   S.compact = !S.compact;
+  syncInputMode();
   btn?.classList.toggle("active", S.compact);
   if (hasBackend()) window.pywebview.api.set_compact(S.compact);
   if (S.view === "dashboard") await renderDashboard({ force: true });
