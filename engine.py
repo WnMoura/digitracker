@@ -118,22 +118,31 @@ DEFAULT_SETTINGS = {
     "guide_density": "comfortable", # comfortable | compact
     "ui_scale": 100,
     "reduced_motion": False,
-    "compact_width": 300,   # tamanho do overlay compacto (ajustável pelo usuário)
+    "compact_size_mode": "auto",  # auto | manual
+    "compact_width": 300,   # tamanho manual do overlay compacto
     "compact_height": 232,
     "compact_last": 2,      # quantas conquistas OBTIDAS mostrar no compacto
     "compact_next": 0,      # quantas PRÓXIMAS mostrar (0 = cabe o que couber)
+    "compact_content": "objective",  # objective | achievements | guide
+    "compact_corner": "auto",        # auto | top-right | bottom-right | top-left | bottom-left
+    "compact_opacity": 42,            # alpha base em percentuais (30..85)
+    "compact_hotkey": "ctrl+alt+g",
+    "compact_auto_expand": False,
+    "compact_auto_collapse_seconds": 0,
 }
 
 # Limites do overlay compacto: não deixa encolher a ponto de nada caber, nem
 # crescer tanto que deixe de ser um overlay.
-COMPACT_MIN = (240, 150)
-COMPACT_MAX = (640, 900)
+COMPACT_MIN = (220, 64)
+COMPACT_MAX = (520, 360)
 
 # Quando "ajustar ao emulador" está ligado, o overlay ocupa esta fração da
 # janela do emulador (preso a COMPACT_MIN/MAX) — cresce em jogo grande, encolhe
 # em janela pequena.
-OVERLAY_FIT_W = 0.26
-OVERLAY_FIT_H = 0.44
+OVERLAY_FIT_W = 0.20
+OVERLAY_FIT_H = 0.12
+OVERLAY_EXPANDED_W = 0.30
+OVERLAY_EXPANDED_H = 0.32
 
 ACCENTS = ["#D62839", "#F5C518", "#2DE2E6", "#27AE60"]
 
@@ -144,8 +153,8 @@ ACCENTS = ["#D62839", "#F5C518", "#2DE2E6", "#27AE60"]
 DEFAULT_MODES = ("hardcore", "softcore")
 
 NORMAL_SIZE = (1040, 680)
-COMPACT_SIZE = (300, 232)   # janela mini/overlay com o progresso do jogo
-COMPACT_MARGIN = 24         # distância do canto da tela ao entrar em modo compacto
+COMPACT_SIZE = (280, 84)    # fallback do HUD mínimo
+COMPACT_MARGIN = 16         # distância do canto da área cliente
 
 
 # ---------------------------------------------------------------------------- #
@@ -223,6 +232,25 @@ def load_settings() -> dict:
             value = saved.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 settings[key] = int(value)
+        size_mode = saved.get("compact_size_mode")
+        if size_mode in ("auto", "manual"):
+            settings["compact_size_mode"] = size_mode
+        content = saved.get("compact_content")
+        if content in ("objective", "achievements", "guide"):
+            settings["compact_content"] = content
+        corner = saved.get("compact_corner")
+        if corner in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
+            settings["compact_corner"] = corner
+        opacity = saved.get("compact_opacity")
+        if isinstance(opacity, (int, float)) and not isinstance(opacity, bool):
+            settings["compact_opacity"] = max(30, min(85, int(opacity)))
+        hotkey = saved.get("compact_hotkey")
+        if isinstance(hotkey, str) and hotkey.strip():
+            settings["compact_hotkey"] = hotkey.strip().lower()
+        settings["compact_auto_expand"] = bool(saved.get("compact_auto_expand", False))
+        collapse = saved.get("compact_auto_collapse_seconds")
+        if isinstance(collapse, (int, float)) and not isinstance(collapse, bool):
+            settings["compact_auto_collapse_seconds"] = max(0, min(60, int(collapse)))
     return settings
 
 
@@ -358,9 +386,15 @@ class Api:
         self._overlay_last_check = 0.0
         self.index_building = False
         self._compact = False
+        self._compact_state = "hidden"  # hidden | minimal | expanded
         self._pre_compact_pos: tuple[int, int] | None = None
         self._pre_compact_size: tuple[int, int] | None = None
         self._normal_size = NORMAL_SIZE
+        self._overlay_input = emulator_tracker.create_overlay_input()
+        self._overlay_native_status = {"passive": False, "error": ""}
+        self._compact_corner_actual = "top-right"
+        self._hotkey_value = ""
+        self._auto_collapse_timer = None
         self._art_status: dict[str, dict] = {}
         self._art_lock = threading.Lock()
         self._lock = threading.Lock()
@@ -419,6 +453,8 @@ class Api:
             "guide_density": self.settings.get("guide_density", "comfortable"),
             "ui_scale": self.settings.get("ui_scale", 100),
             "reduced_motion": bool(self.settings.get("reduced_motion", False)),
+            "compact_state": self._compact_state,
+            "compact_content": self.settings.get("compact_content", "objective"),
             "platform_providers": self._platforms.describe(),
             "pdf_ocr_available": pdf_ocr_available(),
         }
@@ -644,7 +680,9 @@ class Api:
             "overlay": {"auto_overlay", "overlay_exit_fullscreen",
                         "overlay_second_screen", "overlay_fit_emulator"},
             "compact": {"compact_width", "compact_height", "compact_last",
-                        "compact_next"},
+                        "compact_next", "compact_size_mode", "compact_content",
+                        "compact_corner", "compact_opacity", "compact_hotkey",
+                        "compact_auto_expand", "compact_auto_collapse_seconds"},
         }
         if section not in allowed:
             return {"ok": False, "error": "Sessão de configurações desconhecida."}
@@ -670,18 +708,55 @@ class Api:
                         self.settings[key] = max(80, min(140, int(value)))
                     except (TypeError, ValueError):
                         return {"ok": False, "error": "Escala inválida."}
+                elif key == "compact_size_mode":
+                    if value not in ("auto", "manual"):
+                        return {"ok": False, "error": "Modo de tamanho inválido."}
+                    self.settings[key] = value
+                elif key == "compact_content":
+                    if value not in ("objective", "achievements", "guide"):
+                        return {"ok": False, "error": "Conteúdo do overlay inválido."}
+                    self.settings[key] = value
+                elif key == "compact_corner":
+                    if value not in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
+                        return {"ok": False, "error": "Canto do overlay inválido."}
+                    self.settings[key] = value
+                elif key == "compact_opacity":
+                    try:
+                        self.settings[key] = max(30, min(85, int(value)))
+                    except (TypeError, ValueError):
+                        return {"ok": False, "error": "Opacidade inválida."}
+                elif key == "compact_hotkey":
+                    if not isinstance(value, str) or not value.strip():
+                        return {"ok": False, "error": "Hotkey inválida."}
+                    try:
+                        emulator_tracker.parse_hotkey(value)
+                    except ValueError as exc:
+                        return {"ok": False, "error": str(exc)}
+                    self.settings[key] = value.strip().lower()
+                elif key == "compact_auto_expand":
+                    self.settings[key] = bool(value)
+                elif key == "compact_auto_collapse_seconds":
+                    try:
+                        self.settings[key] = max(0, min(60, int(value)))
+                    except (TypeError, ValueError):
+                        return {"ok": False, "error": "Tempo de recolhimento inválido."}
                 elif key in {"compact_width", "compact_height", "compact_last", "compact_next"}:
                     try:
                         number = int(value)
                     except (TypeError, ValueError):
                         return {"ok": False, "error": "Valor numérico inválido."}
                     limits = {
-                        "compact_width": (240, 640),
-                        "compact_height": (150, 900),
+                        "compact_width": COMPACT_MIN[0],
+                        "compact_height": COMPACT_MIN[1],
                         "compact_last": (0, 10),
                         "compact_next": (0, 10),
                     }[key]
-                    self.settings[key] = max(limits[0], min(limits[1], number))
+                    if key == "compact_width":
+                        self.settings[key] = max(COMPACT_MIN[0], min(COMPACT_MAX[0], number))
+                    elif key == "compact_height":
+                        self.settings[key] = max(COMPACT_MIN[1], min(COMPACT_MAX[1], number))
+                    else:
+                        self.settings[key] = max(limits[0], min(limits[1], number))
             save_settings(self.settings)
             result = {key: self.settings[key] for key in allowed[section]
                       if key in self.settings}
@@ -692,8 +767,11 @@ class Api:
                 and result.get("smart_guide_consent") and self._ai_key():
             self._resume_pending_smart_guides()
         if section == "compact" and self._compact and self._window:
-            w, h = self._compact_size()
+            w, h = self._overlay_size_for(self._current_overlay_rect())
             self._window_op(lambda: self._window.resize(w, h))
+            self._configure_native_overlay()
+        if section == "compact":
+            self._start_overlay_hotkey()
         return {"ok": True, "section": section, **result}
 
     # --------------------------- busca (wizard p1) -------------------------- #
@@ -2078,6 +2156,10 @@ class Api:
             self._window_op(self._window.minimize)
 
     def close(self):
+        try:
+            self._overlay_input.close()
+        except Exception:
+            pass
         if self._window:
             self._window_op(self._window.destroy)
 
@@ -2115,7 +2197,11 @@ class Api:
         na mão com o emulador aberto silencia o overlay automático."""
         value = bool(value)
         was_auto = self._compact and not value and from_user
+        if from_user and self._auto_collapse_timer:
+            self._auto_collapse_timer.cancel()
+            self._auto_collapse_timer = None
         self._compact = value
+        self._compact_state = "minimal" if value else "hidden"
         win = self._window
 
         def op():
@@ -2126,7 +2212,7 @@ class Api:
                         int(getattr(win, "width", None) or self._normal_size[0]),
                         int(getattr(win, "height", None) or self._normal_size[1]),
                     )
-                w, h = size or self._compact_size()
+                w, h = size or self._compact_size(self._current_overlay_rect())
                 win.resize(w, h)
                 pos = dock
                 if pos is None:
@@ -2147,6 +2233,7 @@ class Api:
 
         if win:
             self._window_op(op)
+        self._configure_native_overlay()
         if was_auto and self._overlay:
             self._overlay.notify_manual_exit()
         return {"ok": True, "compact": value}
@@ -2249,43 +2336,114 @@ class Api:
         with self._lock:
             self.overlay_notice = mensagem
 
-    def _compact_size(self) -> tuple[int, int]:
-        """Tamanho do overlay compacto, do jeito que o usuário ajustou nas
-        Configurações, preso a limites sensatos."""
+    def _current_overlay_rect(self):
+        tracker = self._tracker
+        if tracker and hasattr(tracker, "status"):
+            return tracker.status().get("rect")
+        return None
+
+    def _compact_size(self, rect=None, expanded=None) -> tuple[int, int]:
+        """Calcula o tamanho mínimo/expandido ou manual do overlay."""
         with self._lock:
-            w = int(self.settings.get("compact_width") or COMPACT_SIZE[0])
-            h = int(self.settings.get("compact_height") or COMPACT_SIZE[1])
-        w = max(COMPACT_MIN[0], min(COMPACT_MAX[0], w))
-        h = max(COMPACT_MIN[1], min(COMPACT_MAX[1], h))
-        return w, h
+            mode = self.settings.get("compact_size_mode", "auto")
+            fit = self.settings.get("overlay_fit_emulator", True)
+            manual_w = int(self.settings.get("compact_width") or COMPACT_SIZE[0])
+            manual_h = int(self.settings.get("compact_height") or COMPACT_SIZE[1])
+        expanded = self._compact_state == "expanded" if expanded is None else bool(expanded)
+        if mode == "manual" or not fit:
+            w, h = manual_w, manual_h
+        elif not rect:
+            w, h = ((360, 180) if expanded else COMPACT_SIZE)
+        else:
+            _ex, _ey, ew, eh = rect
+            ratio_w = OVERLAY_EXPANDED_W if expanded else OVERLAY_FIT_W
+            ratio_h = OVERLAY_EXPANDED_H if expanded else OVERLAY_FIT_H
+            w, h = round(ew * ratio_w), round(eh * ratio_h)
+        return max(COMPACT_MIN[0], min(COMPACT_MAX[0], w)), max(COMPACT_MIN[1], min(COMPACT_MAX[1], h))
 
     def _overlay_size_for(self, rect=None) -> tuple[int, int]:
         """Tamanho do overlay ao grudar: proporcional à janela do emulador quando
         'ajustar ao emulador' está ligado (preso a COMPACT_MIN/MAX); senão, o
         tamanho manual das Configurações."""
-        with self._lock:
-            fit = self.settings.get("overlay_fit_emulator", True)
-        if not (fit and rect):
-            return self._compact_size()
-        _ex, _ey, ew, eh = rect
-        w = max(COMPACT_MIN[0], min(COMPACT_MAX[0], round(ew * OVERLAY_FIT_W)))
-        h = max(COMPACT_MIN[1], min(COMPACT_MAX[1], round(eh * OVERLAY_FIT_H)))
-        return w, h
+        return self._compact_size(rect)
 
     def _dock_for(self, rect, size=None):
-        return emulator_tracker.dock_position(
-            rect, size or self._compact_size(), COMPACT_MARGIN)
+        size = size or self._compact_size(rect)
+        with self._lock:
+            corner = self.settings.get("compact_corner", "auto")
+        if corner == "auto":
+            # A preferência estável mantém o HUD fora do centro; o fallback
+            # para a direita inferior só é usado quando a área é muito baixa.
+            corner = "bottom-right" if rect[3] < size[1] * 2.4 else "top-right"
+        self._compact_corner_actual = corner
+        return emulator_tracker.dock_position(rect, size, COMPACT_MARGIN, corner)
+
+    def _configure_native_overlay(self):
+        if not self._window or not self._own_hwnd:
+            return
+        if self._compact:
+            result = self._overlay_input.apply_passive(self._own_hwnd)
+            self._overlay_native_status = {
+                "passive": bool(result.get("passive")),
+                "error": str(result.get("error") or ""),
+            }
+        else:
+            self._overlay_input.restore()
+            self._overlay_native_status = {"passive": False, "error": ""}
+
+    def _cycle_compact_state(self):
+        if not self._compact:
+            self.set_compact_state("minimal", from_user=True)
+        elif self._compact_state == "minimal":
+            self.set_compact_state("expanded", from_user=True)
+        else:
+            self.set_compact(False, from_user=True)
+
+    def set_compact_state(self, state: str, from_user: bool = True) -> dict:
+        state = str(state or "").lower()
+        if state not in ("minimal", "expanded"):
+            return {"ok": False, "error": "Estado compacto inválido."}
+        if from_user and self._auto_collapse_timer:
+            self._auto_collapse_timer.cancel()
+            self._auto_collapse_timer = None
+        self._compact_state = state
+        if not self._compact:
+            self.set_compact(True, from_user=from_user)
+        rect = self._current_overlay_rect()
+        size = self._compact_size(rect, expanded=state == "expanded")
+        self._overlay_size = size
+        dock = self._dock_for(rect, size) if rect else None
+        if self._window:
+            def resize_and_dock():
+                self._window.resize(*size)
+                if dock:
+                    _move_after_resize(self._window, dock)
+            self._window_op(resize_and_dock)
+        self._configure_native_overlay()
+        self._notify_ui_compact(True, state)
+        return {"ok": True, "compact": True, "state": state}
 
     def get_compact_config(self) -> dict:
         """Tamanho e contagens do overlay compacto para a UI."""
-        w, h = self._compact_size()
+        w, h = self._compact_size(self._current_overlay_rect())
         with self._lock:
             last = int(self.settings.get("compact_last", 2))
             nxt = int(self.settings.get("compact_next", 0))
+            values = {
+                "size_mode": self.settings.get("compact_size_mode", "auto"),
+                "content": self.settings.get("compact_content", "objective"),
+                "corner": self.settings.get("compact_corner", "auto"),
+                "opacity": int(self.settings.get("compact_opacity", 42)),
+                "hotkey": self.settings.get("compact_hotkey", "ctrl+alt+g"),
+                "auto_expand": bool(self.settings.get("compact_auto_expand", False)),
+                "auto_collapse_seconds": int(self.settings.get("compact_auto_collapse_seconds", 0)),
+            }
         return {"ok": True, "width": w, "height": h,
-                "last": max(0, last), "next": max(0, nxt)}
+                "last": max(0, last), "next": max(0, nxt), **values}
 
-    def set_compact_config(self, width=None, height=None, last=None, next=None) -> dict:
+    def set_compact_config(self, width=None, height=None, last=None, next=None,
+                           size_mode=None, content=None, corner=None, opacity=None,
+                           hotkey=None, auto_expand=None, auto_collapse_seconds=None) -> dict:
         """Salva o tamanho/contagens do compacto. Se já estiver em modo compacto,
         redimensiona a janela na hora."""
         with self._lock:
@@ -2297,20 +2455,51 @@ class Api:
                 self.settings["compact_last"] = max(0, int(last))
             if next is not None:
                 self.settings["compact_next"] = max(0, int(next))
+            if size_mode in ("auto", "manual"):
+                self.settings["compact_size_mode"] = size_mode
+            if content in ("objective", "achievements", "guide"):
+                self.settings["compact_content"] = content
+            if corner in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
+                self.settings["compact_corner"] = corner
+            if opacity is not None:
+                self.settings["compact_opacity"] = max(30, min(85, int(opacity)))
+            if hotkey is not None:
+                try:
+                    emulator_tracker.parse_hotkey(hotkey)
+                except ValueError as exc:
+                    return {"ok": False, "error": str(exc)}
+                self.settings["compact_hotkey"] = str(hotkey).strip().lower()
+            if auto_expand is not None:
+                self.settings["compact_auto_expand"] = bool(auto_expand)
+            if auto_collapse_seconds is not None:
+                self.settings["compact_auto_collapse_seconds"] = max(0, min(60, int(auto_collapse_seconds)))
             save_settings(self.settings)
         win = self._window
-        if win and self._compact and (width is not None or height is not None):
-            w, h = self._compact_size()
+        if win and self._compact and (width is not None or height is not None or size_mode is not None):
+            w, h = self._compact_size(self._current_overlay_rect())
             self._window_op(lambda: win.resize(w, h))
+        if hotkey is not None:
+            self._start_overlay_hotkey()
+        self._configure_native_overlay()
         return self.get_compact_config()
 
-    def _notify_ui_compact(self, compact: bool):
+    def _start_overlay_hotkey(self):
+        value = str(self.settings.get("compact_hotkey", "ctrl+alt+g"))
+        if value == self._hotkey_value:
+            return
+        result = self._overlay_input.start_hotkey(value, self._cycle_compact_state)
+        self._hotkey_value = value
+        if not result.get("ok"):
+            self._overlay_native_status["error"] = str(result.get("error") or "")
+
+    def _notify_ui_compact(self, compact: bool, state: str | None = None):
         """O backend mudou o modo sozinho — o JS precisa saber para re-renderizar
         (o polling de 5s do dashboard só perceberia depois)."""
         win = self._window
         if not win:
             return
-        js = f"window.onOverlayChanged && window.onOverlayChanged({str(bool(compact)).lower()})"
+        state = state or (self._compact_state if compact else "hidden")
+        js = f"window.onOverlayChanged && window.onOverlayChanged({str(bool(compact)).lower()}, {json.dumps(state)})"
         try:
             win.evaluate_js(js)
         except Exception:
@@ -2333,6 +2522,12 @@ class Api:
             "rect": list(rect) if rect else [],
             "last_check": raw.get("last_check") or self._overlay_last_check,
             "error": self._overlay_error or str(raw.get("error") or ""),
+            "native_input_mode": "passive" if self._overlay_native_status.get("passive") else "fallback",
+            "hotkey_registered": bool(self._overlay_input.status().get("registered")),
+            "hotkey": self._overlay_input.status().get("hotkey", ""),
+            "hotkey_error": self._overlay_input.status().get("error", "") or self._overlay_native_status.get("error", ""),
+            "compact_state": self._compact_state,
+            "corner": self._compact_corner_actual,
         }
         if rect:
             size = self._overlay_size_for(rect)
@@ -2368,10 +2563,16 @@ class Api:
             self._own_hwnd = self._tracker.own_window_handle(self._window)
         except Exception:
             self._own_hwnd = None
+        self._start_overlay_hotkey()
+        self._configure_native_overlay()
 
         while True:
             time.sleep(OVERLAY_INTERVAL)
             try:
+                if not self._own_hwnd:
+                    self._own_hwnd = self._tracker.own_window_handle(self._window)
+                if self._own_hwnd and self._compact:
+                    self._configure_native_overlay()
                 with self._lock:
                     enabled = self.settings.get("auto_overlay", True)
                 exclusivo = enabled and self._tracker.is_exclusive_fullscreen()
@@ -2606,8 +2807,31 @@ class Api:
             "smart_guide": smart_bundle,
         }
         with self._lock:
+            previous = self.state.get(slug)
             self.state[slug] = detail
+        self._maybe_expand_for_unlock(previous, detail)
         return detail
+
+    def _maybe_expand_for_unlock(self, previous, current):
+        """Expande somente quando habilitado e uma nova conquista entrou."""
+        if not self._compact or not self.settings.get("compact_auto_expand", False):
+            return
+        if not previous:
+            return
+        before = previous.get("last_earned") or {}
+        after = current.get("last_earned") or {}
+        if not after.get("date_raw") or after.get("date_raw") == before.get("date_raw"):
+            return
+        self.set_compact_state("expanded", from_user=False)
+        seconds = int(self.settings.get("compact_auto_collapse_seconds", 0) or 0)
+        if seconds > 0:
+            if self._auto_collapse_timer:
+                self._auto_collapse_timer.cancel()
+            self._auto_collapse_timer = threading.Timer(
+                seconds, lambda: self.set_compact_state("minimal", from_user=False)
+            )
+            self._auto_collapse_timer.daemon = True
+            self._auto_collapse_timer.start()
 
     def _kick_sync(self) -> bool:
         """Recarrega todos os jogos do disco e recomputa o estado uma vez.
@@ -2698,7 +2922,8 @@ def main():
         frameless=True,
         easy_drag=False,      # arrasto via .pywebview-drag-region
         on_top=True,
-        background_color="#08080F",
+        background_color="#000000",
+        transparent=True,
     )
     api._window = window
 

@@ -733,10 +733,40 @@ class TestConfiguracoesPorSessao:
             "compact_last": -5, "compact_next": 99,
         })
         assert result["ok"] is True
-        assert result["compact_width"] == 640
-        assert result["compact_height"] == 150
+        assert result["compact_width"] == 520
+        assert result["compact_height"] == 64
         assert result["compact_last"] == 0
         assert result["compact_next"] == 10
+
+    def test_salva_preferencias_do_hud_passivo(self, api):
+        result = api.set_settings_session("compact", {
+            "compact_size_mode": "auto", "compact_content": "guide",
+            "compact_corner": "bottom-right", "compact_opacity": 31,
+            "compact_hotkey": "ctrl+alt+g", "compact_auto_expand": True,
+            "compact_auto_collapse_seconds": 12,
+        })
+        assert result["ok"] is True
+        settings = engine.load_settings()
+        assert settings["compact_content"] == "guide"
+        assert settings["compact_corner"] == "bottom-right"
+        assert settings["compact_opacity"] == 31
+        assert settings["compact_auto_collapse_seconds"] == 12
+
+    def test_recusa_hotkey_sem_modificador(self, api):
+        result = api.set_settings_session("compact", {"compact_hotkey": "f2"})
+        assert result["ok"] is False
+
+    def test_tamanho_auto_minimo_e_expandido_respeita_area_cliente(self, api):
+        rect = (0, 0, 1280, 720)
+        assert api._compact_size(rect, expanded=False) == (256, 86)
+        assert api._compact_size(rect, expanded=True) == (384, 230)
+
+    def test_config_compacto_expoe_hud_passivo(self, api):
+        cfg = api.get_compact_config()
+        assert cfg["size_mode"] == "auto"
+        assert cfg["content"] == "objective"
+        assert cfg["opacity"] == 42
+        assert cfg["hotkey"] == "ctrl+alt+g"
 
 
 class TestCleanWalkthrough:

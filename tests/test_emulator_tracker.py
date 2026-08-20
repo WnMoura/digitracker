@@ -122,6 +122,21 @@ class TestDockPosition:
         x, y = et.dock_position((-1920, 0, 1920, 1080), (300, 232))
         assert (x, y) == (-316, 16)
 
+    def test_calcula_cantos_alternativos(self):
+        rect = (100, 50, 1280, 720)
+        assert et.dock_position(rect, (220, 64), corner="bottom-right") == (1144, 690)
+        assert et.dock_position(rect, (220, 64), corner="top-left") == (116, 66)
+
+
+class TestHotkey:
+    def test_parseia_hotkey_com_modificadores(self):
+        mods, key = et.parse_hotkey("ctrl+alt+g")
+        assert mods == 0x0003 and key == ord("G")
+
+    def test_rejeita_tecla_sem_modificador(self):
+        with pytest.raises(ValueError):
+            et.parse_hotkey("f2")
+
 
 # ---------------------------------------------------------------------------- #
 # Máquina de estados

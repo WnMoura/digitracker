@@ -778,86 +778,56 @@ button { cursor: pointer; background: none; border: none; color: inherit; }
 .cv-cell:hover { border-color: var(--jogo); transform: translateY(-2px); }
 .cv-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
 
-/* ══════════════════════════  OVERLAY COMPACTO  ═════════════════════════ */
-/* No compacto a barra de título do app some por inteiro — o próprio overlay
-   traz sua faixa mínima (abas + progresso + fechar) e é arrastável por ela. */
-#app.compact .titlebar { display: none; }
-#app.compact .keybar { display: none; }
+/* ══════════════════════════  OVERLAY COMPACTO 2.0  ═══════════════════════ */
+#app.compact, #app.compact > .body, #app.compact #root { background: transparent !important; }
+.compact-window, body.compact-window { background: transparent !important; }
+#app.compact .titlebar, #app.compact .keybar { display: none; }
 
-.cw { position: relative; height: 100%; overflow: hidden; display: flex; flex-direction: column; }
-/* A capa (escolhida no seletor ou a da RA) preenche o fundo do overlay, bem
-   apagada; o scrim por cima garante que o texto continue legível sobre ela. */
-.cw-art {
-  position: absolute; inset: 0;
-  background-size: cover; background-position: center; opacity: .2;
+.cw {
+  --cw-alpha: .42;
+  position: relative; height: 100%; overflow: hidden; display: flex; flex-direction: column;
+  color: var(--text); border: 1px solid color-mix(in srgb, var(--jogo) 58%, rgba(140,210,255,.4));
+  border-radius: 12px; background: rgb(5 12 24 / var(--cw-alpha));
+  box-shadow: 0 10px 32px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.08);
+  backdrop-filter: blur(10px) saturate(120%); -webkit-backdrop-filter: blur(10px) saturate(120%);
 }
-.cw-scrim {
-  position: absolute; inset: 0; pointer-events: none;
-  background: linear-gradient(180deg, rgb(var(--ink-deep) / .72) 0%, rgb(var(--ink-deep) / .82) 100%);
-}
-/* Faixa superior: abas Conquistas/Dicas + progresso + controles. É a região de
-   arraste (pywebview-drag-region) — os botões dentro dela continuam clicáveis. */
-.cw-head {
-  position: relative; z-index: 2; flex-shrink: 0;
-  display: flex; align-items: center; gap: var(--s2);
-  padding: 7px var(--s3); cursor: move;
-}
-.cw-tabs { display: flex; gap: 2px; background: rgba(0,0,0,.35); border-radius: var(--pill); padding: 2px; }
-.cw-tab {
-  font-size: 10.5px; font-weight: 700; color: var(--text-3);
-  padding: 3px 9px; border-radius: var(--pill); transition: color .15s, background .15s;
-}
-.cw-tab:hover { color: var(--text-2); }
-.cw-tab.on { color: rgb(var(--ink-deep)); background: var(--jogo); }
-.cw-badges { display: flex; align-items: center; gap: 5px; flex-shrink: 0; margin-left: auto; }
-.cw-count { font-size: 10px; font-weight: 600; color: var(--text-2); padding: 2px 7px; border-radius: var(--pill); background: rgba(0, 0, 0, .4); }
-.cw-count small { color: var(--text-3); }
-.cw-pct { font-size: 10px; font-weight: 800; color: rgb(var(--ink-deep)); padding: 2px 7px; border-radius: var(--pill); background: var(--jogo); }
-.cw-exit {
-  flex: 0 0 20px; width: 20px; height: 20px; padding: 0;
-  display: grid; place-items: center; border: 1px solid rgba(255,255,255,.18);
-  border-radius: 50%; color: var(--text-2); background: rgba(0,0,0,.28);
-  font-size: 15px; line-height: 1; cursor: pointer;
-  -webkit-app-region: no-drag;
-}
-.cw-exit:hover { color: var(--text); border-color: var(--deck-cyan); background: rgba(72,199,255,.16); }
-/* Conteúdo abaixo da faixa: rola quando não cabe (útil na aba Dicas). A barra
-   de rolagem fica oculta — o overlay é pequeno e ganharia uma faixa cinza à
-   direita; a rolagem pela roda do mouse continua funcionando. */
-.cw-content { position: relative; z-index: 2; flex: 1; min-height: 0; overflow-y: auto; padding: 0 var(--s3) 9px; scrollbar-width: none; }
-.cw-content::-webkit-scrollbar { width: 0; height: 0; }
-/* Setas de trocar jogo: só a setinha, sem faixa de fundo, acendendo no hover
-   (trocar de jogo também funciona pelas setas ↑↓ do teclado). */
-.cw-nav {
-  position: absolute; top: 38px; bottom: 0; width: 22px; z-index: 3;
-  display: grid; place-items: center; color: var(--text-3); font-size: 16px;
-  background: none; opacity: 0; transition: opacity .15s, color .15s;
-}
-.cw-nav.prev { left: 0; }
-.cw-nav.next { right: 0; }
-.cw:hover .cw-nav { opacity: .8; }
-.cw-nav:hover { color: var(--text); opacity: 1; }
-.cw-bar { height: 5px; border-radius: var(--pill); background: rgba(0, 0, 0, .55); overflow: hidden; margin: 2px 0 9px; }
-.cw-fill { height: 100%; border-radius: var(--pill); transition: width .5s ease; }
-.cw-sec { margin-bottom: 7px; }
-.cw-sec-label { font-size: 8.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--text-3); margin-bottom: 4px; }
-.cw-row { display: flex; align-items: center; gap: var(--s2); margin-bottom: 4px; }
-/* Aba Dicas dentro do overlay */
-.cw-tips { font-size: 10px; color: var(--text-2); line-height: 1.5; }
-.cw-tip-h { font-size: 10.5px; font-weight: 700; color: var(--text); margin: 8px 0 3px; }
-.cw-tip-sub { font-weight: 600; color: var(--text-2); margin: 5px 0 2px; }
-.cw-tip-p { margin-bottom: 4px; }
-.cw-badge {
-  width: 26px; height: 26px; flex-shrink: 0; border-radius: var(--r-sm);
-  display: grid; place-items: center; background: var(--raised);
-  background-size: cover; background-position: center; font-size: 12px;
-}
+.cw::after { content: ""; position: absolute; inset: 0; pointer-events: none; border-radius: inherit; background: linear-gradient(110deg, color-mix(in srgb, var(--jogo) 13%, transparent), transparent 42%); }
+.cw-head { position: relative; z-index: 2; display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 8px 10px 5px; cursor: move; }
+.cw-cover { width: 30px; height: 30px; flex: 0 0 30px; object-fit: cover; border-radius: 7px; border: 1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08); }
+.cw-cover-fallback { display: grid; place-items: center; color: var(--jogo); font-weight: 900; font-size: 15px; }
+.cw-title { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.cw-title span, .cw-kicker, .cw-detail-kicker { color: color-mix(in srgb, var(--jogo) 78%, #b8eaff); font-size: 8px; letter-spacing: .15em; font-weight: 800; }
+.cw-title strong { max-width: 150px; color: #fff; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cw-progress { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; margin-left: auto; min-width: 52px; }
+.cw-progress b { color: #fff; font-size: 12px; line-height: 1; }
+.cw-progress i { display: block; width: 54px; height: 4px; overflow: hidden; border-radius: 99px; background: rgba(255,255,255,.15); }
+.cw-progress em { display: block; height: 100%; border-radius: inherit; }
+.cw-progress small { color: var(--text-3); font-size: 8px; }
+.cw-content { position: relative; z-index: 2; flex: 1; min-height: 0; overflow: hidden; padding: 2px 10px 8px; }
+.cw-minimal .cw-content { display: flex; align-items: center; }
+.cw-min-objective { position: relative; min-width: 0; padding: 0 16px 2px 0; }
+.cw-min-objective strong { display: block; max-width: 275px; margin-top: 3px; color: #fff; font-size: 11px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cw-alert-dot { position: absolute; right: 1px; top: 9px; width: 7px; height: 7px; border-radius: 50%; background: #f0b34b; box-shadow: 0 0 10px rgba(240,179,75,.7); }
+.cw-hotkey { position: relative; z-index: 2; padding: 3px 10px 6px; color: var(--text-3); font-size: 8px; text-align: right; }
+.cw-detail { height: 100%; overflow: hidden; }
+.cw-detail h3 { margin: 4px 0 3px; color: #fff; font-size: 15px; line-height: 1.15; }
+.cw-detail > p { margin: 0 0 8px; color: var(--text-2); font-size: 10px; line-height: 1.35; }
+.cw-check { margin-top: 4px; color: var(--text-2); font-size: 9.5px; }
+.cw-warning { margin-top: 8px; padding: 6px 8px; border: 1px solid rgba(240,179,75,.24); border-radius: 7px; color: #f5cd69; background: rgba(240,179,75,.10); font-size: 9px; }
+.cw-warning b { margin-right: 5px; letter-spacing: .1em; font-size: 8px; }
+.cw-sec { margin: 5px 0 7px; }
+.cw-sec-label { margin: 0 0 4px; color: var(--text-3); font-size: 8px; letter-spacing: .12em; text-transform: uppercase; }
+.cw-row { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; min-width: 0; }
+.cw-badge { width: 25px; height: 25px; flex: 0 0 25px; border-radius: 6px; display: grid; place-items: center; background: rgba(255,255,255,.08); background-size: cover; background-position: center; font-size: 11px; }
 .cw-badge.locked { filter: grayscale(1) brightness(.7); }
 .cw-info { min-width: 0; }
-.cw-name { font-size: 10.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.cw-desc { font-size: 9px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.cw-done { font-size: 11px; font-weight: 700; color: var(--hardcore); text-align: center; padding: var(--s2); }
-.cw-empty, .cw-empty-sm { font-size: 10.5px; color: var(--text-3); padding: var(--s3); text-align: center; line-height: 1.5; }
+.cw-name { margin: 0; color: #fff; font-size: 9.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cw-desc { margin: 2px 0 0; color: var(--text-3); font-size: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cw-guide-chapter { margin-top: 7px; padding: 7px 8px; border: 1px solid rgba(255,255,255,.10); border-radius: 7px; background: rgba(0,0,0,.12); }
+.cw-guide-chapter b { color: #fff; font-size: 10px; }
+.cw-guide-chapter p { margin: 5px 0 0; color: var(--text-2); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cw-empty, .cw-empty-sm { padding: 10px; color: var(--text-3); font-size: 10px; text-align: center; }
+.cw-expanded { min-height: 150px; }
 
 /* aviso do overlay (ex.: fullscreen exclusivo) */
 #toast {

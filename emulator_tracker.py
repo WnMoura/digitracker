@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -63,6 +64,40 @@ QUNS_RUNNING_D3D_FULL_SCREEN = 3
 # Tamanho mínimo para considerar uma janela como jogo/emulador (descarta
 # helpers, bandejas e popups minúsculos que aparecem na árvore X11).
 _MIN_EMU_W, _MIN_EMU_H = 320, 200
+
+
+def parse_hotkey(value: str):
+    """Converte ``ctrl+alt+g`` em (modificadores, virtual-key).
+
+    Mantém o parser puro para validar configurações sem depender do Windows.
+    A hotkey é deliberadamente limitada a combinações com modificador para
+    não consumir teclas comuns usadas pelo jogo.
+    """
+    tokens = [part.strip().lower() for part in str(value or "").split("+") if part.strip()]
+    if len(tokens) < 2:
+        raise ValueError("A hotkey precisa de pelo menos um modificador e uma tecla.")
+    mods = 0
+    mod_map = {"ctrl": 0x0002, "control": 0x0002, "alt": 0x0001,
+               "shift": 0x0004, "win": 0x0008, "meta": 0x0008}
+    key = None
+    for token in tokens:
+        if token in mod_map:
+            mods |= mod_map[token]
+            continue
+        if key is not None:
+            raise ValueError("A hotkey só pode ter uma tecla principal.")
+        if len(token) == 1 and token.isalnum():
+            key = ord(token.upper())
+        elif token.startswith("f") and token[1:].isdigit() and 1 <= int(token[1:]) <= 12:
+            key = 0x70 + int(token[1:]) - 1
+        else:
+            key = {"space": 0x20, "tab": 0x09, "enter": 0x0D,
+                   "escape": 0x1B, "esc": 0x1B}.get(token)
+            if key is None:
+                raise ValueError("Tecla de hotkey não reconhecida.")
+    if not mods or key is None:
+        raise ValueError("A hotkey precisa de modificador e tecla principal.")
+    return mods, key
 
 
 def is_emulator(title: str, wm_class: str, patterns=None, process: str = "") -> bool:
@@ -134,19 +169,26 @@ def enable_dpi_awareness() -> bool:
 # ---------------------------------------------------------------------------- #
 # Onde grudar o overlay
 # ---------------------------------------------------------------------------- #
-def dock_position(rect, size, margin: int = 16):
-    """Canto superior-direito de DENTRO da janela do emulador.
+def dock_position(rect, size, margin: int = 16, corner: str = "top-right"):
+    """Posição de um canto DENTRO da janela do emulador.
 
     `rect` = (x, y, w, h) do emulador; `size` = (w, h) do overlay.
     Se o emulador for menor que o overlay + margem, encosta na borda esquerda
     em vez de deixar o overlay sair da janela.
     """
-    ex, ey, ew, _eh = rect
-    ow, _oh = size
-    x = ex + ew - ow - margin
-    if x < ex:
-        x = ex
-    return x, ey + margin
+    ex, ey, ew, eh = rect
+    ow, oh = size
+    right = ex + max(0, ew - ow - margin)
+    bottom = ey + max(0, eh - oh - margin)
+    x = right if corner.endswith("right") else ex + margin
+    y = bottom if corner.startswith("bottom") else ey + margin
+    return max(ex, min(x, ex + max(0, ew - ow))), max(ey, min(y, ey + max(0, eh - oh)))
+
+
+def dock_candidates(rect, size, margin: int = 16):
+    """Cantos em ordem de menor intrusão: superior-direito primeiro."""
+    return [(corner, dock_position(rect, size, margin, corner)) for corner in (
+        "top-right", "bottom-right", "top-left", "bottom-left")]
 
 
 def _overlap(a, b) -> int:
@@ -479,6 +521,200 @@ class WindowsTracker:
         except Exception:
             return []
         return achadas
+
+
+class WindowsOverlayInput:
+    """Torna a janela do overlay passiva e registra a hotkey global.
+
+    O callback do WndProc devolve ``HTTRANSPARENT`` e ``MA_NOACTIVATE`` para
+    que o emulador continue recebendo mouse/foco. A hotkey usa uma thread com
+    fila própria de mensagens, portanto não depende da janela estar ativa.
+    """
+
+    WM_NCHITTEST = 0x0084
+    WM_MOUSEACTIVATE = 0x0021
+    WM_HOTKEY = 0x0312
+    WM_QUIT = 0x0012
+    GWLP_WNDPROC = -4
+    GWL_EXSTYLE = -20
+    WS_EX_TRANSPARENT = 0x00000020
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_NOACTIVATE = 0x08000000
+    HWND_TOPMOST = -1
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_NOACTIVATE = 0x0010
+    SWP_SHOWWINDOW = 0x0040
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self.user32 = ctypes.windll.user32
+        self._hwnd = None
+        self._original_exstyle = None
+        self._original_proc = None
+        self._proc_ref = None
+        self._hotkey_stop = threading.Event()
+        self._hotkey_thread = None
+        self._hotkey_id = 0xD17
+        self._hotkey_status = {"registered": False, "hotkey": "", "error": ""}
+        self._hotkey_lock = threading.Lock()
+
+    def _get_long(self, hwnd, index):
+        fn = getattr(self.user32, "GetWindowLongPtrW", self.user32.GetWindowLongW)
+        fn.argtypes = [self._wintypes.HWND, self._wintypes.INT]
+        fn.restype = self._ctypes.c_ssize_t
+        return int(fn(hwnd, index))
+
+    def _set_long(self, hwnd, index, value):
+        fn = getattr(self.user32, "SetWindowLongPtrW", self.user32.SetWindowLongW)
+        fn.argtypes = [self._wintypes.HWND, self._wintypes.INT, self._ctypes.c_ssize_t]
+        fn.restype = self._ctypes.c_ssize_t
+        return int(fn(hwnd, index, value))
+
+    def apply_passive(self, hwnd):
+        if not hwnd:
+            return {"ok": False, "error": "HWND do overlay não encontrado."}
+        try:
+            if self._hwnd != hwnd:
+                self.restore()
+                self._hwnd = int(hwnd)
+            if self._original_exstyle is None:
+                self._original_exstyle = self._get_long(hwnd, self.GWL_EXSTYLE)
+            style = self._original_exstyle | self.WS_EX_TRANSPARENT | self.WS_EX_TOOLWINDOW | self.WS_EX_NOACTIVATE
+            self._set_long(hwnd, self.GWL_EXSTYLE, style)
+            if self._original_proc is None:
+                self._original_proc = self._get_long(hwnd, self.GWLP_WNDPROC)
+                call_proc = self.user32.CallWindowProcW
+                call_proc.argtypes = [self._ctypes.c_void_p, self._wintypes.HWND,
+                                      self._wintypes.UINT, self._wintypes.WPARAM,
+                                      self._wintypes.LPARAM]
+                call_proc.restype = self._ctypes.c_ssize_t
+                WNDPROC = self._ctypes.WINFUNCTYPE(
+                    self._ctypes.c_ssize_t, self._wintypes.HWND,
+                    self._wintypes.UINT, self._wintypes.WPARAM, self._wintypes.LPARAM)
+
+                @WNDPROC
+                def proc(window, message, wparam, lparam):
+                    if message == self.WM_NCHITTEST:
+                        return -1  # HTTRANSPARENT
+                    if message == self.WM_MOUSEACTIVATE:
+                        return 3   # MA_NOACTIVATE
+                    return call_proc(self._ctypes.c_void_p(self._original_proc),
+                                     window, message, wparam, lparam)
+
+                self._proc_ref = proc
+                self._set_long(hwnd, self.GWLP_WNDPROC, self._ctypes.cast(proc, self._ctypes.c_void_p).value)
+            self.user32.SetWindowPos(
+                hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
+                self.SWP_NOSIZE | self.SWP_NOMOVE | self.SWP_NOACTIVATE | self.SWP_SHOWWINDOW)
+            return {"ok": True, "passive": True}
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def restore(self):
+        hwnd = self._hwnd
+        if not hwnd:
+            return
+        try:
+            if self._original_proc is not None:
+                self._set_long(hwnd, self.GWLP_WNDPROC, self._original_proc)
+            if self._original_exstyle is not None:
+                self._set_long(hwnd, self.GWL_EXSTYLE, self._original_exstyle)
+        except Exception:
+            pass
+        self._original_proc = None
+        self._original_exstyle = None
+        self._proc_ref = None
+        self._hwnd = None
+
+    def stop_hotkey(self):
+        self._hotkey_stop.set()
+        thread = self._hotkey_thread
+        if thread and thread.ident:
+            try:
+                self.user32.PostThreadMessageW(thread.ident, self.WM_QUIT, 0, 0)
+            except Exception:
+                pass
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._hotkey_thread = None
+        with self._hotkey_lock:
+            self._hotkey_status = {"registered": False, "hotkey": "", "error": ""}
+
+    def start_hotkey(self, value, callback):
+        self.stop_hotkey()
+        try:
+            modifiers, key = parse_hotkey(value)
+        except ValueError as exc:
+            with self._hotkey_lock:
+                self._hotkey_status = {"registered": False, "hotkey": str(value or ""), "error": str(exc)}
+            return {"ok": False, "error": str(exc)}
+
+        self._hotkey_stop.clear()
+
+        def loop():
+            ok = bool(self.user32.RegisterHotKey(None, self._hotkey_id, modifiers, key))
+            if not ok:
+                error = self._ctypes.WinError().strerror or "A combinação já está em uso."
+                with self._hotkey_lock:
+                    self._hotkey_status = {"registered": False, "hotkey": str(value), "error": error}
+                return
+            with self._hotkey_lock:
+                self._hotkey_status = {"registered": True, "hotkey": str(value), "error": ""}
+            msg = self._wintypes.MSG()
+            try:
+                while not self._hotkey_stop.is_set():
+                    result = self.user32.GetMessageW(self._ctypes.byref(msg), None, 0, 0)
+                    if result <= 0:
+                        break
+                    if msg.message == self.WM_HOTKEY and msg.wParam == self._hotkey_id:
+                        try:
+                            callback()
+                        except Exception:
+                            pass
+            finally:
+                self.user32.UnregisterHotKey(None, self._hotkey_id)
+
+        self._hotkey_thread = threading.Thread(target=loop, daemon=True, name="DigiTrackerHotkey")
+        self._hotkey_thread.start()
+        return {"ok": True, "hotkey": str(value)}
+
+    def status(self):
+        with self._hotkey_lock:
+            return dict(self._hotkey_status)
+
+    def close(self):
+        self.stop_hotkey()
+        self.restore()
+
+
+class NullOverlayInput:
+    """Fallback não-Windows: mantém o overlay funcional sem APIs nativas."""
+
+    def apply_passive(self, _hwnd):
+        return {"ok": True, "passive": False, "fallback": True}
+
+    def restore(self):
+        pass
+
+    def start_hotkey(self, _value, _callback):
+        return {"ok": False, "error": "Hotkey global disponível somente no Windows."}
+
+    def stop_hotkey(self):
+        pass
+
+    def status(self):
+        return {"registered": False, "hotkey": "", "error": ""}
+
+    def close(self):
+        pass
+
+
+def create_overlay_input():
+    return WindowsOverlayInput() if sys.platform == "win32" else NullOverlayInput()
 
 
 # ---------------------------------------------------------------------------- #
