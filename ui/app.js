@@ -126,6 +126,8 @@ const S = {
   compactState: "hidden", // hidden | minimal | expanded
   compactContent: "objective", // objective | achievements | guide
   compactCfg: null,      // tamanho/conteúdo/opacidade do overlay
+  compactPassive: false, // só fica true após a hotkey nativa ser confirmada
+  compactNativeError: "",
   poll: null,
   sig: null,             // assinatura do último render (evita redesenhar à toa)
   screenKey: null,       // identidade da tela atual (p/ decidir se mantém o scroll)
@@ -232,6 +234,10 @@ const backend = {
   async setAutoOverlay(v) {
     if (S.mode === "demo") return { ok: true, auto_overlay: v };
     return window.pywebview.api.set_auto_overlay(v);
+  },
+  async setCompact(v) {
+    if (S.mode === "demo") return { ok: true, compact: !!v };
+    return window.pywebview.api.set_compact(!!v);
   },
   async setOverlayOption(chave, v) {
     if (S.mode === "demo") return { ok: true };
@@ -411,6 +417,7 @@ const backend = {
 window.onOverlayChanged = async (compact, state) => {
   S.compact = !!compact;
   S.compactState = compact ? (state || "minimal") : "hidden";
+  await refreshCompactNativeStatus();
   syncInputMode();
   const btn = document.getElementById("btn-compact");
   if (btn) {
@@ -419,6 +426,22 @@ window.onOverlayChanged = async (compact, state) => {
   }
   if (S.view === "dashboard") await renderDashboard({ force: true });
 };
+
+async function refreshCompactNativeStatus() {
+  if (!S.compact) {
+    S.compactPassive = false;
+    S.compactNativeError = "";
+    return;
+  }
+  try {
+    const status = await backend.overlayStatus();
+    S.compactPassive = status?.native_input_mode === "passive" && !!status?.hotkey_registered;
+    S.compactNativeError = status?.hotkey_error || status?.compatibility_error || "";
+  } catch (e) {
+    S.compactPassive = false;
+    S.compactNativeError = String(e || "Modo passivo indisponível.");
+  }
+}
 
 /* ------------------------------- toast ---------------------------------- */
 let toastT;
@@ -640,19 +663,28 @@ function compactHTML(game) {
   const objective = compactObjective(game);
   const progress = Math.max(0, Math.min(100, Number(mst.percent || 0)));
   const expanded = state === "expanded";
+  const hotkey = String(cfg.hotkey || "Ctrl+Alt+G").replace(/\+/g, " + ").toUpperCase();
   const body = expanded ? compactContentHTML(game, content, t) : `
-    <div class="cw-min-objective"><span class="cw-kicker">PRÓXIMO OBJETIVO</span>
-      <strong>${esc(objective.title || "Continue seu guia")}</strong>
-      ${objective.warning ? `<i class="cw-alert-dot" title="${esc(objective.warning)}"></i>` : ""}
+    <div class="cw-min-card">
+      ${capa ? `<img class="cw-min-cover" src="${esc(capa)}" alt="">` : `<span class="cw-min-cover cw-cover-fallback">D</span>`}
+      <div class="cw-min-objective"><span class="cw-kicker">PRÓXIMO OBJETIVO</span>
+        <strong>${esc(objective.title || "Continue seu guia")}</strong>
+        <small>${objective.text ? esc(objective.text) : `${mst.hardcore || 0} de ${t} conquistas`}</small>
+      </div>
+      <div class="cw-ring" style="--p:${progress}" aria-label="${progress}%"><span>${progress}%</span></div>
     </div>`;
+  const tab = (id, icon, label) => `<span class="${content === id ? "on" : ""}">${icon}<b>${label}</b></span>`;
   return `<div class="cw cw-${state}" style="--jogo:${cor};--cw-alpha:${alpha}">
     <div class="cw-head" title="${esc(game.title)}">
-      ${capa ? `<img class="cw-cover" src="${esc(capa)}" alt="">` : `<span class="cw-cover cw-cover-fallback">D</span>`}
-      <div class="cw-title"><span>DIGITRACKER</span><strong>${esc(game.title)}</strong></div>
-      <div class="cw-progress"><b>${progress}%</b><i><em style="width:${progress}%;background:${cor}"></em></i><small>${mst.hardcore || 0}/${t}</small></div>
+      <div class="cw-title"><span>DIGITRACKER</span>${expanded ? `<strong>${esc(game.title)}</strong>` : ""}</div>
+      <i class="cw-live-dot" title="Overlay passivo ativo"></i>
+      ${expanded ? `<span class="cw-collapse-mark">—</span>` : ""}
+      ${!S.compactPassive ? `<button class="cw-recover" id="cw-recover" title="${esc(S.compactNativeError || "Modo de recuperação: fechar overlay")}" aria-label="Fechar overlay">×</button>` : ""}
     </div>
+    ${expanded ? `<div class="cw-tabs">${tab("achievements", "♜", "Conquistas")}${tab("guide", "♢", "Guia Inteligente")}</div>` : ""}
     <div class="cw-content" data-scroll="compact">${body}</div>
-    ${expanded ? `<div class="cw-hotkey">Ctrl+Alt+G · recolher</div>` : ""}
+    ${expanded && objective.warning ? `<div class="cw-alert"><span>⚠</span><b>ALERTA</b><em>${esc(objective.warning)}</em><i>›</i></div>` : ""}
+    ${expanded ? `<div class="cw-hotkey">${esc(hotkey)} · ocultar</div>` : ""}
   </div>`;
 }
 
@@ -685,10 +717,15 @@ function cwObjectiveHTML(game) {
   const chapter = (current.chapters || []).find((c) => c.id === smart.next_objective?.chapter_id) || {};
   const block = (chapter.blocks || []).find((b) => b.id === smart.next_objective?.block_id) || {};
   const items = (block.items || []).slice(0, 3);
-  return `<div class="cw-detail"><div class="cw-detail-kicker">PRÓXIMO OBJETIVO</div>
-    <h3>${esc(objective.title)}</h3><p>${esc(objective.text)}</p>
-    ${items.map((item) => `<div class="cw-check">□ ${esc(item.text || item)}</div>`).join("")}
-    ${objective.warning ? `<div class="cw-warning"><b>ALERTA</b> ${esc(objective.warning)}</div>` : ""}</div>`;
+  const capa = game.art?.cover || game.art?.box;
+  return `<div class="cw-detail cw-objective">
+    <div class="cw-objective-main">
+      ${capa ? `<img class="cw-objective-cover" src="${esc(capa)}" alt="">` : `<span class="cw-objective-cover cw-cover-fallback">D</span>`}
+      <div><div class="cw-detail-kicker">PRÓXIMO OBJETIVO</div><h3>${esc(objective.title)}</h3><p>${esc(objective.text)}</p></div>
+    </div>
+    <i class="cw-objective-progress"><em></em></i>
+    <div class="cw-checklist">${items.length ? items.map((item, index) => `<div class="cw-check ${index ? "done" : ""}"><i>${index ? "✓" : ""}</i>${esc(item.text || item)}</div>`).join("") : `<div class="cw-check"><i></i>Continue pelo próximo passo do guia</div>`}</div>
+  </div>`;
 }
 
 function cwAchievementsHTML(game, total) {
@@ -729,6 +766,7 @@ function cwRow(a, locked) {
 }
 
 function bindCompact() {
+  $("#cw-recover")?.addEventListener("click", () => toggleCompact(false));
   makeDraggable(root.querySelector(".cw-head"));
 }
 
@@ -778,7 +816,8 @@ async function toggleCompact(value) {
     btn.classList.toggle("active", S.compact);
     btn.title = S.compact ? "Sair do modo compacto" : "Modo compacto (overlay de progresso)";
   }
-  if (hasBackend()) window.pywebview.api.set_compact(S.compact);
+  if (hasBackend()) await backend.setCompact(S.compact);
+  await refreshCompactNativeStatus();
   if (S.view === "dashboard") await renderDashboard({ force: true });
 }
 
@@ -3027,7 +3066,7 @@ function bindAtalhos() {
     // Esc etc.) consumirem a entrada enquanto o usuário joga com teclado.
     // Cliques continuam funcionando porque esta proteção cobre somente
     // eventos de teclado.
-    if (S.compact) return;
+    if (S.compact && S.compactPassive) return;
     // não sequestra digitação em campos de texto
     const alvo = e.target;
     if (alvo && (alvo.tagName === "INPUT" || alvo.tagName === "TEXTAREA" || alvo.isContentEditable)) {
@@ -3126,7 +3165,8 @@ async function toggleCompacto() {
   S.compactState = S.compact ? "minimal" : "hidden";
   syncInputMode();
   btn?.classList.toggle("active", S.compact);
-  if (hasBackend()) window.pywebview.api.set_compact(S.compact);
+  if (hasBackend()) await backend.setCompact(S.compact);
+  await refreshCompactNativeStatus();
   if (S.view === "dashboard") await renderDashboard({ force: true });
 }
 

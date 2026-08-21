@@ -685,7 +685,7 @@ class TestAtualizacoes:
         return engine.Api()
 
     def test_versao_aparece_no_estado(self, api):
-        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.8.4"
+        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.8.5"
 
     def test_verificacao_automatica_ligada_por_padrao(self, api):
         assert api.get_app_state()["auto_check_updates"] is True
@@ -768,6 +768,74 @@ class TestConfiguracoesPorSessao:
         assert cfg["opacity"] == 42
         assert cfg["hotkey"] == "ctrl+alt+g"
 
+    def test_sem_hotkey_nao_deixa_overlay_passa_clique(self, api):
+        class Input:
+            restored = False
+            applied = False
+
+            @staticmethod
+            def status():
+                return {"registered": False, "error": "hotkey ocupada"}
+
+            @classmethod
+            def restore(cls):
+                cls.restored = True
+
+            @classmethod
+            def apply_passive(cls, _hwnd, expected_size=None, opacity=75):
+                cls.applied = True
+                return {"ok": True, "passive": True}
+
+        api._window = object()
+        api._own_hwnd = 123
+        api._compact = True
+        api._overlay_input = Input()
+        api._configure_native_overlay()
+        assert Input.restored is True
+        assert Input.applied is False
+        assert api._overlay_native_status["passive"] is False
+        assert "ocupada" in api._overlay_native_status["error"]
+
+    def test_com_hotkey_confirmada_ativa_modo_passivo(self, api):
+        class Input:
+            @staticmethod
+            def status():
+                return {"registered": True, "error": ""}
+
+            @staticmethod
+            def apply_passive(_hwnd, expected_size=None, opacity=75):
+                assert expected_size == (280, 84)
+                assert opacity == 42
+                return {"ok": True, "passive": True}
+
+        api._window = object()
+        api._own_hwnd = 123
+        api._compact = True
+        api._compact_expected_size = (280, 84)
+        api._overlay_input = Input()
+        api._configure_native_overlay()
+        assert api._overlay_native_status == {"passive": True, "error": ""}
+
+    def test_sair_do_compacto_restabelece_cliques_imediatamente(self, api):
+        class Input:
+            restored = False
+
+            @staticmethod
+            def restore():
+                Input.restored = True
+
+            @staticmethod
+            def status():
+                return {"registered": True, "error": ""}
+
+        api._overlay_input = Input()
+        api._compact = True
+        api._compact_expected_size = (280, 84)
+        api.set_compact(False)
+        assert Input.restored is True
+        assert api._compact_expected_size is None
+        assert api._overlay_native_status == {"passive": False, "error": ""}
+
 
 class TestCleanWalkthrough:
     def test_descarta_o_mode_legado(self):
@@ -790,6 +858,45 @@ class TestCleanWalkthrough:
 
     def test_lista_vazia(self):
         assert engine.Api._clean_walkthrough([]) == []
+
+
+class TestBootstrapWindow:
+    def test_janela_principal_nao_nasce_transparente(self, monkeypatch):
+        captured = {}
+
+        class Hook:
+            def __iadd__(self, callback):
+                captured["loaded"] = callback
+                return self
+
+        class Window:
+            events = type("Events", (), {"loaded": Hook()})()
+
+        class FakeApi:
+            _normal_size = None
+            _window = None
+
+            def sync_loop(self):
+                pass
+
+            def overlay_loop(self):
+                pass
+
+        def create_window(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return Window()
+
+        monkeypatch.setattr(engine.emulator_tracker, "enable_dpi_awareness", lambda: None)
+        monkeypatch.setattr(engine, "Api", FakeApi)
+        monkeypatch.setattr(engine, "adaptive_normal_size", lambda: (1200, 800))
+        monkeypatch.setattr(engine, "start_static_server", lambda: 12345)
+        monkeypatch.setattr(engine.webview, "create_window", create_window)
+        monkeypatch.setattr(engine.webview, "start", lambda: None)
+
+        engine.main()
+
+        assert captured["kwargs"].get("transparent", False) is False
+        assert captured["kwargs"]["background_color"] == "#050c18"
 
 
 class TestSlugify:

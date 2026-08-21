@@ -387,6 +387,7 @@ class Api:
         self.index_building = False
         self._compact = False
         self._compact_state = "hidden"  # hidden | minimal | expanded
+        self._compact_expected_size: tuple[int, int] | None = None
         self._pre_compact_pos: tuple[int, int] | None = None
         self._pre_compact_size: tuple[int, int] | None = None
         self._normal_size = NORMAL_SIZE
@@ -2200,6 +2201,13 @@ class Api:
         if from_user and self._auto_collapse_timer:
             self._auto_collapse_timer.cancel()
             self._auto_collapse_timer = None
+        # Ao voltar para o aplicativo completo, recupere os cliques antes de
+        # enfileirar resize/movimentação. Assim a janela nunca fica grande e
+        # ainda marcada como passa-clique caso a operação visual demore.
+        if not value:
+            self._overlay_input.restore()
+            self._overlay_native_status = {"passive": False, "error": ""}
+            self._compact_expected_size = None
         self._compact = value
         self._compact_state = "minimal" if value else "hidden"
         win = self._window
@@ -2213,6 +2221,7 @@ class Api:
                         int(getattr(win, "height", None) or self._normal_size[1]),
                     )
                 w, h = size or self._compact_size(self._current_overlay_rect())
+                self._compact_expected_size = (int(w), int(h))
                 win.resize(w, h)
                 pos = dock
                 if pos is None:
@@ -2381,8 +2390,36 @@ class Api:
     def _configure_native_overlay(self):
         if not self._window or not self._own_hwnd:
             return
+        # O backend WinForms pode trocar o controle nativo após o WebView2
+        # terminar de carregar. Re-resolver mantém o estilo no HWND raiz e
+        # impede que WS_EX_TRANSPARENT seja aplicado ao conteúdo interno.
+        if self._tracker:
+            try:
+                self._own_hwnd = self._tracker.own_window_handle(self._window)
+            except Exception:
+                pass
         if self._compact:
-            result = self._overlay_input.apply_passive(self._own_hwnd)
+            hotkey = self._overlay_input.status()
+            if not hotkey.get("registered"):
+                # Nunca deixe o usuário preso numa janela passa-clique sem uma
+                # hotkey funcional para sair. Nesse caso o HUD continua
+                # interativo e a interface mostra um botão de recuperação.
+                self._overlay_input.restore()
+                self._overlay_native_status = {
+                    "passive": False,
+                    "error": str(hotkey.get("error") or
+                                 "Hotkey global indisponível; modo de recuperação ativo."),
+                }
+                return
+            expected = self._compact_expected_size or self._compact_size(
+                self._current_overlay_rect(), expanded=self._compact_state == "expanded"
+            )
+            result = self._overlay_input.apply_passive(
+                self._own_hwnd,
+                expected_size=expected,
+                opacity=(int(self.settings.get("compact_opacity", 42)) +
+                         (16 if self._compact_state == "expanded" else 0)),
+            )
             self._overlay_native_status = {
                 "passive": bool(result.get("passive")),
                 "error": str(result.get("error") or ""),
@@ -2411,6 +2448,7 @@ class Api:
             self.set_compact(True, from_user=from_user)
         rect = self._current_overlay_rect()
         size = self._compact_size(rect, expanded=state == "expanded")
+        self._compact_expected_size = size
         self._overlay_size = size
         dock = self._dock_for(rect, size) if rect else None
         if self._window:
@@ -2477,6 +2515,7 @@ class Api:
         win = self._window
         if win and self._compact and (width is not None or height is not None or size_mode is not None):
             w, h = self._compact_size(self._current_overlay_rect())
+            self._compact_expected_size = (w, h)
             self._window_op(lambda: win.resize(w, h))
         if hotkey is not None:
             self._start_overlay_hotkey()
@@ -2485,10 +2524,10 @@ class Api:
 
     def _start_overlay_hotkey(self):
         value = str(self.settings.get("compact_hotkey", "ctrl+alt+g"))
-        if value == self._hotkey_value:
+        if value == self._hotkey_value and self._overlay_input.status().get("registered"):
             return
         result = self._overlay_input.start_hotkey(value, self._cycle_compact_state)
-        self._hotkey_value = value
+        self._hotkey_value = value if result.get("ok") else ""
         if not result.get("ok"):
             self._overlay_native_status["error"] = str(result.get("error") or "")
 
@@ -2922,13 +2961,24 @@ def main():
         frameless=True,
         easy_drag=False,      # arrasto via .pywebview-drag-region
         on_top=True,
-        background_color="#000000",
-        transparent=True,
+        background_color="#050c18",
     )
     api._window = window
 
-    threading.Thread(target=api.sync_loop, daemon=True).start()
-    threading.Thread(target=api.overlay_loop, daemon=True).start()
+    services_started = threading.Event()
+
+    def start_runtime_services():
+        # O rastreador pode redimensionar e alterar estilos nativos. Esperar o
+        # evento `loaded` evita tocar no WinForms/WebView2 enquanto a janela
+        # ainda está sendo construída — condição que podia deixar a build
+        # onefile sem responder logo depois de uma atualização.
+        if services_started.is_set():
+            return
+        services_started.set()
+        threading.Thread(target=api.sync_loop, daemon=True).start()
+        threading.Thread(target=api.overlay_loop, daemon=True).start()
+
+    window.events.loaded += start_runtime_services
     webview.start()
 
 

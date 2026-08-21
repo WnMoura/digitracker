@@ -138,6 +138,42 @@ class TestHotkey:
             et.parse_hotkey("f2")
 
 
+class TestOwnWindowHandle:
+    def test_normaliza_controle_webview_para_janela_raiz(self):
+        class Handle:
+            @staticmethod
+            def ToInt64():
+                return 321
+
+        class User32:
+            @staticmethod
+            def GetAncestor(hwnd, flag):
+                assert (hwnd, flag) == (321, 2)
+                return 123
+
+        tracker = et.WindowsTracker.__new__(et.WindowsTracker)
+        tracker.user32 = User32()
+        window = type("Window", (), {"native": type("Native", (), {"Handle": Handle()})()})()
+        assert tracker.own_window_handle(window) == 123
+
+    def test_fallback_por_titulo_tambem_retorna_raiz(self):
+        class User32:
+            @staticmethod
+            def FindWindowW(_cls, title):
+                assert title == "DigiTracker"
+                return 654
+
+            @staticmethod
+            def GetAncestor(hwnd, flag):
+                assert (hwnd, flag) == (654, 2)
+                return 456
+
+        tracker = et.WindowsTracker.__new__(et.WindowsTracker)
+        tracker.user32 = User32()
+        window = type("Window", (), {"native": None})()
+        assert tracker.own_window_handle(window) == 456
+
+
 # ---------------------------------------------------------------------------- #
 # Máquina de estados
 # ---------------------------------------------------------------------------- #

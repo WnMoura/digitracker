@@ -433,15 +433,22 @@ class WindowsTracker:
 
     def own_window_handle(self, window, title: str = "DigiTracker"):
         """HWND da janela do app. O backend winforms do pywebview expõe
-        `native.Handle`; se não expuser, acha pela barra de título."""
+        `native.Handle`; em algumas versões esse Handle pertence ao controle
+        WebView2 interno, então sempre o normalizamos para a janela raiz."""
         native = getattr(window, "native", None)
         handle = getattr(native, "Handle", None)
         if handle:
             try:
-                return int(handle.ToInt64())
+                handle = int(handle.ToInt64())
             except AttributeError:
-                return int(handle)
-        return self.user32.FindWindowW(None, title) or None
+                handle = int(handle)
+            root = self.user32.GetAncestor(handle, 2)  # GA_ROOT
+            return int(root or handle)
+        found = self.user32.FindWindowW(None, title) or None
+        if not found:
+            return None
+        root = self.user32.GetAncestor(found, 2)
+        return int(root or found)
 
     def is_exclusive_fullscreen(self) -> bool:
         """Há um app Direct3D em fullscreen EXCLUSIVO?
@@ -526,17 +533,18 @@ class WindowsTracker:
 class WindowsOverlayInput:
     """Torna a janela do overlay passiva e registra a hotkey global.
 
-    O callback do WndProc devolve ``HTTRANSPARENT`` e ``MA_NOACTIVATE`` para
-    que o emulador continue recebendo mouse/foco. A hotkey usa uma thread com
-    fila própria de mensagens, portanto não depende da janela estar ativa.
+    O modo passivo usa somente estilos nativos. Subclassificar o WndProc do
+    WinForms com um callback Python parece simples, mas pode bloquear a thread
+    da interface quando o WebView2 e o Python disputam o GIL. ``LAYERED`` mais
+    ``TRANSPARENT`` mantém o click-through sem executar Python a cada mensagem.
+    A hotkey usa uma thread com fila própria e confirma o registro antes de o
+    aplicativo tornar a janela não interativa.
     """
 
-    WM_NCHITTEST = 0x0084
-    WM_MOUSEACTIVATE = 0x0021
     WM_HOTKEY = 0x0312
     WM_QUIT = 0x0012
-    GWLP_WNDPROC = -4
     GWL_EXSTYLE = -20
+    WS_EX_LAYERED = 0x00080000
     WS_EX_TRANSPARENT = 0x00000020
     WS_EX_TOOLWINDOW = 0x00000080
     WS_EX_NOACTIVATE = 0x08000000
@@ -545,6 +553,7 @@ class WindowsOverlayInput:
     SWP_NOMOVE = 0x0002
     SWP_NOACTIVATE = 0x0010
     SWP_SHOWWINDOW = 0x0040
+    LWA_ALPHA = 0x00000002
 
     def __init__(self):
         import ctypes
@@ -552,12 +561,21 @@ class WindowsOverlayInput:
         self._ctypes = ctypes
         self._wintypes = wintypes
         self.user32 = ctypes.windll.user32
+        self.kernel32 = ctypes.windll.kernel32
+        self.user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        self.user32.GetAncestor.restype = wintypes.HWND
+        self.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        self.user32.GetWindowRect.restype = wintypes.BOOL
+        self.user32.SetLayeredWindowAttributes.argtypes = [
+            wintypes.HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD,
+        ]
+        self.user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
         self._hwnd = None
         self._original_exstyle = None
-        self._original_proc = None
-        self._proc_ref = None
+        self._passive = False
         self._hotkey_stop = threading.Event()
         self._hotkey_thread = None
+        self._hotkey_thread_id = None
         self._hotkey_id = 0xD17
         self._hotkey_status = {"registered": False, "hotkey": "", "error": ""}
         self._hotkey_lock = threading.Lock()
@@ -574,44 +592,69 @@ class WindowsOverlayInput:
         fn.restype = self._ctypes.c_ssize_t
         return int(fn(hwnd, index, value))
 
-    def apply_passive(self, hwnd):
+    def apply_passive(self, hwnd, expected_size=None, opacity=75):
         if not hwnd:
             return {"ok": False, "error": "HWND do overlay não encontrado."}
         try:
+            # Defesa adicional: nunca altere um controle filho do WebView2.
+            # WS_EX_TRANSPARENT nesse filho deixa a interface inteira visível,
+            # mas todos os cliques atravessam o conteúdo.
+            root = self.user32.GetAncestor(hwnd, 2)  # GA_ROOT
+            hwnd = int(root or hwnd)
+            # O resize do pywebview acontece de forma assíncrona. Nunca aplique
+            # WS_EX_TRANSPARENT enquanto a janela ainda estiver no tamanho do
+            # aplicativo principal: se o resize falhar, toda a interface fica
+            # visível, porém nenhum campo recebe clique.
+            if expected_size:
+                rect = self._wintypes.RECT()
+                if not self.user32.GetWindowRect(hwnd, self._ctypes.byref(rect)):
+                    raise self._ctypes.WinError()
+                width = max(0, int(rect.right - rect.left))
+                height = max(0, int(rect.bottom - rect.top))
+                get_dpi = getattr(self.user32, "GetDpiForWindow", None)
+                dpi = int(get_dpi(hwnd)) if get_dpi else 96
+                scale = max(1.0, dpi / 96.0)
+                expected_w, expected_h = expected_size
+                max_w = int(expected_w * scale) + 48
+                max_h = int(expected_h * scale) + 48
+                if width > max_w or height > max_h:
+                    self.restore()
+                    return {
+                        "ok": False,
+                        "passive": False,
+                        "pending": True,
+                        "error": "Aguardando a janela entrar no tamanho compacto.",
+                    }
+            if self._hwnd == int(hwnd) and self._passive:
+                return {"ok": True, "passive": True}
             if self._hwnd != hwnd:
                 self.restore()
                 self._hwnd = int(hwnd)
             if self._original_exstyle is None:
                 self._original_exstyle = self._get_long(hwnd, self.GWL_EXSTYLE)
-            style = self._original_exstyle | self.WS_EX_TRANSPARENT | self.WS_EX_TOOLWINDOW | self.WS_EX_NOACTIVATE
+            style = (self._original_exstyle | self.WS_EX_LAYERED |
+                     self.WS_EX_TRANSPARENT | self.WS_EX_TOOLWINDOW |
+                     self.WS_EX_NOACTIVATE)
             self._set_long(hwnd, self.GWL_EXSTYLE, style)
-            if self._original_proc is None:
-                self._original_proc = self._get_long(hwnd, self.GWLP_WNDPROC)
-                call_proc = self.user32.CallWindowProcW
-                call_proc.argtypes = [self._ctypes.c_void_p, self._wintypes.HWND,
-                                      self._wintypes.UINT, self._wintypes.WPARAM,
-                                      self._wintypes.LPARAM]
-                call_proc.restype = self._ctypes.c_ssize_t
-                WNDPROC = self._ctypes.WINFUNCTYPE(
-                    self._ctypes.c_ssize_t, self._wintypes.HWND,
-                    self._wintypes.UINT, self._wintypes.WPARAM, self._wintypes.LPARAM)
-
-                @WNDPROC
-                def proc(window, message, wparam, lparam):
-                    if message == self.WM_NCHITTEST:
-                        return -1  # HTTRANSPARENT
-                    if message == self.WM_MOUSEACTIVATE:
-                        return 3   # MA_NOACTIVATE
-                    return call_proc(self._ctypes.c_void_p(self._original_proc),
-                                     window, message, wparam, lparam)
-
-                self._proc_ref = proc
-                self._set_long(hwnd, self.GWLP_WNDPROC, self._ctypes.cast(proc, self._ctypes.c_void_p).value)
+            applied = self._get_long(hwnd, self.GWL_EXSTYLE)
+            required = self.WS_EX_TRANSPARENT | self.WS_EX_NOACTIVATE
+            if (applied & required) != required:
+                raise OSError("O Windows recusou os estilos passivos do overlay.")
             self.user32.SetWindowPos(
                 hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
                 self.SWP_NOSIZE | self.SWP_NOMOVE | self.SWP_NOACTIVATE | self.SWP_SHOWWINDOW)
+            # A janela principal permanece opaca e interativa. A transparência
+            # real passa a existir somente no HUD compacto, evitando o bug do
+            # WebView2 em que `transparent=True` remove toda a janela do hit-test.
+            requested = max(30, min(85, int(opacity)))
+            alpha_percent = 55 + round(requested * 0.47)  # 69% .. 95%
+            alpha = max(1, min(255, round(255 * alpha_percent / 100)))
+            if not self.user32.SetLayeredWindowAttributes(hwnd, 0, alpha, self.LWA_ALPHA):
+                raise self._ctypes.WinError()
+            self._passive = True
             return {"ok": True, "passive": True}
         except Exception as exc:
+            self.restore()
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def restore(self):
@@ -619,28 +662,31 @@ class WindowsOverlayInput:
         if not hwnd:
             return
         try:
-            if self._original_proc is not None:
-                self._set_long(hwnd, self.GWLP_WNDPROC, self._original_proc)
             if self._original_exstyle is not None:
                 self._set_long(hwnd, self.GWL_EXSTYLE, self._original_exstyle)
+                self.user32.SetWindowPos(
+                    hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
+                    self.SWP_NOSIZE | self.SWP_NOMOVE | self.SWP_NOACTIVATE |
+                    self.SWP_SHOWWINDOW)
         except Exception:
             pass
-        self._original_proc = None
         self._original_exstyle = None
-        self._proc_ref = None
+        self._passive = False
         self._hwnd = None
 
     def stop_hotkey(self):
         self._hotkey_stop.set()
         thread = self._hotkey_thread
-        if thread and thread.ident:
+        thread_id = self._hotkey_thread_id
+        if thread and thread_id:
             try:
-                self.user32.PostThreadMessageW(thread.ident, self.WM_QUIT, 0, 0)
+                self.user32.PostThreadMessageW(thread_id, self.WM_QUIT, 0, 0)
             except Exception:
                 pass
         if thread and thread is not threading.current_thread():
             thread.join(timeout=1.0)
         self._hotkey_thread = None
+        self._hotkey_thread_id = None
         with self._hotkey_lock:
             self._hotkey_status = {"registered": False, "hotkey": "", "error": ""}
 
@@ -654,16 +700,20 @@ class WindowsOverlayInput:
             return {"ok": False, "error": str(exc)}
 
         self._hotkey_stop.clear()
+        ready = threading.Event()
 
         def loop():
+            self._hotkey_thread_id = int(self.kernel32.GetCurrentThreadId())
             ok = bool(self.user32.RegisterHotKey(None, self._hotkey_id, modifiers, key))
             if not ok:
                 error = self._ctypes.WinError().strerror or "A combinação já está em uso."
                 with self._hotkey_lock:
                     self._hotkey_status = {"registered": False, "hotkey": str(value), "error": error}
+                ready.set()
                 return
             with self._hotkey_lock:
                 self._hotkey_status = {"registered": True, "hotkey": str(value), "error": ""}
+            ready.set()
             msg = self._wintypes.MSG()
             try:
                 while not self._hotkey_stop.is_set():
@@ -680,7 +730,16 @@ class WindowsOverlayInput:
 
         self._hotkey_thread = threading.Thread(target=loop, daemon=True, name="DigiTrackerHotkey")
         self._hotkey_thread.start()
-        return {"ok": True, "hotkey": str(value)}
+        if not ready.wait(timeout=1.5):
+            self.stop_hotkey()
+            error = "O Windows não respondeu ao registro da hotkey."
+            with self._hotkey_lock:
+                self._hotkey_status = {"registered": False, "hotkey": str(value), "error": error}
+            return {"ok": False, "error": error}
+        status = self.status()
+        return ({"ok": True, "hotkey": str(value)} if status.get("registered")
+                else {"ok": False, "error": status.get("error") or
+                      "A combinação de hotkey já está em uso."})
 
     def status(self):
         with self._hotkey_lock:
@@ -694,7 +753,7 @@ class WindowsOverlayInput:
 class NullOverlayInput:
     """Fallback não-Windows: mantém o overlay funcional sem APIs nativas."""
 
-    def apply_passive(self, _hwnd):
+    def apply_passive(self, _hwnd, expected_size=None, opacity=75):
         return {"ok": True, "passive": False, "fallback": True}
 
     def restore(self):
