@@ -125,7 +125,7 @@ const S = {
   compact: false,        // modo mini-overlay (progresso de conquistas)
   compactState: "hidden", // hidden | minimal | expanded
   compactContent: "objective", // objective | achievements | guide
-  compactCfg: null,      // tamanho/conteúdo/opacidade do overlay
+  compactCfg: null,      // tamanho/conteúdo/fundo do overlay
   compactPassive: false, // só fica true após a hotkey nativa ser confirmada
   compactNativeError: "",
   poll: null,
@@ -397,14 +397,19 @@ const backend = {
     return window.pywebview.api.clear_game_cover(slug, role || "cover");
   },
   async getCompactConfig() {
-    if (S.mode === "demo") return { ok: true, width: 280, height: 84, last: 2, next: 0, size_mode: "auto", content: "objective", corner: "auto", opacity: 42, hotkey: "ctrl+alt+g", auto_expand: false, auto_collapse_seconds: 0 };
+    if (S.mode === "demo") return { ok: true, width: 320, height: 110, expanded_width: 420, expanded_height: 300, last: 2, next: 0, size_mode: "auto", content: "objective", corner: "auto", background_mode: "background", opacity: 100, hotkey: "ctrl+alt+g", auto_expand: false, auto_collapse_seconds: 0 };
     return window.pywebview.api.get_compact_config();
   },
   async setCompactConfig(cfg) {
     if (S.mode === "demo") return { ok: true, ...cfg };
     return window.pywebview.api.set_compact_config(
       cfg.width, cfg.height, cfg.last, cfg.next, cfg.size_mode, cfg.content,
-      cfg.corner, cfg.opacity, cfg.hotkey, cfg.auto_expand, cfg.auto_collapse_seconds);
+      cfg.corner, 100, cfg.hotkey, cfg.auto_expand, cfg.auto_collapse_seconds,
+      cfg.expanded_width, cfg.expanded_height, cfg.background_mode);
+  },
+  async setCompactState(state) {
+    if (S.mode === "demo") return { ok: true, compact: true, state };
+    return window.pywebview.api.set_compact_state(state, true);
   },
   moveWindow(x, y) {
     if (S.mode === "demo" || !hasBackend()) return;
@@ -435,7 +440,7 @@ async function refreshCompactNativeStatus() {
   }
   try {
     const status = await backend.overlayStatus();
-    S.compactPassive = status?.native_input_mode === "passive" && !!status?.hotkey_registered;
+    S.compactPassive = ["passive", "interactive"].includes(status?.native_input_mode) && !!status?.hotkey_registered;
     S.compactNativeError = status?.hotkey_error || status?.compatibility_error || "";
   } catch (e) {
     S.compactPassive = false;
@@ -649,6 +654,14 @@ async function renderDashboard({ force = false } = {}) {
 /* ========================= MODO COMPACTO (OVERLAY) ======================= */
 /* HUD passivo: não depende de foco, não exibe arte em tela cheia e só mostra
    detalhes quando o estado expandido é solicitado pela hotkey global. */
+function compactBackground(game, mode) {
+  const art = game?.art || {};
+  if (mode === "solid") return "";
+  if (mode === "cover") return art.cover || art.box || art.background || art.ingame || art.title || "";
+  if (mode === "title") return art.title || art.background || art.ingame || art.cover || art.box || "";
+  return art.background || art.ingame || art.title || art.cover || art.box || "";
+}
+
 function compactHTML(game) {
   if (!game) return `<div class="cw cw-empty">Nenhum jogo selecionado.</div>`;
   const { t } = totals(game);
@@ -657,9 +670,8 @@ function compactHTML(game) {
   const cfg = S.compactCfg || {};
   const state = S.compactState === "expanded" ? "expanded" : "minimal";
   const content = cfg.content || S.compactContent || "objective";
-  const baseAlpha = Math.max(30, Math.min(85, Number(cfg.opacity ?? 42))) / 100;
-  const alpha = state === "expanded" ? Math.min(.85, baseAlpha + .16) : baseAlpha;
   const capa = game.art?.cover || game.art?.box;
+  const fundo = compactBackground(game, cfg.background_mode || "background");
   const objective = compactObjective(game);
   const progress = Math.max(0, Math.min(100, Number(mst.percent || 0)));
   const expanded = state === "expanded";
@@ -673,17 +685,19 @@ function compactHTML(game) {
       </div>
       <div class="cw-ring" style="--p:${progress}" aria-label="${progress}%"><span>${progress}%</span></div>
     </div>`;
-  const tab = (id, icon, label) => `<span class="${content === id ? "on" : ""}">${icon}<b>${label}</b></span>`;
-  return `<div class="cw cw-${state}" style="--jogo:${cor};--cw-alpha:${alpha}">
+  const tab = (id, icon, label) => `<button type="button" data-cw-content="${id}" class="${content === id ? "on" : ""}">${icon}<b>${label}</b></button>`;
+  return `<div class="cw cw-${state}" style="--jogo:${cor}">
+    ${fundo ? `<div class="cw-bg" style="background-image:url('${esc(fundo)}')"></div>` : ""}
+    <div class="cw-shade"></div>
     <div class="cw-head" title="${esc(game.title)}">
       <div class="cw-title"><span>DIGITRACKER</span>${expanded ? `<strong>${esc(game.title)}</strong>` : ""}</div>
       <i class="cw-live-dot" title="Overlay passivo ativo"></i>
-      ${expanded ? `<span class="cw-collapse-mark">—</span>` : ""}
+      ${expanded ? `<button type="button" class="cw-collapse-mark" id="cw-collapse" title="Recolher HUD" aria-label="Recolher HUD">—</button>` : ""}
       ${!S.compactPassive ? `<button class="cw-recover" id="cw-recover" title="${esc(S.compactNativeError || "Modo de recuperação: fechar overlay")}" aria-label="Fechar overlay">×</button>` : ""}
     </div>
     ${expanded ? `<div class="cw-tabs">${tab("achievements", "♜", "Conquistas")}${tab("guide", "♢", "Guia Inteligente")}</div>` : ""}
     <div class="cw-content" data-scroll="compact">${body}</div>
-    ${expanded && objective.warning ? `<div class="cw-alert"><span>⚠</span><b>ALERTA</b><em>${esc(objective.warning)}</em><i>›</i></div>` : ""}
+    ${expanded && objective.warning ? `<button type="button" class="cw-alert" id="cw-alert-guide"><span>⚠</span><b>ALERTA</b><em>${esc(objective.warning)}</em><i>›</i></button>` : ""}
     ${expanded ? `<div class="cw-hotkey">${esc(hotkey)} · ocultar</div>` : ""}
   </div>`;
 }
@@ -767,6 +781,24 @@ function cwRow(a, locked) {
 
 function bindCompact() {
   $("#cw-recover")?.addEventListener("click", () => toggleCompact(false));
+  $("#cw-collapse")?.addEventListener("click", async () => {
+    await backend.setCompactState("minimal").catch(() => null);
+    S.compactState = "minimal";
+    await renderDashboard({ force: true });
+  });
+  $("#cw-alert-guide")?.addEventListener("click", async () => {
+    S.compactContent = "guide";
+    S.compactCfg = { ...(S.compactCfg || {}), content: "guide" };
+    await backend.setCompactConfig(S.compactCfg).catch(() => null);
+    await renderDashboard({ force: true });
+  });
+  root.querySelectorAll("[data-cw-content]").forEach((button) => button.addEventListener("click", async () => {
+    if (S.compactState !== "expanded") return;
+    S.compactContent = button.dataset.cwContent;
+    S.compactCfg = { ...(S.compactCfg || {}), content: S.compactContent };
+    await backend.setCompactConfig(S.compactCfg).catch(() => null);
+    await renderDashboard({ force: true });
+  }));
   makeDraggable(root.querySelector(".cw-head"));
 }
 
@@ -1551,10 +1583,13 @@ function settingsSnapshot(section) {
   };
   if (section === "compact") return {
     compact_size_mode: cc.size_mode || "auto",
-    compact_width: Number(cc.width || 280), compact_height: Number(cc.height || 84),
+    compact_width: Number(cc.width || 320), compact_height: Number(cc.height || 110),
+    compact_expanded_width: Number(cc.expanded_width || 420),
+    compact_expanded_height: Number(cc.expanded_height || 300),
     compact_last: Number(cc.last || 2), compact_next: Number(cc.next || 0),
     compact_content: cc.content || "objective", compact_corner: cc.corner || "auto",
-    compact_opacity: Number(cc.opacity ?? 42), compact_hotkey: cc.hotkey || "ctrl+alt+g",
+    compact_background_mode: cc.background_mode || "background",
+    compact_hotkey: cc.hotkey || "ctrl+alt+g",
     compact_auto_expand: !!cc.auto_expand,
     compact_auto_collapse_seconds: Number(cc.auto_collapse_seconds || 0),
   };
@@ -1610,7 +1645,7 @@ function renderSettings() {
   : id === "images" ? settingsPanelFrame(id, `<p class="set-hint settings-intro">Configure as fontes opcionais de capas e fundos. As credenciais só serão enviadas quando você salvar esta sessão.</p>${[["steamgriddb","SteamGridDB","Capas da comunidade.",ready.steamgriddb],["rawg","RAWG","Fundos e screenshots para jogos retrô.",ready.rawg],["igdb","IGDB","Capas de qualidade via Twitch.",ready.igdb]].map(([key,label,sub,has]) => `<div class="src-cfg settings-card"><h3>${label} ${has ? "✓" : ""}</h3><p class="set-hint">${sub}</p>${field(`${key}.key1`, "", key === "igdb" ? "text" : "password", `placeholder="${has ? "•••••••• (salva — em branco mantém)" : (key === "igdb" ? "Twitch Client ID" : "chave da API")}" autocomplete="off"`)}${key === "igdb" ? field(`${key}.key2`, "", "password", `placeholder="${has ? "•••• (segredo salvo — em branco mantém)" : "Twitch Client Secret"}" autocomplete="off"`) : ""}<button class="btn-ghost settings-inline-action ${draft[key].clear ? "selected" : ""}" data-source-clear="${key}">${draft[key].clear ? "Fonte será removida" : "Remover credencial salva"}</button></div>`).join("")}`)
   : id === "library" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Entrada de jogos</h3>${settingsToggle("auto_import", draft.auto_import, "Importar jogos novos automaticamente", "Verifica a cada 5 minutos e traz os jogos em que você começou a jogar")}</div>`)
   : id === "overlay" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Comportamento</h3>${settingsToggle("auto_overlay", draft.auto_overlay, "Grudar no emulador", "Vira overlay e acompanha a janela quando um emulador abre")}${settingsToggle("overlay_exit_fullscreen", draft.overlay_exit_fullscreen, "Sair do fullscreen exclusivo", "Manda Alt+Enter para o emulador quando autorizado")}${settingsToggle("overlay_second_screen", draft.overlay_second_screen, "Usar o segundo monitor", "Leva o overlay para a tela que o jogo não ocupa")}${settingsToggle("overlay_fit_emulator", draft.overlay_fit_emulator, "Ajustar ao tamanho do emulador", "Mantém o overlay proporcional à janela do emulador")}</div><div class="overlay-diag settings-card ${ov.detected ? "ok" : ""}"><h3>Diagnóstico de detecção</h3><div class="set-sub">${ovState}</div><div class="overlay-diag-grid"><span>Área interna</span><code>${esc(ovRect)}</code><span>Overlay</span><code>${esc((ov.overlay_size || []).join(" × ") || "—")}</code><span>Posição</span><code>${esc((ov.dock || []).join(", ") || "—")}</code><span>Modo nativo</span><code>${esc(ov.native_input_mode || "—")}</code><span>Hotkey</span><code>${esc(ov.hotkey || "—")}${ov.hotkey_error ? ` · ${esc(ov.hotkey_error)}` : ""}</code></div><button class="btn-ghost" id="overlay-test">Testar detecção agora</button></div>`)
-  : settingsPanelFrame(id, `<div class="settings-card"><h3>HUD passivo</h3><p class="set-hint">O overlay não captura foco, mouse, teclado ou controle durante a gameplay. A hotkey alterna oculto, mínimo e expandido.</p><div class="set-grid2"><div><label class="set-label">Tamanho</label><select class="set-field" data-draft-field="compact_size_mode"><option value="auto" ${draft.compact_size_mode === "auto" ? "selected" : ""}>Adaptar ao emulador</option><option value="manual" ${draft.compact_size_mode === "manual" ? "selected" : ""}>Manual</option></select></div><div><label class="set-label">Conteúdo expandido</label><select class="set-field" data-draft-field="compact_content"><option value="objective" ${draft.compact_content === "objective" ? "selected" : ""}>Próximo objetivo + alerta</option><option value="achievements" ${draft.compact_content === "achievements" ? "selected" : ""}>Conquistas</option><option value="guide" ${draft.compact_content === "guide" ? "selected" : ""}>Guia Inteligente</option></select></div><div><label class="set-label">Largura manual (px)</label>${field("compact_width", draft.compact_width, "number", "min=220 max=520")}</div><div><label class="set-label">Altura manual (px)</label>${field("compact_height", draft.compact_height, "number", "min=64 max=360")}</div><div><label class="set-label">Opacidade: <b id="compact-opacity-label">${draft.compact_opacity}%</b></label>${field("compact_opacity", draft.compact_opacity, "range", "min=30 max=85 step=1")}</div><div><label class="set-label">Canto</label><select class="set-field" data-draft-field="compact_corner"><option value="auto" ${draft.compact_corner === "auto" ? "selected" : ""}>Automático (preferir superior direito)</option><option value="top-right" ${draft.compact_corner === "top-right" ? "selected" : ""}>Superior direito</option><option value="bottom-right" ${draft.compact_corner === "bottom-right" ? "selected" : ""}>Inferior direito</option><option value="top-left" ${draft.compact_corner === "top-left" ? "selected" : ""}>Superior esquerdo</option><option value="bottom-left" ${draft.compact_corner === "bottom-left" ? "selected" : ""}>Inferior esquerdo</option></select></div></div></div><div class="settings-card"><h3>Hotkey e eventos</h3><div class="set-grid2"><div><label class="set-label">Hotkey</label>${field("compact_hotkey", draft.compact_hotkey, "text", "placeholder=ctrl+alt+g autocomplete=off")}</div><div>${settingsToggle("compact_auto_expand", draft.compact_auto_expand, "Expandir ao obter conquista", "Desligado por padrão para preservar a imersão")}</div><div><label class="set-label">Recolher automaticamente (segundos)</label>${field("compact_auto_collapse_seconds", draft.compact_auto_collapse_seconds, "number", "min=0 max=60")}</div></div></div><div class="settings-card"><h3>Conteúdo</h3><div class="set-grid2"><div><label class="set-label">Últimas conquistas</label>${field("compact_last", draft.compact_last, "number", "min=0 max=10")}</div><div><label class="set-label">Próximas conquistas</label>${field("compact_next", draft.compact_next, "number", "min=0 max=10")}</div></div></div>`);
+  : settingsPanelFrame(id, `<div class="settings-card"><h3>HUD passivo</h3><p class="set-hint">O overlay não captura foco, mouse, teclado ou controle durante a gameplay. A hotkey alterna oculto, mínimo e expandido.</p><div class="set-grid2"><div><label class="set-label">Tamanho</label><select class="set-field" data-draft-field="compact_size_mode"><option value="auto" ${draft.compact_size_mode === "auto" ? "selected" : ""}>Adaptar ao emulador</option><option value="manual" ${draft.compact_size_mode === "manual" ? "selected" : ""}>Manual</option></select></div><div><label class="set-label">Conteúdo expandido</label><select class="set-field" data-draft-field="compact_content"><option value="objective" ${draft.compact_content === "objective" ? "selected" : ""}>Próximo objetivo + alerta</option><option value="achievements" ${draft.compact_content === "achievements" ? "selected" : ""}>Conquistas</option><option value="guide" ${draft.compact_content === "guide" ? "selected" : ""}>Guia Inteligente</option></select></div><div><label class="set-label">HUD mínimo · largura</label>${field("compact_width", draft.compact_width, "number", "min=260 max=380")}</div><div><label class="set-label">HUD mínimo · altura</label>${field("compact_height", draft.compact_height, "number", "min=90 max=120")}</div><div><label class="set-label">HUD expandido · largura</label>${field("compact_expanded_width", draft.compact_expanded_width, "number", "min=360 max=520")}</div><div><label class="set-label">HUD expandido · altura</label>${field("compact_expanded_height", draft.compact_expanded_height, "number", "min=240 max=360")}</div><div><label class="set-label">Canto</label><select class="set-field" data-draft-field="compact_corner"><option value="auto" ${draft.compact_corner === "auto" ? "selected" : ""}>Automático (preferir superior direito)</option><option value="top-right" ${draft.compact_corner === "top-right" ? "selected" : ""}>Superior direito</option><option value="bottom-right" ${draft.compact_corner === "bottom-right" ? "selected" : ""}>Inferior direito</option><option value="top-left" ${draft.compact_corner === "top-left" ? "selected" : ""}>Superior esquerdo</option><option value="bottom-left" ${draft.compact_corner === "bottom-left" ? "selected" : ""}>Inferior esquerdo</option></select></div></div></div><div class="settings-card"><h3>Fundo do modo compacto</h3><p class="set-hint">O painel é sempre opaco. A arte escolhida aparece dentro do HUD com uma máscara escura para manter o texto legível.</p><div class="set-grid2"><div><label class="set-label">Arte usada no HUD</label><select class="set-field" data-draft-field="compact_background_mode"><option value="background" ${draft.compact_background_mode === "background" ? "selected" : ""}>Fundo do jogo (recomendado)</option><option value="cover" ${draft.compact_background_mode === "cover" ? "selected" : ""}>Capa do jogo</option><option value="title" ${draft.compact_background_mode === "title" ? "selected" : ""}>Arte de título</option><option value="solid" ${draft.compact_background_mode === "solid" ? "selected" : ""}>Cor sólida</option></select></div><div class="settings-art-action"><label class="set-label">Fundo do jogo atual</label><button class="btn-ghost" id="compact-art-picker" ${S.activeSlug ? "" : "disabled"}>Escolher imagem…</button></div></div></div><div class="settings-card"><h3>Hotkey e eventos</h3><div class="set-grid2"><div><label class="set-label">Hotkey</label>${field("compact_hotkey", draft.compact_hotkey, "text", "placeholder=ctrl+alt+g autocomplete=off")}</div><div>${settingsToggle("compact_auto_expand", draft.compact_auto_expand, "Expandir ao obter conquista", "Desligado por padrão para preservar a imersão")}</div><div><label class="set-label">Recolher automaticamente (segundos)</label>${field("compact_auto_collapse_seconds", draft.compact_auto_collapse_seconds, "number", "min=0 max=60")}</div></div></div><div class="settings-card"><h3>Conteúdo</h3><div class="set-grid2"><div><label class="set-label">Últimas conquistas</label>${field("compact_last", draft.compact_last, "number", "min=0 max=10")}</div><div><label class="set-label">Próximas conquistas</label>${field("compact_next", draft.compact_next, "number", "min=0 max=10")}</div></div></div>`);
 
   root.innerHTML = `<div class="view"><div class="wiz-head"><button class="back" id="set-back" title="Voltar">←</button><div><div class="t">Configurações</div><div class="s">Central de controle · sessão independente</div></div></div><div class="settings"><div class="settings-shell"><nav class="settings-nav" aria-label="Categorias das configurações"><p>Preferências</p>${Object.entries(SETTINGS_META).map(([key,meta]) => `<button class="set-nav-btn ${id === key ? "active" : ""}" data-set-target="${key}"><span>${meta[0]}</span><span>${esc(meta[1])}</span>${settingsHasChanges(key) ? "<i>•</i>" : ""}</button>`).join("")}</nav><main class="settings-inner">${panel}</main></div></div></div>`;
   const scroll = $("#settings-panel-scroll");
@@ -1619,12 +1654,16 @@ function renderSettings() {
   $("#set-reconnect")?.addEventListener("click", () => { S.mode = "real"; renderSetup(); });
   $("#set-update-check")?.addEventListener("click", () => procurarAtualizacao(true));
   $("#overlay-test")?.addEventListener("click", testarOverlay);
+  $("#compact-art-picker")?.addEventListener("click", async () => {
+    const game = S.activeSlug ? await backend.game(S.activeSlug).catch(() => null) : null;
+    if (game) openCoverPicker(game, "background");
+  });
   $("#settings-save")?.addEventListener("click", () => saveSettingsSession());
   $("#settings-discard")?.addEventListener("click", () => discardSettingsSession());
   root.querySelectorAll("[data-set-target]").forEach((b) => b.addEventListener("click", () => requestSettingsSection(b.dataset.setTarget)));
   root.querySelectorAll("[data-draft-toggle]").forEach((b) => b.addEventListener("click", () => { const key = b.dataset.draftToggle; S.SET.drafts[id][key] = !S.SET.drafts[id][key]; b.classList.toggle("on", S.SET.drafts[id][key]); b.setAttribute("aria-checked", String(S.SET.drafts[id][key])); markSettingsDirty(); }));
   root.querySelectorAll("[data-draft-field]").forEach((input) => {
-    const update = () => { setDraftValue(input.dataset.draftField, input.value); if (input.dataset.draftField === "ui_scale") $("#settings-scale-label").textContent = `${input.value}%`; if (input.dataset.draftField === "compact_opacity") $("#compact-opacity-label").textContent = `${input.value}%`; markSettingsDirty(); };
+    const update = () => { setDraftValue(input.dataset.draftField, input.value); if (input.dataset.draftField === "ui_scale") $("#settings-scale-label").textContent = `${input.value}%`; markSettingsDirty(); };
     input.addEventListener("input", update); input.addEventListener("change", update);
   });
   root.querySelectorAll("[data-settings-provider]").forEach((b) => b.addEventListener("click", () => { S.SET.drafts.ai.provider = b.dataset.settingsProvider; S.SET.drafts.ai.model = ""; S.SET.drafts.ai.base_url = ""; markSettingsDirty(); renderSettings(); }));
@@ -1635,7 +1674,7 @@ function renderSettings() {
 function setDraftValue(path, value) {
   const parts = String(path).split("."); let obj = S.SET.drafts[S.SET.section];
   for (let i = 0; i < parts.length - 1; i++) obj = obj[parts[i]];
-  const key = parts[parts.length - 1]; obj[key] = ["ui_scale", "compact_width", "compact_height", "compact_last", "compact_next", "compact_opacity", "compact_auto_collapse_seconds"].includes(key) ? Number(value) : value;
+  const key = parts[parts.length - 1]; obj[key] = ["ui_scale", "compact_width", "compact_height", "compact_expanded_width", "compact_expanded_height", "compact_last", "compact_next", "compact_auto_collapse_seconds"].includes(key) ? Number(value) : value;
 }
 function markSettingsDirty() {
   const dirty = settingsDirty(); const state = $("#settings-state"); const save = $("#settings-save"); const discard = $("#settings-discard");
@@ -1687,7 +1726,7 @@ async function saveSettingsSession() {
   if (id === "account") S.autoCheckUpdates = !!draft.auto_check_updates;
   if (id === "library") S.autoImport = !!draft.auto_import;
   if (id === "overlay") { S.autoOverlay = !!draft.auto_overlay; S.overlayExitFullscreen = !!draft.overlay_exit_fullscreen; S.overlaySecondScreen = !!draft.overlay_second_screen; S.overlayFitEmulator = !!draft.overlay_fit_emulator; }
-  if (id === "compact") { S.compactCfg = { ok: true, width: draft.compact_width, height: draft.compact_height, last: draft.compact_last, next: draft.compact_next, size_mode: draft.compact_size_mode, content: draft.compact_content, corner: draft.compact_corner, opacity: draft.compact_opacity, hotkey: draft.compact_hotkey, auto_expand: draft.compact_auto_expand, auto_collapse_seconds: draft.compact_auto_collapse_seconds }; S.compactContent = draft.compact_content; }
+  if (id === "compact") { S.compactCfg = { ok: true, width: draft.compact_width, height: draft.compact_height, expanded_width: draft.compact_expanded_width, expanded_height: draft.compact_expanded_height, last: draft.compact_last, next: draft.compact_next, size_mode: draft.compact_size_mode, content: draft.compact_content, corner: draft.compact_corner, background_mode: draft.compact_background_mode, opacity: 100, hotkey: draft.compact_hotkey, auto_expand: draft.compact_auto_expand, auto_collapse_seconds: draft.compact_auto_collapse_seconds }; S.compactContent = draft.compact_content; }
   renderSettings(); toast("Sessão salva com sucesso."); return true;
 }
 
@@ -2069,13 +2108,13 @@ const CV_SOURCES = [
 ];
 const CV_SRC_LABEL = { steamgriddb: "SteamGridDB", rawg: "RAWG", igdb: "IGDB" };
 
-async function openCoverPicker(game) {
+async function openCoverPicker(game, initialRole = "cover") {
   const cfg = await backend.getSourcesConfig().catch(() => ({ ready: {} }));
   const ready = (cfg && cfg.ready) || {};
   const first = ["steamgriddb", "rawg", "igdb"].find((s) => ready[s]) || "steamgriddb";
   S.CV = {
     slug: game.slug, title: game.title, query: game.title,
-    source: first, ready, role: "cover", urlValue: "",
+    source: first, ready, role: initialRole, returnView: S.view, urlValue: "",
     busy: false, error: "", matches: [], chosen: null, covers: [], heroes: [],
   };
   renderCoverPicker();
@@ -2263,9 +2302,11 @@ async function cvAplicar(url) {
     renderCoverPicker();
     return;
   }
+  const returnView = V.returnView;
   closeCoverPicker();
   toast(role === "both" ? "Capa e fundo atualizados." : role === "background" ? "Fundo atualizado." : "Capa atualizada.");
-  await renderDashboard({ force: true });
+  if (returnView === "settings") await renderSettings();
+  else await renderDashboard({ force: true });
 }
 
 async function cvLimpar() {
@@ -2274,9 +2315,11 @@ async function cvLimpar() {
   const role = V.role;
   const res = await backend.clearGameCover(V.slug, role).catch((e) => ({ ok: false, error: "" + e }));
   if (!res || !res.ok) return toast(res && res.error ? res.error : "Não consegui remover.", true);
+  const returnView = V.returnView;
   closeCoverPicker();
   toast("Voltou à arte padrão da RA.");
-  await renderDashboard({ force: true });
+  if (returnView === "settings") await renderSettings();
+  else await renderDashboard({ force: true });
 }
 
 /* Refina o guia recém-importado com a IA (opcional, custa por uso). */

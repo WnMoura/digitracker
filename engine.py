@@ -119,13 +119,15 @@ DEFAULT_SETTINGS = {
     "ui_scale": 100,
     "reduced_motion": False,
     "compact_size_mode": "auto",  # auto | manual
-    "compact_width": 300,   # tamanho manual do overlay compacto
-    "compact_height": 232,
+    "compact_width": 320,   # tamanho manual do HUD mínimo
+    "compact_height": 110,
+    "compact_expanded_width": 420,
+    "compact_expanded_height": 300,
     "compact_last": 2,      # quantas conquistas OBTIDAS mostrar no compacto
     "compact_next": 0,      # quantas PRÓXIMAS mostrar (0 = cabe o que couber)
     "compact_content": "objective",  # objective | achievements | guide
     "compact_corner": "auto",        # auto | top-right | bottom-right | top-left | bottom-left
-    "compact_opacity": 42,            # alpha base em percentuais (30..85)
+    "compact_background_mode": "background",  # background | cover | title | solid
     "compact_hotkey": "ctrl+alt+g",
     "compact_auto_expand": False,
     "compact_auto_collapse_seconds": 0,
@@ -135,14 +137,18 @@ DEFAULT_SETTINGS = {
 # crescer tanto que deixe de ser um overlay.
 COMPACT_MIN = (220, 64)
 COMPACT_MAX = (520, 360)
+COMPACT_MINIMAL_MIN = (260, 90)
+COMPACT_MINIMAL_MAX = (380, 120)
+COMPACT_EXPANDED_MIN = (360, 240)
+COMPACT_EXPANDED_MAX = (520, 360)
 
 # Quando "ajustar ao emulador" está ligado, o overlay ocupa esta fração da
 # janela do emulador (preso a COMPACT_MIN/MAX) — cresce em jogo grande, encolhe
 # em janela pequena.
-OVERLAY_FIT_W = 0.20
-OVERLAY_FIT_H = 0.12
-OVERLAY_EXPANDED_W = 0.30
-OVERLAY_EXPANDED_H = 0.32
+OVERLAY_FIT_W = 0.22
+OVERLAY_FIT_H = 0.14
+OVERLAY_EXPANDED_W = 0.32
+OVERLAY_EXPANDED_H = 0.40
 
 ACCENTS = ["#D62839", "#F5C518", "#2DE2E6", "#27AE60"]
 
@@ -153,7 +159,8 @@ ACCENTS = ["#D62839", "#F5C518", "#2DE2E6", "#27AE60"]
 DEFAULT_MODES = ("hardcore", "softcore")
 
 NORMAL_SIZE = (1040, 680)
-COMPACT_SIZE = (280, 84)    # fallback do HUD mínimo
+COMPACT_SIZE = (320, 110)    # fallback do HUD mínimo
+COMPACT_EXPANDED_SIZE = (420, 300)
 COMPACT_MARGIN = 16         # distância do canto da área cliente
 
 
@@ -228,10 +235,15 @@ def load_settings() -> dict:
         scale = saved.get("ui_scale")
         if isinstance(scale, (int, float)) and not isinstance(scale, bool):
             settings["ui_scale"] = max(80, min(140, int(scale)))
-        for key in ("compact_width", "compact_height", "compact_last", "compact_next"):
+        for key in ("compact_width", "compact_height", "compact_expanded_width",
+                    "compact_expanded_height", "compact_last", "compact_next"):
             value = saved.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 settings[key] = int(value)
+        settings["compact_width"] = max(COMPACT_MINIMAL_MIN[0], min(COMPACT_MINIMAL_MAX[0], settings["compact_width"]))
+        settings["compact_height"] = max(COMPACT_MINIMAL_MIN[1], min(COMPACT_MINIMAL_MAX[1], settings["compact_height"]))
+        settings["compact_expanded_width"] = max(COMPACT_EXPANDED_MIN[0], min(COMPACT_EXPANDED_MAX[0], settings["compact_expanded_width"]))
+        settings["compact_expanded_height"] = max(COMPACT_EXPANDED_MIN[1], min(COMPACT_EXPANDED_MAX[1], settings["compact_expanded_height"]))
         size_mode = saved.get("compact_size_mode")
         if size_mode in ("auto", "manual"):
             settings["compact_size_mode"] = size_mode
@@ -241,9 +253,9 @@ def load_settings() -> dict:
         corner = saved.get("compact_corner")
         if corner in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
             settings["compact_corner"] = corner
-        opacity = saved.get("compact_opacity")
-        if isinstance(opacity, (int, float)) and not isinstance(opacity, bool):
-            settings["compact_opacity"] = max(30, min(85, int(opacity)))
+        background_mode = saved.get("compact_background_mode")
+        if background_mode in ("background", "cover", "title", "solid"):
+            settings["compact_background_mode"] = background_mode
         hotkey = saved.get("compact_hotkey")
         if isinstance(hotkey, str) and hotkey.strip():
             settings["compact_hotkey"] = hotkey.strip().lower()
@@ -680,9 +692,11 @@ class Api:
             "library": {"auto_import"},
             "overlay": {"auto_overlay", "overlay_exit_fullscreen",
                         "overlay_second_screen", "overlay_fit_emulator"},
-            "compact": {"compact_width", "compact_height", "compact_last",
-                        "compact_next", "compact_size_mode", "compact_content",
-                        "compact_corner", "compact_opacity", "compact_hotkey",
+            "compact": {"compact_width", "compact_height",
+                        "compact_expanded_width", "compact_expanded_height",
+                        "compact_last", "compact_next", "compact_size_mode",
+                        "compact_content", "compact_corner", "compact_background_mode",
+                        "compact_hotkey",
                         "compact_auto_expand", "compact_auto_collapse_seconds"},
         }
         if section not in allowed:
@@ -721,11 +735,10 @@ class Api:
                     if value not in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
                         return {"ok": False, "error": "Canto do overlay inválido."}
                     self.settings[key] = value
-                elif key == "compact_opacity":
-                    try:
-                        self.settings[key] = max(30, min(85, int(value)))
-                    except (TypeError, ValueError):
-                        return {"ok": False, "error": "Opacidade inválida."}
+                elif key == "compact_background_mode":
+                    if value not in ("background", "cover", "title", "solid"):
+                        return {"ok": False, "error": "Fundo do overlay inválido."}
+                    self.settings[key] = value
                 elif key == "compact_hotkey":
                     if not isinstance(value, str) or not value.strip():
                         return {"ok": False, "error": "Hotkey inválida."}
@@ -741,21 +754,28 @@ class Api:
                         self.settings[key] = max(0, min(60, int(value)))
                     except (TypeError, ValueError):
                         return {"ok": False, "error": "Tempo de recolhimento inválido."}
-                elif key in {"compact_width", "compact_height", "compact_last", "compact_next"}:
+                elif key in {"compact_width", "compact_height", "compact_expanded_width",
+                             "compact_expanded_height", "compact_last", "compact_next"}:
                     try:
                         number = int(value)
                     except (TypeError, ValueError):
                         return {"ok": False, "error": "Valor numérico inválido."}
                     limits = {
-                        "compact_width": COMPACT_MIN[0],
-                        "compact_height": COMPACT_MIN[1],
+                        "compact_width": COMPACT_MINIMAL_MIN,
+                        "compact_height": COMPACT_MINIMAL_MIN,
+                        "compact_expanded_width": COMPACT_EXPANDED_MIN,
+                        "compact_expanded_height": COMPACT_EXPANDED_MIN,
                         "compact_last": (0, 10),
                         "compact_next": (0, 10),
                     }[key]
                     if key == "compact_width":
-                        self.settings[key] = max(COMPACT_MIN[0], min(COMPACT_MAX[0], number))
+                        self.settings[key] = max(COMPACT_MINIMAL_MIN[0], min(COMPACT_MINIMAL_MAX[0], number))
                     elif key == "compact_height":
-                        self.settings[key] = max(COMPACT_MIN[1], min(COMPACT_MAX[1], number))
+                        self.settings[key] = max(COMPACT_MINIMAL_MIN[1], min(COMPACT_MINIMAL_MAX[1], number))
+                    elif key == "compact_expanded_width":
+                        self.settings[key] = max(COMPACT_EXPANDED_MIN[0], min(COMPACT_EXPANDED_MAX[0], number))
+                    elif key == "compact_expanded_height":
+                        self.settings[key] = max(COMPACT_EXPANDED_MIN[1], min(COMPACT_EXPANDED_MAX[1], number))
                     else:
                         self.settings[key] = max(limits[0], min(limits[1], number))
             save_settings(self.settings)
@@ -2358,17 +2378,21 @@ class Api:
             fit = self.settings.get("overlay_fit_emulator", True)
             manual_w = int(self.settings.get("compact_width") or COMPACT_SIZE[0])
             manual_h = int(self.settings.get("compact_height") or COMPACT_SIZE[1])
+            expanded_w = int(self.settings.get("compact_expanded_width") or COMPACT_EXPANDED_SIZE[0])
+            expanded_h = int(self.settings.get("compact_expanded_height") or COMPACT_EXPANDED_SIZE[1])
         expanded = self._compact_state == "expanded" if expanded is None else bool(expanded)
         if mode == "manual" or not fit:
-            w, h = manual_w, manual_h
+            w, h = (expanded_w, expanded_h) if expanded else (manual_w, manual_h)
         elif not rect:
-            w, h = ((360, 180) if expanded else COMPACT_SIZE)
+            w, h = (COMPACT_EXPANDED_SIZE if expanded else COMPACT_SIZE)
         else:
             _ex, _ey, ew, eh = rect
             ratio_w = OVERLAY_EXPANDED_W if expanded else OVERLAY_FIT_W
             ratio_h = OVERLAY_EXPANDED_H if expanded else OVERLAY_FIT_H
             w, h = round(ew * ratio_w), round(eh * ratio_h)
-        return max(COMPACT_MIN[0], min(COMPACT_MAX[0], w)), max(COMPACT_MIN[1], min(COMPACT_MAX[1], h))
+        low = COMPACT_EXPANDED_MIN if expanded else COMPACT_MINIMAL_MIN
+        high = COMPACT_EXPANDED_MAX if expanded else COMPACT_MINIMAL_MAX
+        return max(low[0], min(high[0], w)), max(low[1], min(high[1], h))
 
     def _overlay_size_for(self, rect=None) -> tuple[int, int]:
         """Tamanho do overlay ao grudar: proporcional à janela do emulador quando
@@ -2417,11 +2441,12 @@ class Api:
             result = self._overlay_input.apply_passive(
                 self._own_hwnd,
                 expected_size=expected,
-                opacity=(int(self.settings.get("compact_opacity", 42)) +
-                         (16 if self._compact_state == "expanded" else 0)),
+                opacity=100,
+                click_through=self._compact_state != "expanded",
             )
             self._overlay_native_status = {
                 "passive": bool(result.get("passive")),
+                "click_through": bool(result.get("click_through", True)),
                 "error": str(result.get("error") or ""),
             }
         else:
@@ -2463,15 +2488,19 @@ class Api:
 
     def get_compact_config(self) -> dict:
         """Tamanho e contagens do overlay compacto para a UI."""
-        w, h = self._compact_size(self._current_overlay_rect())
         with self._lock:
+            w = int(self.settings.get("compact_width", COMPACT_SIZE[0]))
+            h = int(self.settings.get("compact_height", COMPACT_SIZE[1]))
             last = int(self.settings.get("compact_last", 2))
             nxt = int(self.settings.get("compact_next", 0))
             values = {
+                "expanded_width": int(self.settings.get("compact_expanded_width", COMPACT_EXPANDED_SIZE[0])),
+                "expanded_height": int(self.settings.get("compact_expanded_height", COMPACT_EXPANDED_SIZE[1])),
                 "size_mode": self.settings.get("compact_size_mode", "auto"),
                 "content": self.settings.get("compact_content", "objective"),
                 "corner": self.settings.get("compact_corner", "auto"),
-                "opacity": int(self.settings.get("compact_opacity", 42)),
+                "background_mode": self.settings.get("compact_background_mode", "background"),
+                "opacity": 100,
                 "hotkey": self.settings.get("compact_hotkey", "ctrl+alt+g"),
                 "auto_expand": bool(self.settings.get("compact_auto_expand", False)),
                 "auto_collapse_seconds": int(self.settings.get("compact_auto_collapse_seconds", 0)),
@@ -2481,7 +2510,9 @@ class Api:
 
     def set_compact_config(self, width=None, height=None, last=None, next=None,
                            size_mode=None, content=None, corner=None, opacity=None,
-                           hotkey=None, auto_expand=None, auto_collapse_seconds=None) -> dict:
+                           hotkey=None, auto_expand=None, auto_collapse_seconds=None,
+                           expanded_width=None, expanded_height=None,
+                           background_mode=None) -> dict:
         """Salva o tamanho/contagens do compacto. Se já estiver em modo compacto,
         redimensiona a janela na hora."""
         with self._lock:
@@ -2489,6 +2520,10 @@ class Api:
                 self.settings["compact_width"] = int(width)
             if height is not None:
                 self.settings["compact_height"] = int(height)
+            if expanded_width is not None:
+                self.settings["compact_expanded_width"] = int(expanded_width)
+            if expanded_height is not None:
+                self.settings["compact_expanded_height"] = int(expanded_height)
             if last is not None:
                 self.settings["compact_last"] = max(0, int(last))
             if next is not None:
@@ -2499,8 +2534,8 @@ class Api:
                 self.settings["compact_content"] = content
             if corner in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
                 self.settings["compact_corner"] = corner
-            if opacity is not None:
-                self.settings["compact_opacity"] = max(30, min(85, int(opacity)))
+            # Mantido na assinatura para compatibilidade com versões antigas da UI.
+            # O HUD agora é sempre opaco para preservar legibilidade.
             if hotkey is not None:
                 try:
                     emulator_tracker.parse_hotkey(hotkey)
@@ -2511,9 +2546,12 @@ class Api:
                 self.settings["compact_auto_expand"] = bool(auto_expand)
             if auto_collapse_seconds is not None:
                 self.settings["compact_auto_collapse_seconds"] = max(0, min(60, int(auto_collapse_seconds)))
+            if background_mode in ("background", "cover", "title", "solid"):
+                self.settings["compact_background_mode"] = background_mode
             save_settings(self.settings)
         win = self._window
-        if win and self._compact and (width is not None or height is not None or size_mode is not None):
+        if win and self._compact and any(value is not None for value in (
+                width, height, expanded_width, expanded_height, size_mode)):
             w, h = self._compact_size(self._current_overlay_rect())
             self._compact_expected_size = (w, h)
             self._window_op(lambda: win.resize(w, h))
@@ -2561,7 +2599,8 @@ class Api:
             "rect": list(rect) if rect else [],
             "last_check": raw.get("last_check") or self._overlay_last_check,
             "error": self._overlay_error or str(raw.get("error") or ""),
-            "native_input_mode": "passive" if self._overlay_native_status.get("passive") else "fallback",
+            "native_input_mode": ("passive" if self._overlay_native_status.get("click_through", True)
+                                  else "interactive") if self._overlay_native_status.get("passive") else "fallback",
             "hotkey_registered": bool(self._overlay_input.status().get("registered")),
             "hotkey": self._overlay_input.status().get("hotkey", ""),
             "hotkey_error": self._overlay_input.status().get("error", "") or self._overlay_native_status.get("error", ""),

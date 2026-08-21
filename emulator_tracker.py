@@ -573,6 +573,7 @@ class WindowsOverlayInput:
         self._hwnd = None
         self._original_exstyle = None
         self._passive = False
+        self._click_through = False
         self._hotkey_stop = threading.Event()
         self._hotkey_thread = None
         self._hotkey_thread_id = None
@@ -592,7 +593,7 @@ class WindowsOverlayInput:
         fn.restype = self._ctypes.c_ssize_t
         return int(fn(hwnd, index, value))
 
-    def apply_passive(self, hwnd, expected_size=None, opacity=75):
+    def apply_passive(self, hwnd, expected_size=None, opacity=75, click_through=True):
         if not hwnd:
             return {"ok": False, "error": "HWND do overlay não encontrado."}
         try:
@@ -625,34 +626,38 @@ class WindowsOverlayInput:
                         "pending": True,
                         "error": "Aguardando a janela entrar no tamanho compacto.",
                     }
-            if self._hwnd == int(hwnd) and self._passive:
-                return {"ok": True, "passive": True}
+            click_through = bool(click_through)
+            if self._hwnd == int(hwnd) and self._passive and self._click_through == click_through:
+                return {"ok": True, "passive": True, "click_through": click_through}
             if self._hwnd != hwnd:
                 self.restore()
                 self._hwnd = int(hwnd)
             if self._original_exstyle is None:
                 self._original_exstyle = self._get_long(hwnd, self.GWL_EXSTYLE)
             style = (self._original_exstyle | self.WS_EX_LAYERED |
-                     self.WS_EX_TRANSPARENT | self.WS_EX_TOOLWINDOW |
-                     self.WS_EX_NOACTIVATE)
+                     self.WS_EX_TOOLWINDOW | self.WS_EX_NOACTIVATE)
+            if click_through:
+                style |= self.WS_EX_TRANSPARENT
+            else:
+                style &= ~self.WS_EX_TRANSPARENT
             self._set_long(hwnd, self.GWL_EXSTYLE, style)
             applied = self._get_long(hwnd, self.GWL_EXSTYLE)
-            required = self.WS_EX_TRANSPARENT | self.WS_EX_NOACTIVATE
+            required = self.WS_EX_NOACTIVATE | (self.WS_EX_TRANSPARENT if click_through else 0)
             if (applied & required) != required:
                 raise OSError("O Windows recusou os estilos passivos do overlay.")
+            if not click_through and (applied & self.WS_EX_TRANSPARENT):
+                raise OSError("O Windows manteve o passa-clique no HUD expandido.")
             self.user32.SetWindowPos(
                 hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
                 self.SWP_NOSIZE | self.SWP_NOMOVE | self.SWP_NOACTIVATE | self.SWP_SHOWWINDOW)
-            # A janela principal permanece opaca e interativa. A transparência
-            # real passa a existir somente no HUD compacto, evitando o bug do
-            # WebView2 em que `transparent=True` remove toda a janela do hit-test.
-            requested = max(30, min(85, int(opacity)))
-            alpha_percent = 55 + round(requested * 0.47)  # 69% .. 95%
-            alpha = max(1, min(255, round(255 * alpha_percent / 100)))
-            if not self.user32.SetLayeredWindowAttributes(hwnd, 0, alpha, self.LWA_ALPHA):
+            # A janela permanece 100% opaca. O fundo escolhido é composto pela
+            # própria UI; reduzir o alpha da janela inteira fazia o jogo vazar
+            # através do texto e prejudicava a leitura do HUD.
+            if not self.user32.SetLayeredWindowAttributes(hwnd, 0, 255, self.LWA_ALPHA):
                 raise self._ctypes.WinError()
             self._passive = True
-            return {"ok": True, "passive": True}
+            self._click_through = click_through
+            return {"ok": True, "passive": True, "click_through": click_through}
         except Exception as exc:
             self.restore()
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -672,6 +677,7 @@ class WindowsOverlayInput:
             pass
         self._original_exstyle = None
         self._passive = False
+        self._click_through = False
         self._hwnd = None
 
     def stop_hotkey(self):
@@ -753,7 +759,7 @@ class WindowsOverlayInput:
 class NullOverlayInput:
     """Fallback não-Windows: mantém o overlay funcional sem APIs nativas."""
 
-    def apply_passive(self, _hwnd, expected_size=None, opacity=75):
+    def apply_passive(self, _hwnd, expected_size=None, opacity=75, click_through=True):
         return {"ok": True, "passive": False, "fallback": True}
 
     def restore(self):

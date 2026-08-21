@@ -730,18 +730,21 @@ class TestConfiguracoesPorSessao:
     def test_limita_valores_do_modo_compacto(self, api):
         result = api.set_settings_session("compact", {
             "compact_width": 9999, "compact_height": 1,
+            "compact_expanded_width": 100, "compact_expanded_height": 9999,
             "compact_last": -5, "compact_next": 99,
         })
         assert result["ok"] is True
-        assert result["compact_width"] == 520
-        assert result["compact_height"] == 64
+        assert result["compact_width"] == 380
+        assert result["compact_height"] == 90
+        assert result["compact_expanded_width"] == 360
+        assert result["compact_expanded_height"] == 360
         assert result["compact_last"] == 0
         assert result["compact_next"] == 10
 
     def test_salva_preferencias_do_hud_passivo(self, api):
         result = api.set_settings_session("compact", {
             "compact_size_mode": "auto", "compact_content": "guide",
-            "compact_corner": "bottom-right", "compact_opacity": 31,
+            "compact_corner": "bottom-right", "compact_background_mode": "cover",
             "compact_hotkey": "ctrl+alt+g", "compact_auto_expand": True,
             "compact_auto_collapse_seconds": 12,
         })
@@ -749,7 +752,7 @@ class TestConfiguracoesPorSessao:
         settings = engine.load_settings()
         assert settings["compact_content"] == "guide"
         assert settings["compact_corner"] == "bottom-right"
-        assert settings["compact_opacity"] == 31
+        assert settings["compact_background_mode"] == "cover"
         assert settings["compact_auto_collapse_seconds"] == 12
 
     def test_recusa_hotkey_sem_modificador(self, api):
@@ -758,14 +761,25 @@ class TestConfiguracoesPorSessao:
 
     def test_tamanho_auto_minimo_e_expandido_respeita_area_cliente(self, api):
         rect = (0, 0, 1280, 720)
-        assert api._compact_size(rect, expanded=False) == (256, 86)
-        assert api._compact_size(rect, expanded=True) == (384, 230)
+        assert api._compact_size(rect, expanded=False) == (282, 101)
+        assert api._compact_size(rect, expanded=True) == (410, 288)
+
+    def test_tamanho_manual_separa_minimo_e_expandido(self, api):
+        api.settings.update({
+            "compact_size_mode": "manual", "compact_width": 310,
+            "compact_height": 105, "compact_expanded_width": 460,
+            "compact_expanded_height": 330,
+        })
+        assert api._compact_size(expanded=False) == (310, 105)
+        assert api._compact_size(expanded=True) == (460, 330)
 
     def test_config_compacto_expoe_hud_passivo(self, api):
         cfg = api.get_compact_config()
         assert cfg["size_mode"] == "auto"
         assert cfg["content"] == "objective"
-        assert cfg["opacity"] == 42
+        assert cfg["opacity"] == 100
+        assert cfg["background_mode"] == "background"
+        assert cfg["expanded_width"] == 420
         assert cfg["hotkey"] == "ctrl+alt+g"
 
     def test_sem_hotkey_nao_deixa_overlay_passa_clique(self, api):
@@ -782,7 +796,7 @@ class TestConfiguracoesPorSessao:
                 cls.restored = True
 
             @classmethod
-            def apply_passive(cls, _hwnd, expected_size=None, opacity=75):
+            def apply_passive(cls, _hwnd, expected_size=None, opacity=75, click_through=True):
                 cls.applied = True
                 return {"ok": True, "passive": True}
 
@@ -803,18 +817,41 @@ class TestConfiguracoesPorSessao:
                 return {"registered": True, "error": ""}
 
             @staticmethod
-            def apply_passive(_hwnd, expected_size=None, opacity=75):
-                assert expected_size == (280, 84)
-                assert opacity == 42
-                return {"ok": True, "passive": True}
+            def apply_passive(_hwnd, expected_size=None, opacity=75, click_through=True):
+                assert expected_size == (320, 110)
+                assert opacity == 100
+                assert click_through is True
+                return {"ok": True, "passive": True, "click_through": True}
 
         api._window = object()
         api._own_hwnd = 123
         api._compact = True
-        api._compact_expected_size = (280, 84)
+        api._compact_expected_size = (320, 110)
         api._overlay_input = Input()
         api._configure_native_overlay()
-        assert api._overlay_native_status == {"passive": True, "error": ""}
+        assert api._overlay_native_status == {"passive": True, "click_through": True, "error": ""}
+
+    def test_expandido_libera_botoes_sem_roubar_foco(self, api):
+        class Input:
+            @staticmethod
+            def status():
+                return {"registered": True, "error": ""}
+
+            @staticmethod
+            def apply_passive(_hwnd, expected_size=None, opacity=75, click_through=True):
+                assert expected_size == (420, 300)
+                assert click_through is False
+                return {"ok": True, "passive": True, "click_through": False}
+
+        api._window = object()
+        api._own_hwnd = 123
+        api._compact = True
+        api._compact_state = "expanded"
+        api._compact_expected_size = (420, 300)
+        api._overlay_input = Input()
+        api._configure_native_overlay()
+        assert api._overlay_native_status["passive"] is True
+        assert api._overlay_native_status["click_through"] is False
 
     def test_sair_do_compacto_restabelece_cliques_imediatamente(self, api):
         class Input:
