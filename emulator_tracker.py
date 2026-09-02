@@ -570,15 +570,19 @@ class WindowsOverlayInput:
             wintypes.HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD,
         ]
         self.user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
-        self._hwnd = None
-        self._original_exstyle = None
-        self._passive = False
-        self._click_through = False
+        # Um DigiTracker pode manter dois HUDs nativos ao mesmo tempo. O
+        # controlador antigo guardava apenas um HWND e restaurava o anterior
+        # sempre que o segundo era configurado, deixando uma das janelas
+        # interativa durante a gameplay. Cada raiz nativa agora possui seu
+        # próprio snapshot de estilo.
+        self._windows = {}
         self._hotkey_stop = threading.Event()
         self._hotkey_thread = None
         self._hotkey_thread_id = None
         self._hotkey_id = 0xD17
-        self._hotkey_status = {"registered": False, "hotkey": "", "error": ""}
+        self._hotkey_status = {
+            "registered": False, "hotkey": "", "error": "", "bindings": {},
+        }
         self._hotkey_lock = threading.Lock()
 
     def _get_long(self, hwnd, index):
@@ -619,7 +623,10 @@ class WindowsOverlayInput:
                 max_w = int(expected_w * scale) + 48
                 max_h = int(expected_h * scale) + 48
                 if width > max_w or height > max_h:
-                    self.restore()
+                    # Um HUD pode terminar o resize antes do outro. Restaurar
+                    # todos aqui tornava a segunda superficie clicavel durante
+                    # a gameplay enquanto apenas esta ainda estava pendente.
+                    self.restore(hwnd)
                     return {
                         "ok": False,
                         "passive": False,
@@ -627,14 +634,18 @@ class WindowsOverlayInput:
                         "error": "Aguardando a janela entrar no tamanho compacto.",
                     }
             click_through = bool(click_through)
-            if self._hwnd == int(hwnd) and self._passive and self._click_through == click_through:
+            hwnd = int(hwnd)
+            current = self._windows.get(hwnd)
+            if current and current.get("passive") and current.get("click_through") == click_through:
                 return {"ok": True, "passive": True, "click_through": click_through}
-            if self._hwnd != hwnd:
-                self.restore()
-                self._hwnd = int(hwnd)
-            if self._original_exstyle is None:
-                self._original_exstyle = self._get_long(hwnd, self.GWL_EXSTYLE)
-            style = (self._original_exstyle | self.WS_EX_LAYERED |
+            if current is None:
+                current = {
+                    "original_exstyle": self._get_long(hwnd, self.GWL_EXSTYLE),
+                    "passive": False,
+                    "click_through": False,
+                }
+                self._windows[hwnd] = current
+            style = (current["original_exstyle"] | self.WS_EX_LAYERED |
                      self.WS_EX_TOOLWINDOW | self.WS_EX_NOACTIVATE)
             if click_through:
                 style |= self.WS_EX_TRANSPARENT
@@ -655,30 +666,57 @@ class WindowsOverlayInput:
             # através do texto e prejudicava a leitura do HUD.
             if not self.user32.SetLayeredWindowAttributes(hwnd, 0, 255, self.LWA_ALPHA):
                 raise self._ctypes.WinError()
-            self._passive = True
-            self._click_through = click_through
+            current["passive"] = True
+            current["click_through"] = click_through
             return {"ok": True, "passive": True, "click_through": click_through}
         except Exception as exc:
-            self.restore()
+            self.restore(hwnd if 'hwnd' in locals() else None)
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
-    def restore(self):
-        hwnd = self._hwnd
+    def restore(self, hwnd=None):
+        """Restaura um HUD específico ou todos eles quando ``hwnd`` é omitido."""
+        targets = [int(hwnd)] if hwnd else list(self._windows)
+        for target in targets:
+            state = self._windows.pop(target, None)
+            if not state:
+                continue
+            try:
+                original = state.get("original_exstyle")
+                if original is not None:
+                    self._set_long(target, self.GWL_EXSTYLE, original)
+                    self.user32.SetWindowPos(
+                        target, self.HWND_TOPMOST, 0, 0, 0, 0,
+                        self.SWP_NOSIZE | self.SWP_NOMOVE | self.SWP_NOACTIVATE |
+                        self.SWP_SHOWWINDOW)
+            except Exception:
+                pass
+
+    def show_no_activate(self, hwnd):
+        """Exibe um HUD sem transferir o foco do jogo/emulador."""
         if not hwnd:
-            return
+            return False
         try:
-            if self._original_exstyle is not None:
-                self._set_long(hwnd, self.GWL_EXSTYLE, self._original_exstyle)
-                self.user32.SetWindowPos(
-                    hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
-                    self.SWP_NOSIZE | self.SWP_NOMOVE | self.SWP_NOACTIVATE |
-                    self.SWP_SHOWWINDOW)
+            hwnd = int(self.user32.GetAncestor(hwnd, 2) or hwnd)
+            # SW_SHOWNOACTIVATE
+            self.user32.ShowWindow(hwnd, 4)
+            self.user32.SetWindowPos(
+                hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
+                self.SWP_NOSIZE | self.SWP_NOMOVE | self.SWP_NOACTIVATE |
+                self.SWP_SHOWWINDOW)
+            return True
         except Exception:
-            pass
-        self._original_exstyle = None
-        self._passive = False
-        self._click_through = False
-        self._hwnd = None
+            return False
+
+    def hide_window(self, hwnd):
+        if not hwnd:
+            return False
+        try:
+            hwnd = int(self.user32.GetAncestor(hwnd, 2) or hwnd)
+            # SW_HIDE
+            self.user32.ShowWindow(hwnd, 0)
+            return True
+        except Exception:
+            return False
 
     def stop_hotkey(self):
         self._hotkey_stop.set()
@@ -694,15 +732,39 @@ class WindowsOverlayInput:
         self._hotkey_thread = None
         self._hotkey_thread_id = None
         with self._hotkey_lock:
-            self._hotkey_status = {"registered": False, "hotkey": "", "error": ""}
+            self._hotkey_status = {
+                "registered": False, "hotkey": "", "error": "", "bindings": {},
+            }
 
     def start_hotkey(self, value, callback):
+        """Compatibilidade com o contrato antigo de uma unica hotkey."""
+        result = self.start_hotkeys({"toggle": (value, callback)})
+        status = self.status()
+        return ({"ok": True, "hotkey": str(value)} if result.get("ok") else
+                {"ok": False, "error": status.get("error") or result.get("error")})
+
+    def start_hotkeys(self, bindings):
+        """Registra varias hotkeys na mesma fila nativa do Windows.
+
+        ``bindings`` e ``{nome: (atalho, callback)}``. O registro e atomico:
+        se uma combinacao falhar, as demais sao desregistradas para que o
+        engine mantenha a janela interativa e ofereca recuperacao.
+        """
         self.stop_hotkey()
+        parsed = []
         try:
-            modifiers, key = parse_hotkey(value)
-        except ValueError as exc:
+            for offset, (name, binding) in enumerate(dict(bindings or {}).items()):
+                value, callback = binding
+                modifiers, key = parse_hotkey(value)
+                parsed.append((self._hotkey_id + offset, str(name), str(value),
+                               modifiers, key, callback))
+            if not parsed:
+                raise ValueError("Nenhuma hotkey foi informada.")
+        except (TypeError, ValueError) as exc:
             with self._hotkey_lock:
-                self._hotkey_status = {"registered": False, "hotkey": str(value or ""), "error": str(exc)}
+                self._hotkey_status = {
+                    "registered": False, "hotkey": "", "error": str(exc), "bindings": {},
+                }
             return {"ok": False, "error": str(exc)}
 
         self._hotkey_stop.clear()
@@ -710,15 +772,31 @@ class WindowsOverlayInput:
 
         def loop():
             self._hotkey_thread_id = int(self.kernel32.GetCurrentThreadId())
-            ok = bool(self.user32.RegisterHotKey(None, self._hotkey_id, modifiers, key))
-            if not ok:
-                error = self._ctypes.WinError().strerror or "A combinação já está em uso."
-                with self._hotkey_lock:
-                    self._hotkey_status = {"registered": False, "hotkey": str(value), "error": error}
-                ready.set()
-                return
+            registered = []
+            callbacks = {}
+            statuses = {}
+            for hotkey_id, name, value, modifiers, key, callback in parsed:
+                ok = bool(self.user32.RegisterHotKey(None, hotkey_id, modifiers, key))
+                statuses[name] = {"registered": ok, "hotkey": value, "error": ""}
+                if not ok:
+                    error = self._ctypes.WinError().strerror or "A combinação já está em uso."
+                    statuses[name]["error"] = error
+                    for previous_id in registered:
+                        self.user32.UnregisterHotKey(None, previous_id)
+                    with self._hotkey_lock:
+                        self._hotkey_status = {
+                            "registered": False, "hotkey": parsed[0][2],
+                            "error": f"{name}: {error}", "bindings": statuses,
+                        }
+                    ready.set()
+                    return
+                registered.append(hotkey_id)
+                callbacks[hotkey_id] = callback
             with self._hotkey_lock:
-                self._hotkey_status = {"registered": True, "hotkey": str(value), "error": ""}
+                self._hotkey_status = {
+                    "registered": True, "hotkey": parsed[0][2], "error": "",
+                    "bindings": statuses,
+                }
             ready.set()
             msg = self._wintypes.MSG()
             try:
@@ -726,13 +804,15 @@ class WindowsOverlayInput:
                     result = self.user32.GetMessageW(self._ctypes.byref(msg), None, 0, 0)
                     if result <= 0:
                         break
-                    if msg.message == self.WM_HOTKEY and msg.wParam == self._hotkey_id:
+                    callback = callbacks.get(int(msg.wParam)) if msg.message == self.WM_HOTKEY else None
+                    if callback:
                         try:
                             callback()
                         except Exception:
                             pass
             finally:
-                self.user32.UnregisterHotKey(None, self._hotkey_id)
+                for hotkey_id in registered:
+                    self.user32.UnregisterHotKey(None, hotkey_id)
 
         self._hotkey_thread = threading.Thread(target=loop, daemon=True, name="DigiTrackerHotkey")
         self._hotkey_thread.start()
@@ -740,10 +820,13 @@ class WindowsOverlayInput:
             self.stop_hotkey()
             error = "O Windows não respondeu ao registro da hotkey."
             with self._hotkey_lock:
-                self._hotkey_status = {"registered": False, "hotkey": str(value), "error": error}
+                self._hotkey_status = {
+                    "registered": False, "hotkey": parsed[0][2],
+                    "error": error, "bindings": {},
+                }
             return {"ok": False, "error": error}
         status = self.status()
-        return ({"ok": True, "hotkey": str(value)} if status.get("registered")
+        return ({"ok": True, "bindings": status.get("bindings", {})} if status.get("registered")
                 else {"ok": False, "error": status.get("error") or
                       "A combinação de hotkey já está em uso."})
 
@@ -762,11 +845,20 @@ class NullOverlayInput:
     def apply_passive(self, _hwnd, expected_size=None, opacity=75, click_through=True):
         return {"ok": True, "passive": False, "fallback": True}
 
-    def restore(self):
+    def restore(self, _hwnd=None):
         pass
+
+    def show_no_activate(self, _hwnd):
+        return False
+
+    def hide_window(self, _hwnd):
+        return False
 
     def start_hotkey(self, _value, _callback):
         return {"ok": False, "error": "Hotkey global disponível somente no Windows."}
+
+    def start_hotkeys(self, _bindings):
+        return {"ok": False, "error": "Hotkeys globais disponíveis somente no Windows."}
 
     def stop_hotkey(self):
         pass

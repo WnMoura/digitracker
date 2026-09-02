@@ -168,6 +168,85 @@ class TestConsoleWindowAndArt:
         assert saved["art"] == {"box": "/box.png"}
         assert saved["art_meta"]["auto_status"] == "fallback"
 
+    def test_paleta_extraida_da_arte_e_ajuste_manual(self, api):
+        from PIL import Image
+        art = engine.ART_DIR / "jogo" / "box.png"
+        art.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (100, 100), (20, 130, 220)).save(art)
+        self._write_game(api, {
+            "slug": "jogo", "title": "Jogo", "accent": "#000000",
+            "art": {"box": "/assets/art/jogo/box.png"},
+        })
+        automatic = api.recalculate_game_palette("jogo")
+        assert automatic["ok"] and automatic["palette"]["manual"] is False
+        manual = api.set_game_palette("jogo", "#AA3300", "#FFCC00")
+        assert manual["palette"]["primary"] == "#AA3300"
+        assert manual["palette"]["manual"] is True
+
+    def test_falha_da_web_preserva_arte_anterior(self, api, monkeypatch):
+        path = self._write_game(api, {
+            "slug": "jogo", "title": "Jogo",
+            "art": {"box": "/original.png", "cover": "/manual.png"},
+            "art_meta": {"cover": {"manual": True}},
+        })
+        monkeypatch.setattr(engine.image_fetch, "download_image_validated", lambda *args: {
+            "ok": False, "error": "hotlink bloqueado",
+        })
+        result = api.apply_web_art("jogo", {
+            "url": "https://cdn.example/cover.jpg", "provider": "google",
+        }, "cover")
+        assert result["ok"] is False
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["art"]["cover"] == "/manual.png"
+        assert saved["art_meta"]["cover"] == {"manual": True}
+
+    def test_aplica_candidato_aprovado_e_registra_proveniencia(self, api, monkeypatch):
+        from PIL import Image
+        path = self._write_game(api, {
+            "slug": "jogo", "title": "Jogo", "art": {"box": "/original.png"},
+        })
+
+        def fake_download(_url, destination):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (800, 1200), (30, 80, 160)).save(destination, format="PNG")
+            return {"ok": True, "width": 800, "height": 1200,
+                    "mime": "image/png", "sha256": "a" * 64}
+
+        monkeypatch.setattr(engine.image_fetch, "download_image_validated", fake_download)
+        result = api.apply_web_art("jogo", {
+            "url": "https://cdn.example/cover.jpg", "provider": "google",
+            "source_page": "https://games.example/jogo", "host": "games.example",
+            "query": "Jogo PS2 box art cover",
+        }, "cover")
+        assert result["ok"] is True
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        metadata = saved["art_meta"]["cover"]
+        assert metadata["manual"] is True
+        assert metadata["origin"] == "games.example"
+        assert metadata["mechanism"] == "google"
+        assert metadata["source_url"] == "https://cdn.example/cover.jpg"
+        assert metadata["query"] == "Jogo PS2 box art cover"
+        assert metadata["sha256"] == "a" * 64
+
+    def test_busca_web_usa_termo_por_papel_e_normaliza_resultado(self, api, monkeypatch):
+        self._write_game(api, {"slug": "jogo", "title": "Jogo", "platform": "PS2"})
+        captured = {}
+
+        def fake_search(query, page, safe, provider):
+            captured.update(query=query, page=page, safe=safe, provider=provider)
+            return {"ok": True, "provider": "google", "query": query,
+                    "results": [{"url": "https://cdn.example/wall.jpg",
+                                 "thumb": "https://cdn.example/thumb.jpg",
+                                 "width": 1920, "height": 1080,
+                                 "source": "https://games.example/page"}]}
+
+        monkeypatch.setattr(engine.web_image_search, "search", fake_search)
+        result = api.search_web_images("jogo", "", 2, "strict", "background", "google")
+        assert captured["query"] == "Jogo PS2 wallpaper 1920x1080"
+        assert captured["page"] == 2
+        assert result["results"][0]["orientation"] == "landscape"
+        assert result["results"][0]["host"] == "games.example"
+
 
 class TestSyncGameMastery:
     """O progresso deixou de ser curadoria Normal/Hard: hardcore e softcore vêm
@@ -266,6 +345,79 @@ class TestSyncGameMastery:
         d = self._sync(api, {})
         assert d["mastery"]["percent"] == 0
         assert d["mastery"]["complete"] is False
+
+    def test_conjunto_ra_independe_do_walkthrough_e_calcula_score(self, api):
+        game = self._game([1])
+        earned = {
+            1: {"id": 1, "title": "A", "earned": True, "hardcore": True,
+                "date": "2026-01-01 10:00:00", "date_hardcore": "2026-01-01 10:00:00",
+                "points": 5, "true_ratio": 11, "display_order": 1},
+            2: {"id": 2, "title": "B", "earned": False, "hardcore": False,
+                "date": "", "points": 10, "true_ratio": 29, "display_order": 2},
+        }
+        detail = api._apply_progress(game, earned, {"UserTotalPlaytime": 3661})
+        assert [a["id"] for a in detail["achievements"]] == [1, 2]
+        assert detail["mastery"]["total"] == 2
+        assert detail["score"] == {"available": 15, "earned": 5, "hardcore": 5,
+                                    "true_ratio_available": 40, "true_ratio_earned": 11}
+        assert detail["playtime"]["label"] == "1h 01min"
+
+    def test_celebracao_so_dispara_na_transicao(self, api):
+        game = self._game([1])
+        path = engine.GAMES_DIR / "jogo.json"
+        path.write_text(json.dumps(game), encoding="utf-8")
+        locked = {1: {"id": 1, "earned": False, "hardcore": False, "date": "", "points": 5}}
+        api._apply_progress(game, locked, {})
+        earned = {1: {"id": 1, "earned": True, "hardcore": True,
+                      "date": "2026-01-01 10:00:00",
+                      "date_softcore": "2026-01-01 09:00:00",
+                      "date_hardcore": "2026-01-01 10:00:00", "points": 5}}
+        detail = api._apply_progress(game, earned, {})
+        events = detail["completion_events"]["events"]
+        assert [e["kind"] for e in events] == ["softcore", "mastery"]
+        assert events[0]["pending"] is False and events[1]["pending"] is True
+        detail = api._apply_progress(game, earned, {})
+        assert len(detail["completion_events"]["events"]) == 2
+
+    def test_conclusao_antiga_migra_sem_modal_mas_pode_ser_reaberta(self, api):
+        game = self._game([1])
+        earned = {1: {"id": 1, "earned": True, "hardcore": True,
+                      "date": "2025-01-01 09:00:00",
+                      "date_hardcore": "2025-01-01 10:00:00", "points": 5}}
+        detail = api._apply_progress(game, earned, {})
+        events = detail["completion_events"]["events"]
+        assert [event["kind"] for event in events] == ["softcore", "mastery"]
+        assert all(event["pending"] is False for event in events)
+
+    def test_hall_ordena_por_data_original_e_nao_pela_data_formatada(self, api):
+        api.state = {
+            "antigo": {"completion": {"mastery_complete": True,
+                                        "mastery_date": "31/12/2025",
+                                        "mastery_date_raw": "2025-12-31 10:00:00"}},
+            "novo": {"completion": {"mastery_complete": True,
+                                      "mastery_date": "01/01/2026",
+                                      "mastery_date_raw": "2026-01-01 10:00:00"}},
+        }
+        hall = api.get_mastery_hall()
+        assert hall["mastery"] == [api.state["novo"], api.state["antigo"]]
+
+    def test_replay_antigo_sem_evento_e_sintetizado_sem_ficar_pendente(self, api):
+        api.state = {"jogo": {
+            "slug": "jogo", "title": "Jogo antigo",
+            "mastery": {"total": 10},
+            "score": {"hardcore": 75},
+            "playtime": {"seconds": 3600, "label": "1h"},
+            "completion": {
+                "mastery_complete": True, "mastery_date": "01/01/2025",
+                "hardcore": 10,
+            },
+        }}
+        result = api.reopen_completion_event("jogo")
+        assert result["ok"] is True
+        assert result["game"]["title"] == "Jogo antigo"
+        assert result["event"]["synthetic"] is True
+        assert result["event"]["pending"] is False
+        assert result["event"]["points"] == 75
 
 
 class TestAutoImport:
@@ -685,7 +837,7 @@ class TestAtualizacoes:
         return engine.Api()
 
     def test_versao_aparece_no_estado(self, api):
-        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.8.6"
+        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.9.0"
 
     def test_verificacao_automatica_ligada_por_padrao(self, api):
         assert api.get_app_state()["auto_check_updates"] is True
@@ -736,21 +888,22 @@ class TestConfiguracoesPorSessao:
         assert result["ok"] is True
         assert result["compact_width"] == 380
         assert result["compact_height"] == 90
-        assert result["compact_expanded_width"] == 360
-        assert result["compact_expanded_height"] == 360
+        assert result["compact_expanded_width"] == 340
+        assert result["compact_expanded_height"] == 480
         assert result["compact_last"] == 0
         assert result["compact_next"] == 10
 
     def test_salva_preferencias_do_hud_passivo(self, api):
         result = api.set_settings_session("compact", {
-            "compact_size_mode": "auto", "compact_content": "guide",
+            "compact_size_mode": "auto",
             "compact_corner": "bottom-right", "compact_background_mode": "cover",
-            "compact_hotkey": "ctrl+alt+g", "compact_auto_expand": True,
+            "compact_hotkey": "ctrl+alt+g", "compact_edit_hotkey": "ctrl+alt+e",
+            "compact_auto_expand": True,
             "compact_auto_collapse_seconds": 12,
         })
         assert result["ok"] is True
         settings = engine.load_settings()
-        assert settings["compact_content"] == "guide"
+        assert settings["compact_edit_hotkey"] == "ctrl+alt+e"
         assert settings["compact_corner"] == "bottom-right"
         assert settings["compact_background_mode"] == "cover"
         assert settings["compact_auto_collapse_seconds"] == 12
@@ -764,6 +917,10 @@ class TestConfiguracoesPorSessao:
         assert api._compact_size(rect, expanded=False) == (282, 101)
         assert api._compact_size(rect, expanded=True) == (410, 288)
 
+    def test_tamanho_auto_combina_resumo_e_trofeus(self, api):
+        rect = (0, 0, 1280, 720)
+        assert api._compact_size(rect, variant="both") == (410, 399)
+
     def test_tamanho_manual_separa_minimo_e_expandido(self, api):
         api.settings.update({
             "compact_size_mode": "manual", "compact_width": 310,
@@ -772,15 +929,70 @@ class TestConfiguracoesPorSessao:
         })
         assert api._compact_size(expanded=False) == (310, 105)
         assert api._compact_size(expanded=True) == (460, 330)
+        assert api._compact_size(variant="both") == (460, 445)
 
     def test_config_compacto_expoe_hud_passivo(self, api):
         cfg = api.get_compact_config()
         assert cfg["size_mode"] == "auto"
-        assert cfg["content"] == "objective"
+        assert cfg["tab"] == "achievements"
+        assert cfg["view"] == "minimal"
         assert cfg["opacity"] == 100
         assert cfg["background_mode"] == "background"
         assert cfg["expanded_width"] == 420
         assert cfg["hotkey"] == "ctrl+alt+g"
+        assert cfg["edit_hotkey"] == "ctrl+alt+e"
+        assert cfg["surfaces"]["summary"] == {
+            "enabled": True, "corner": "top-right",
+        }
+        assert cfg["surfaces"]["details"] == {
+            "enabled": False, "corner": "bottom-right",
+        }
+
+    def test_migra_visual_combinado_para_duas_superficies(self, api):
+        engine.SETTINGS_PATH.write_text(json.dumps({"compact_view": "both"}), encoding="utf-8")
+        settings = engine.load_settings()
+        assert settings["compact_surfaces"]["summary"]["enabled"] is True
+        assert settings["compact_surfaces"]["details"]["enabled"] is True
+
+    def test_salva_huds_e_cantos_independentes(self, api):
+        result = api.set_settings_session("compact", {"compact_surfaces": {
+            "version": 1,
+            "summary": {"enabled": True, "corner": "top-left"},
+            "details": {"enabled": True, "corner": "bottom-right"},
+        }})
+        assert result["ok"] is True
+        assert result["compact_view"] == "both"
+        saved = engine.load_settings()["compact_surfaces"]
+        assert saved["summary"]["corner"] == "top-left"
+        assert saved["details"]["corner"] == "bottom-right"
+
+    def test_geometria_e_independente_por_superficie(self, api):
+        class Tracker:
+            @staticmethod
+            def status():
+                return {"process": "pcsx2-qt.exe", "rect": (100, 50, 1280, 720)}
+
+        api._tracker = Tracker()
+        api.save_overlay_geometry("summary", 1100, 70, 300, 100)
+        api.save_overlay_geometry("details", 940, 450, 440, 300)
+        assert api._stored_compact_geometry("summary")["width"] == 300
+        assert api._stored_compact_geometry("details")["width"] == 440
+        assert api._stored_compact_geometry("summary")["offset_y"] == 20
+        assert api._stored_compact_geometry("details")["offset_y"] == 400
+
+    def test_visual_combinado_e_persistido(self, api):
+        api._compact = True
+        result = api.set_compact_state("both", from_user=True)
+        assert result["ok"] is True
+        assert api._compact_state == "both"
+        assert api.settings["compact_view"] == "both"
+        assert api.get_compact_config()["view"] == "both"
+
+    def test_sessao_compacta_aceita_visual_de_trofeus(self, api):
+        result = api.set_settings_session("compact", {"compact_view": "expanded"})
+        assert result["ok"] is True
+        assert result["compact_view"] == "expanded"
+        assert api._compact_variant == "expanded"
 
     def test_sem_hotkey_nao_deixa_overlay_passa_clique(self, api):
         class Input:
@@ -831,7 +1043,7 @@ class TestConfiguracoesPorSessao:
         api._configure_native_overlay()
         assert api._overlay_native_status == {"passive": True, "click_through": True, "error": ""}
 
-    def test_expandido_libera_botoes_sem_roubar_foco(self, api):
+    def test_expandido_tambem_fica_passa_clique_na_gameplay(self, api):
         class Input:
             @staticmethod
             def status():
@@ -840,8 +1052,8 @@ class TestConfiguracoesPorSessao:
             @staticmethod
             def apply_passive(_hwnd, expected_size=None, opacity=75, click_through=True):
                 assert expected_size == (420, 300)
-                assert click_through is False
-                return {"ok": True, "passive": True, "click_through": False}
+                assert click_through is True
+                return {"ok": True, "passive": True, "click_through": True}
 
         api._window = object()
         api._own_hwnd = 123
@@ -851,7 +1063,33 @@ class TestConfiguracoesPorSessao:
         api._overlay_input = Input()
         api._configure_native_overlay()
         assert api._overlay_native_status["passive"] is True
+        assert api._overlay_native_status["click_through"] is True
+
+    def test_modo_edicao_libera_mouse_temporariamente(self, api):
+        class Input:
+            @staticmethod
+            def status():
+                return {"registered": True, "error": ""}
+
+            @staticmethod
+            def apply_passive(_hwnd, expected_size=None, opacity=75, click_through=True):
+                assert click_through is False
+                return {"ok": True, "passive": True, "click_through": False}
+
+        api._window = object()
+        api._own_hwnd = 123
+        api._compact = True
+        api._compact_edit_mode = True
+        api._compact_expected_size = (320, 110)
+        api._overlay_input = Input()
+        api._configure_native_overlay()
         assert api._overlay_native_status["click_through"] is False
+
+    def test_mostrar_ocultar_cinquenta_vezes_mantem_estado_sincronizado(self, api):
+        for _ in range(50):
+            api._toggle_compact_visibility()
+        assert api._compact is False
+        assert api._compact_state == "hidden"
 
     def test_sair_do_compacto_restabelece_cliques_imediatamente(self, api):
         class Input:
@@ -899,7 +1137,7 @@ class TestCleanWalkthrough:
 
 class TestBootstrapWindow:
     def test_janela_principal_nao_nasce_transparente(self, monkeypatch):
-        captured = {}
+        captured = {"windows": []}
 
         class Hook:
             def __iadd__(self, callback):
@@ -920,7 +1158,7 @@ class TestBootstrapWindow:
                 pass
 
         def create_window(*args, **kwargs):
-            captured["kwargs"] = kwargs
+            captured["windows"].append({"args": args, "kwargs": kwargs})
             return Window()
 
         monkeypatch.setattr(engine.emulator_tracker, "enable_dpi_awareness", lambda: None)
@@ -932,8 +1170,14 @@ class TestBootstrapWindow:
 
         engine.main()
 
-        assert captured["kwargs"].get("transparent", False) is False
-        assert captured["kwargs"]["background_color"] == "#050c18"
+        assert len(captured["windows"]) == 3
+        main, summary, details = captured["windows"]
+        assert main["kwargs"].get("transparent", False) is False
+        assert main["kwargs"]["background_color"] == "#050c18"
+        assert summary["kwargs"]["hidden"] is True
+        assert details["kwargs"]["hidden"] is True
+        assert summary["kwargs"]["frameless"] is True
+        assert details["kwargs"]["frameless"] is True
 
 
 class TestSlugify:

@@ -24,6 +24,25 @@ regras específicas no núcleo. Adicionar jogos, importar fontes e organizar gui
 - Pacotes `.dtguide` portáteis com fonte, revisões, mídia, atribuições e
   progresso opcional.
 
+## Overlay, pontos e Hall da Mastery (v0.9)
+
+- Dois HUDs nativos independentes: **Resumo** e **Conquistas/Guia**. É possível
+  ativar um ou ambos, com posição, canto e geometria próprios por emulador.
+  Ambos passam cliques e ignoram teclado/gamepad durante a gameplay.
+- `Ctrl+Alt+G` mostra ou oculta; `Ctrl+Alt+E` libera edição por 15 segundos para
+  arrastar, redimensionar e trocar a aba do painel de detalhes.
+- Conquistas responsivas: até três obtidas recentemente e o restante das linhas
+  completas preenchido com próximas conquistas.
+- Pontos, TrueRatio, raridade, datas softcore/hardcore e tempo registrado são
+  importados do conjunto canônico da RetroAchievements, sem depender do guia.
+- Celebrações distintas para conclusão Softcore e Mastery, além do Hall da
+  Mastery com filtros, datas, pontos e tempo oficial registrado.
+- Paleta extraída da arte de cada jogo, com ajuste manual, e Google Imagens como
+  busca principal no estilo Playnite. Há fallback identificado por Yandex/Bing,
+  filtro pelo nome completo, SafeSearch, aprovação manual, validação e cache.
+- A antiga separação Walkthrough/Mastery foi reunida em **Conquistas**, com
+  percentual, pontos, alertas softcore, filtros e ordem recomendada no mesmo painel.
+
 ## Stack
 
 - **Python + pywebview** — janela nativa always-on-top com a UI em HTML/CSS/JS.
@@ -235,10 +254,10 @@ mantido — o progresso na tela não "zera" por causa de uma oscilação de rede
 
 ## Configurações
 
-O **⚙** na barra de título abre a tela de Configurações, com quatro seções:
-**Conta** (qual conta da RetroAchievements está conectada), **Inteligência
-artificial** (provedor, chave, modelo e endpoint), **Biblioteca** (importação
-automática) e **Overlay** (comportamento sobre o emulador).
+O **⚙** na barra de título abre a central de Configurações por sessão: conta e
+atualizações, interface e guias, inteligência artificial, fontes de imagem,
+biblioteca, overlay e modo compacto. Cada sessão salva seu próprio rascunho e
+avisa antes de descartar alterações pendentes.
 
 > Antes da v0.3.0 o provedor de IA só era configurável dentro do wizard de
 > "Adicionar Jogo" — que a importação automática fez ninguém abrir. Na prática só

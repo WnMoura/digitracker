@@ -259,6 +259,10 @@ class RAClient:
         DateEarnedHardcore.
         """
         out: dict[int, dict] = {}
+        try:
+            players = max(0, int(progress.get("NumDistinctPlayers") or 0))
+        except (TypeError, ValueError):
+            players = 0
         ach = progress.get("Achievements") or {}
         for raw_id, a in ach.items():
             try:
@@ -269,6 +273,22 @@ class RAClient:
             date_sc = a.get("DateEarned")
             earned_date = date_hc or date_sc
             try:
+                points = max(0, int(a.get("Points") or 0))
+            except (TypeError, ValueError):
+                points = 0
+            try:
+                true_ratio = max(0, int(a.get("TrueRatio") or 0))
+            except (TypeError, ValueError):
+                true_ratio = 0
+            try:
+                awarded = max(0, int(a.get("NumAwarded") or 0))
+            except (TypeError, ValueError):
+                awarded = 0
+            try:
+                awarded_hardcore = max(0, int(a.get("NumAwardedHardcore") or 0))
+            except (TypeError, ValueError):
+                awarded_hardcore = 0
+            try:
                 display_order = int(a.get("DisplayOrder"))
             except (TypeError, ValueError):
                 display_order = 10_000_000   # sem ordem definida -> vai para o fim
@@ -277,11 +297,17 @@ class RAClient:
                 "title": a.get("Title") or "",
                 "desc": a.get("Description") or "",
                 "badge": a.get("BadgeName") or "",
-                "points": a.get("Points") or 0,
+                "points": points,
+                "true_ratio": true_ratio,
+                "num_awarded": awarded,
+                "num_awarded_hardcore": awarded_hardcore,
+                "rarity": round(awarded / players * 100, 2) if players else None,
                 "display_order": display_order,   # ordem canônica/lógica do set no RA
                 "earned": bool(earned_date),
                 "hardcore": bool(date_hc),
                 "date": earned_date or "",
+                "date_softcore": date_sc or "",
+                "date_hardcore": date_hc or "",
             }
         return out
 

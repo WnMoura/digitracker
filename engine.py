@@ -9,6 +9,7 @@ RetroAchievements a cada 30s e mantém o estado de cada jogo em memória.
 from __future__ import annotations
 
 import base64
+import copy
 import ctypes
 import io
 import json
@@ -24,7 +25,7 @@ import zipfile
 from functools import lru_cache
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 # No GNOME/Wayland o backend nativo do GTK não honra bem uma janela sem moldura
 # (o compositor ainda desenha decoração com fechar/maximizar) e o arraste
@@ -48,6 +49,7 @@ import rawg
 import smart_guide
 import steamgriddb
 import updater
+import web_image_search
 from ra_api import RAClient, RAError, RARateLimited, fmt_date
 from version import APP_VERSION
 
@@ -125,10 +127,18 @@ DEFAULT_SETTINGS = {
     "compact_expanded_height": 300,
     "compact_last": 2,      # quantas conquistas OBTIDAS mostrar no compacto
     "compact_next": 0,      # quantas PRÓXIMAS mostrar (0 = cabe o que couber)
-    "compact_content": "objective",  # objective | achievements | guide
+    "compact_tab": "achievements",  # aba escolhida no HUD expandido
+    "compact_view": "minimal",       # minimal | expanded | both
     "compact_corner": "auto",        # auto | top-right | bottom-right | top-left | bottom-left
+    "compact_surfaces": {
+        "version": 1,
+        "summary": {"enabled": True, "corner": "top-right"},
+        "details": {"enabled": False, "corner": "bottom-right"},
+    },
     "compact_background_mode": "background",  # background | cover | title | solid
     "compact_hotkey": "ctrl+alt+g",
+    "compact_edit_hotkey": "ctrl+alt+e",
+    "compact_geometries": {},  # processo -> variante -> tamanho/offset relativo
     "compact_auto_expand": False,
     "compact_auto_collapse_seconds": 0,
 }
@@ -138,9 +148,11 @@ DEFAULT_SETTINGS = {
 COMPACT_MIN = (220, 64)
 COMPACT_MAX = (520, 360)
 COMPACT_MINIMAL_MIN = (260, 90)
-COMPACT_MINIMAL_MAX = (380, 120)
-COMPACT_EXPANDED_MIN = (360, 240)
-COMPACT_EXPANDED_MAX = (520, 360)
+COMPACT_MINIMAL_MAX = (380, 130)
+COMPACT_EXPANDED_MIN = (340, 220)
+COMPACT_EXPANDED_MAX = (560, 480)
+COMPACT_BOTH_MIN = (340, 320)
+COMPACT_BOTH_MAX = (560, 620)
 
 # Quando "ajustar ao emulador" está ligado, o overlay ocupa esta fração da
 # janela do emulador (preso a COMPACT_MIN/MAX) — cresce em jogo grande, encolhe
@@ -203,7 +215,7 @@ def load_secrets() -> dict | None:
 
 def load_settings() -> dict:
     """Preferências do app. Sempre devolve as chaves padrão preenchidas."""
-    settings = dict(DEFAULT_SETTINGS)
+    settings = copy.deepcopy(DEFAULT_SETTINGS)
     settings["dismissed"] = []
     settings["emulators"] = []
     try:
@@ -247,9 +259,12 @@ def load_settings() -> dict:
         size_mode = saved.get("compact_size_mode")
         if size_mode in ("auto", "manual"):
             settings["compact_size_mode"] = size_mode
-        content = saved.get("compact_content")
-        if content in ("objective", "achievements", "guide"):
-            settings["compact_content"] = content
+        tab = saved.get("compact_tab") or saved.get("compact_content")
+        if tab in ("achievements", "guide"):
+            settings["compact_tab"] = tab
+        view = saved.get("compact_view")
+        if view in ("minimal", "expanded", "both"):
+            settings["compact_view"] = view
         corner = saved.get("compact_corner")
         if corner in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
             settings["compact_corner"] = corner
@@ -259,6 +274,44 @@ def load_settings() -> dict:
         hotkey = saved.get("compact_hotkey")
         if isinstance(hotkey, str) and hotkey.strip():
             settings["compact_hotkey"] = hotkey.strip().lower()
+        edit_hotkey = saved.get("compact_edit_hotkey")
+        if isinstance(edit_hotkey, str) and edit_hotkey.strip():
+            settings["compact_edit_hotkey"] = edit_hotkey.strip().lower()
+        geometries = saved.get("compact_geometries")
+        if isinstance(geometries, dict):
+            settings["compact_geometries"] = geometries
+        # v0.9: os dois HUDs passaram a ser janelas independentes. A estrutura
+        # nova é derivada do visual antigo quando ainda não existir, de modo
+        # que uma atualização preserve exatamente o que estava habilitado.
+        surfaces = saved.get("compact_surfaces")
+        if not isinstance(surfaces, dict):
+            surfaces = {
+                "version": 1,
+                "summary": {
+                    "enabled": settings["compact_view"] in ("minimal", "both"),
+                    "corner": (settings["compact_corner"]
+                               if settings["compact_corner"] != "auto" else "top-right"),
+                },
+                "details": {
+                    "enabled": settings["compact_view"] in ("expanded", "both"),
+                    "corner": "bottom-right",
+                },
+            }
+        normalized = {"version": 1}
+        for surface, default_corner in (("summary", "top-right"),
+                                        ("details", "bottom-right")):
+            raw = surfaces.get(surface) if isinstance(surfaces.get(surface), dict) else {}
+            corner = raw.get("corner", default_corner)
+            if corner not in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
+                corner = default_corner
+            normalized[surface] = {
+                "enabled": bool(raw.get("enabled", surface == "summary")),
+                "corner": corner,
+            }
+        # Nunca grave uma configuração impossível de recuperar pela hotkey.
+        if not (normalized["summary"]["enabled"] or normalized["details"]["enabled"]):
+            normalized["summary"]["enabled"] = True
+        settings["compact_surfaces"] = normalized
         settings["compact_auto_expand"] = bool(saved.get("compact_auto_expand", False))
         collapse = saved.get("compact_auto_collapse_seconds")
         if isinstance(collapse, (int, float)) and not isinstance(collapse, bool):
@@ -380,6 +433,12 @@ def annotate_pdf_pages(sections: list, raw: bytes) -> list:
 class Api:
     def __init__(self):
         self._window = None
+        self._overlay_windows: dict[str, object] = {}
+        self._overlay_loaded: set[str] = set()
+        self._overlay_hwnds: dict[str, int] = {}
+        self._overlay_expected_sizes: dict[str, tuple[int, int]] = {}
+        self._overlay_native_by_surface: dict[str, dict] = {}
+        self._active_slug = ""
         self._client: RAClient | None = None
         self.state: dict[str, dict] = {}      # slug -> detalhe computado
         self.pending_import: dict | None = None
@@ -398,7 +457,10 @@ class Api:
         self._overlay_last_check = 0.0
         self.index_building = False
         self._compact = False
-        self._compact_state = "hidden"  # hidden | minimal | expanded
+        self._compact_state = "hidden"  # hidden | minimal | expanded | both
+        self._compact_variant = self.settings.get("compact_view", "minimal")
+        self._compact_edit_mode = False
+        self._compact_edit_timer = None
         self._compact_expected_size: tuple[int, int] | None = None
         self._pre_compact_pos: tuple[int, int] | None = None
         self._pre_compact_size: tuple[int, int] | None = None
@@ -407,6 +469,7 @@ class Api:
         self._overlay_native_status = {"passive": False, "error": ""}
         self._compact_corner_actual = "top-right"
         self._hotkey_value = ""
+        self._edit_hotkey_value = ""
         self._auto_collapse_timer = None
         self._art_status: dict[str, dict] = {}
         self._art_lock = threading.Lock()
@@ -441,6 +504,71 @@ class Api:
             return self._client.get_game_info_and_user_progress(int(game_id))
         raise RAError("RetroAchievements não configurado.")
 
+    @staticmethod
+    def _surfaces_for_variant(variant: str) -> tuple[str, ...]:
+        if variant == "expanded":
+            return ("details",)
+        if variant == "both":
+            return ("summary", "details")
+        return ("summary",)
+
+    def _compact_surfaces_config(self) -> dict:
+        raw = self.settings.get("compact_surfaces") or {}
+        result = {"version": 1}
+        for surface, default_corner in (("summary", "top-right"),
+                                        ("details", "bottom-right")):
+            item = raw.get(surface) if isinstance(raw.get(surface), dict) else {}
+            result[surface] = {
+                "enabled": bool(item.get("enabled", surface == "summary")),
+                "corner": item.get("corner", default_corner),
+            }
+        if not (result["summary"]["enabled"] or result["details"]["enabled"]):
+            result["summary"]["enabled"] = True
+        return result
+
+    def _enabled_compact_surfaces(self) -> tuple[str, ...]:
+        config = self._compact_surfaces_config()
+        return tuple(surface for surface in ("summary", "details")
+                     if config[surface]["enabled"])
+
+    def _legacy_variant_from_surfaces(self) -> str:
+        enabled = set(self._enabled_compact_surfaces())
+        if enabled == {"summary", "details"}:
+            return "both"
+        return "expanded" if enabled == {"details"} else "minimal"
+
+    def set_active_game(self, slug: str) -> dict:
+        slug = str(slug or "").strip()
+        with self._lock:
+            if slug and slug not in self.state:
+                return {"ok": False, "error": "Jogo não encontrado."}
+            self._active_slug = slug
+        self._notify_overlay_surfaces()
+        return {"ok": True, "slug": slug}
+
+    def get_compact_surface_state(self, surface: str) -> dict:
+        surface = str(surface or "").lower()
+        if surface not in ("summary", "details"):
+            return {"ok": False, "error": "Superfície de overlay inválida."}
+        with self._lock:
+            slug = self._active_slug
+            game = self.state.get(slug) if slug else None
+            if game is None and self.state:
+                game = next((item for item in self.state.values()
+                             if not (item.get("mastery") or {}).get("complete")),
+                            next(iter(self.state.values())))
+                slug = game.get("slug", "")
+                self._active_slug = slug
+        config = self.get_compact_config()
+        return {
+            "ok": True,
+            "surface": surface,
+            "visible": bool(self._compact and surface in self._enabled_compact_surfaces()),
+            "editing": bool(self._compact_edit_mode),
+            "game": game,
+            "config": config,
+        }
+
     def get_app_state(self) -> dict:
         ai_provider, ai_label, ai_model = self._ai_summary()
         return {
@@ -467,7 +595,10 @@ class Api:
             "ui_scale": self.settings.get("ui_scale", 100),
             "reduced_motion": bool(self.settings.get("reduced_motion", False)),
             "compact_state": self._compact_state,
-            "compact_content": self.settings.get("compact_content", "objective"),
+            "compact_tab": self.settings.get("compact_tab", "achievements"),
+            "compact_view": self.settings.get("compact_view", "minimal"),
+            "compact_surfaces": self._compact_surfaces_config(),
+            "compact_editing": self._compact_edit_mode,
             "platform_providers": self._platforms.describe(),
             "pdf_ocr_available": pdf_ocr_available(),
         }
@@ -597,8 +728,13 @@ class Api:
                     "art": g.get("art", {}),
                     "art_meta": g.get("art_meta", {}),
                     "accent": g["accent"],
+                    "palette": g.get("palette", {}),
                     "modes": g["modes"],
                     "mastery": g["mastery"],
+                    "score": g.get("score", {}),
+                    "playtime": g.get("playtime"),
+                    "completion": g.get("completion", {}),
+                    "completion_events": g.get("completion_events", {}),
                 }
             )
         summaries.sort(key=lambda s: s["title"].lower())
@@ -610,6 +746,106 @@ class Api:
         self._schedule_art_enrichment(slug)
         with self._lock:
             return self.state.get(slug)
+
+    def get_completion_events(self, slug: str = "", pending_only: bool = True) -> dict:
+        with self._lock:
+            games = ([self.state.get(slug)] if slug else list(self.state.values()))
+            events = []
+            for game in games:
+                if not game:
+                    continue
+                for event in (game.get("completion_events") or {}).get("events", []):
+                    if pending_only and not event.get("pending"):
+                        continue
+                    events.append({**event, "slug": game["slug"], "title": game["title"],
+                                   "platform": game.get("platform", ""),
+                                   "art": game.get("art", {}),
+                                   "palette": game.get("palette", {})})
+        events.sort(key=lambda item: item.get("created_at", 0), reverse=True)
+        return {"ok": True, "events": events}
+
+    def confirm_completion_event(self, slug: str, event_id: str) -> dict:
+        path = GAMES_DIR / f"{slug}.json"
+        game = load_game_file(path)
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        found = False
+        for event in (game.get("completion_events") or {}).get("events", []):
+            if event.get("id") == event_id:
+                event["pending"] = False
+                found = True
+                break
+        if not found:
+            return {"ok": False, "error": "Celebração não encontrada."}
+        path.write_text(json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._lock:
+            detail = self.state.get(slug)
+            if detail:
+                for event in (detail.get("completion_events") or {}).get("events", []):
+                    if event.get("id") == event_id:
+                        event["pending"] = False
+        return {"ok": True}
+
+    def reopen_completion_event(self, slug: str, event_id: str = "") -> dict:
+        with self._lock:
+            game = self.state.get(slug)
+            events = list((game.get("completion_events") or {}).get("events", [])) if game else []
+        if not game:
+            return {"ok": False, "event": {}, "game": {},
+                    "error": "Jogo não encontrado."}
+        event = next((item for item in events if item.get("id") == event_id), None) \
+            if event_id else (events[-1] if events else None)
+        if not event:
+            # Saves muito antigos podem já estar 100% sem possuir o histórico
+            # introduzido na v0.9. O replay é uma visualização: sintetizá-lo
+            # não cria evento pendente nem modifica o arquivo do jogo.
+            completion = game.get("completion") or {}
+            mastery = game.get("mastery") or {}
+            score = game.get("score") or {}
+            kind = "mastery" if completion.get("mastery_complete") else "softcore"
+            complete = (completion.get("mastery_complete") or
+                        completion.get("softcore_complete"))
+            if complete:
+                event = {
+                    "id": "", "kind": kind, "pending": False, "synthetic": True,
+                    "achievements": (completion.get("hardcore") if kind == "mastery"
+                                     else completion.get("earned")) or mastery.get("total", 0),
+                    "points": (score.get("hardcore") if kind == "mastery"
+                               else score.get("earned")) or 0,
+                    "playtime": game.get("playtime"),
+                    "date": (completion.get("mastery_date") if kind == "mastery"
+                             else completion.get("softcore_date")) or "",
+                }
+        return {"ok": bool(event), "event": event or {}, "game": game,
+                "error": "Celebração não encontrada." if not event else ""}
+
+    def get_mastery_hall(self) -> dict:
+        with self._lock:
+            games = list(self.state.values())
+        mastered = [g for g in games if (g.get("completion") or {}).get("mastery_complete")]
+        completed = [g for g in games if (g.get("completion") or {}).get("softcore_complete")
+                     and not (g.get("completion") or {}).get("mastery_complete")]
+        def date_key(game):
+            completion = game.get("completion") or {}
+            return completion.get("mastery_date_raw") or completion.get("softcore_date_raw") or ""
+        mastered.sort(key=date_key, reverse=True)
+        completed.sort(key=date_key, reverse=True)
+        return {"ok": True, "mastery": mastered, "softcore": completed}
+
+    def set_compact_tab(self, slug: str, tab: str) -> dict:
+        tab = str(tab or "").lower()
+        if tab not in ("achievements", "guide"):
+            return {"ok": False, "error": "Aba inválida."}
+        path = GAMES_DIR / f"{slug}.json"
+        game = load_game_file(path)
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        game.setdefault("compact_ui", {})["tab"] = tab
+        path.write_text(json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._lock:
+            if slug in self.state:
+                self.state[slug]["compact_tab"] = tab
+        return {"ok": True, "tab": tab}
 
     def delete_game(self, slug: str) -> dict:
         """Remove o jogo da biblioteca e o marca como dispensado, senão a
@@ -695,8 +931,9 @@ class Api:
             "compact": {"compact_width", "compact_height",
                         "compact_expanded_width", "compact_expanded_height",
                         "compact_last", "compact_next", "compact_size_mode",
-                        "compact_content", "compact_corner", "compact_background_mode",
-                        "compact_hotkey",
+                        "compact_corner", "compact_background_mode", "compact_view",
+                        "compact_surfaces",
+                        "compact_hotkey", "compact_edit_hotkey",
                         "compact_auto_expand", "compact_auto_collapse_seconds"},
         }
         if section not in allowed:
@@ -727,10 +964,6 @@ class Api:
                     if value not in ("auto", "manual"):
                         return {"ok": False, "error": "Modo de tamanho inválido."}
                     self.settings[key] = value
-                elif key == "compact_content":
-                    if value not in ("objective", "achievements", "guide"):
-                        return {"ok": False, "error": "Conteúdo do overlay inválido."}
-                    self.settings[key] = value
                 elif key == "compact_corner":
                     if value not in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
                         return {"ok": False, "error": "Canto do overlay inválido."}
@@ -739,7 +972,43 @@ class Api:
                     if value not in ("background", "cover", "title", "solid"):
                         return {"ok": False, "error": "Fundo do overlay inválido."}
                     self.settings[key] = value
-                elif key == "compact_hotkey":
+                elif key == "compact_view":
+                    if value not in ("minimal", "expanded", "both"):
+                        return {"ok": False, "error": "Visual do overlay inválido."}
+                    self.settings[key] = value
+                    self._compact_variant = value
+                    enabled = set(self._surfaces_for_variant(value))
+                    surfaces = self._compact_surfaces_config()
+                    surfaces["summary"]["enabled"] = "summary" in enabled
+                    surfaces["details"]["enabled"] = "details" in enabled
+                    self.settings["compact_surfaces"] = surfaces
+                    if self._compact:
+                        self._compact_state = value
+                elif key == "compact_surfaces":
+                    if not isinstance(value, dict):
+                        return {"ok": False, "error": "Configuração dos HUDs inválida."}
+                    normalized = {"version": 1}
+                    for surface, default_corner in (("summary", "top-right"),
+                                                    ("details", "bottom-right")):
+                        raw = value.get(surface)
+                        if not isinstance(raw, dict):
+                            return {"ok": False, "error": f"Configuração do HUD {surface} inválida."}
+                        corner = raw.get("corner", default_corner)
+                        if corner not in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
+                            return {"ok": False, "error": "Canto do overlay inválido."}
+                        normalized[surface] = {
+                            "enabled": bool(raw.get("enabled")),
+                            "corner": corner,
+                        }
+                    if not (normalized["summary"]["enabled"] or
+                            normalized["details"]["enabled"]):
+                        return {"ok": False, "error": "Ative pelo menos um HUD."}
+                    self.settings["compact_surfaces"] = normalized
+                    self.settings["compact_view"] = self._legacy_variant_from_surfaces()
+                    self._compact_variant = self.settings["compact_view"]
+                    if self._compact:
+                        self._compact_state = self._compact_variant
+                elif key in ("compact_hotkey", "compact_edit_hotkey"):
                     if not isinstance(value, str) or not value.strip():
                         return {"ok": False, "error": "Hotkey inválida."}
                     try:
@@ -765,7 +1034,7 @@ class Api:
                         "compact_height": COMPACT_MINIMAL_MIN,
                         "compact_expanded_width": COMPACT_EXPANDED_MIN,
                         "compact_expanded_height": COMPACT_EXPANDED_MIN,
-                        "compact_last": (0, 10),
+                        "compact_last": (0, 3),
                         "compact_next": (0, 10),
                     }[key]
                     if key == "compact_width":
@@ -787,12 +1056,12 @@ class Api:
         if section == "experience" and result.get("smart_guide_auto") \
                 and result.get("smart_guide_consent") and self._ai_key():
             self._resume_pending_smart_guides()
-        if section == "compact" and self._compact and self._window:
-            w, h = self._overlay_size_for(self._current_overlay_rect())
-            self._window_op(lambda: self._window.resize(w, h))
+        if section == "compact" and self._compact:
+            self._layout_overlay_surfaces(self._current_overlay_rect(), resize=True)
             self._configure_native_overlay()
+            self._notify_ui_compact(True, self._compact_state)
         if section == "compact":
-            self._start_overlay_hotkey()
+            self._start_overlay_hotkeys()
         return {"ok": True, "section": section, **result}
 
     # --------------------------- busca (wizard p1) -------------------------- #
@@ -1014,7 +1283,7 @@ class Api:
             json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         # já popula o estado com o progresso que acabou de vir (sem nova chamada)
-        self._apply_progress(game, achievements)
+        self._apply_progress(game, achievements, progress)
         return slug, [(slug, a["badge"]) for a in ach_list if a["badge"]]
 
     # --------------------------- importar (wizard) -------------------------- #
@@ -1823,8 +2092,8 @@ class Api:
     # A arte escolhida vira art.cover (retrato: overlay/lateral) e/ou
     # art.background (paisagem: fundo da lista) — separadas da arte da RA e
     # reversíveis. Cada fonte guarda a própria chave em secrets.json.
-    _ROLE_FILE = {"cover": "cover.png", "background": "background.png"}
-    _ROLE_ART = {"cover": "cover", "background": "background"}
+    _ROLE_FILE = {"cover": "cover.png", "background": "background.png", "icon": "icon.png"}
+    _ROLE_ART = {"cover": "cover", "background": "background", "icon": "icon"}
     # Campos de secrets por fonte (todos precisam estar preenchidos p/ "pronta").
     _SOURCE_KEYS = {
         "steamgriddb": ("steamgriddb_api_key",),
@@ -1981,6 +2250,82 @@ class Api:
             return {"ok": False, "error": "Jogo não encontrado."}
         return self._search_source(source, term)
 
+    @staticmethod
+    def _web_art_query(game: dict, query: str = "", role: str = "cover") -> str:
+        base = (query or "").strip() or " ".join(filter(None, (
+            game.get("title", ""), game.get("platform", "")
+        )))
+        suffix = {
+            "cover": "box art cover",
+            "background": "wallpaper 1920x1080",
+            "icon": "icon png",
+            "both": "box art cover",
+        }.get(str(role or "cover").lower(), "box art cover")
+        normalized = re.sub(r"\s+", " ", base).strip()
+        if not normalized:
+            return ""
+        if not normalized.casefold().endswith(suffix.casefold()):
+            normalized = f"{normalized} {suffix}".strip()
+        return normalized[:300]
+
+    def search_web_images(self, slug: str, query: str = "", page: int = 0,
+                          safe: str = "moderate", role: str = "cover",
+                          provider: str = "google") -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado.", "results": []}
+        term = self._web_art_query(game, query, role)
+        try:
+            result = web_image_search.search(term, page, safe, provider=provider)
+            normalized = []
+            for index, item in enumerate(result.get("results") or []):
+                row = dict(item)
+                try:
+                    width, height = int(row.get("width") or 0), int(row.get("height") or 0)
+                except (TypeError, ValueError):
+                    width, height = 0, 0
+                row.update({
+                    "id": f"{result.get('provider', provider)}-{page}-{index}",
+                    "width": width, "height": height,
+                    "orientation": ("portrait" if height > width * 1.08 else
+                                    "landscape" if width > height * 1.08 else "square"),
+                    "source_page": row.get("source") or "",
+                    "host": (urlparse(row.get("source") or row.get("url") or "").hostname or ""),
+                    "provider": row.get("provider") or result.get("provider") or provider,
+                    "query": result.get("query") or term,
+                })
+                normalized.append(row)
+            result["results"] = normalized
+            result["role"] = role
+            return result
+        except web_image_search.WebImageSearchError as exc:
+            return {"ok": False, "error": str(exc), "results": [],
+                    "open_url": web_image_search.public_search_url(term, safe),
+                    "open_google_url": web_image_search.public_search_url(term, safe)}
+
+    def open_web_image_search(self, slug: str, query: str = "",
+                              safe: str = "moderate", role: str = "cover") -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json") or {}
+        term = self._web_art_query(game, query, role)
+        if not term:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        url = web_image_search.public_search_url(term, safe)
+        try:
+            webbrowser.open(url)
+            return {"ok": True, "url": url}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "url": url}
+
+    def open_image_source(self, url: str) -> dict:
+        url = str(url or "").strip()
+        if not url.startswith(("https://", "http://")):
+            return {"ok": False, "error": "Endereço de origem inválido."}
+        try:
+            webbrowser.open(url)
+            return {"ok": True, "url": url}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     def covers_for(self, game_id, source: str = "steamgriddb") -> dict:
         """Imagens de um jogo específico da fonte (ao trocar o jogo casado)."""
         try:
@@ -2093,7 +2438,8 @@ class Api:
         except steamgriddb.SteamGridDBError:
             return []
 
-    def set_game_cover(self, slug: str, url: str, role: str = "cover") -> dict:
+    def set_game_cover(self, slug: str, url: str, role: str = "cover",
+                       metadata: dict | None = None) -> dict:
         """Baixa a imagem escolhida (de qualquer fonte, ou de uma URL colada) e a
         grava no papel pedido — `cover`, `background` ou `both` — sem tocar em
         conquistas/progresso. NÃO exige chave: o asset vem de um CDN público e é
@@ -2112,17 +2458,163 @@ class Api:
         art = dict(game.get("art") or {})
         art_meta = dict(game.get("art_meta") or {})
         stamp = int(time.time())
+        temp = ART_DIR / "_downloads" / f"{slug}-{threading.get_ident()}.png"
+        downloaded = image_fetch.download_image_validated(url, temp)
+        if not downloaded.get("ok"):
+            return {"ok": False, "error": downloaded.get("error") or
+                    "Não consegui validar a imagem."}
+        digest = downloaded["sha256"]
+        cached = ART_DIR / "_cache" / f"{digest}.png"
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        if cached.exists():
+            temp.unlink(missing_ok=True)
+        else:
+            temp.replace(cached)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        provider = str(metadata.get("provider") or "manual").lower()
+        if provider not in ("google", "yandex", "bing", "steamgriddb", "rawg", "igdb", "manual"):
+            provider = "manual"
+        source_page = str(metadata.get("source_page") or metadata.get("source") or "")
+        if source_page and not source_page.startswith(("http://", "https://")):
+            source_page = ""
+        origin = str(metadata.get("origin") or
+                     (urlparse(source_page).hostname if source_page else "") or provider)[:200]
         for r in roles:
-            dest = ART_DIR / slug / self._ROLE_FILE[r]
-            if not image_fetch.download_image(url, dest):
-                return {"ok": False,
-                        "error": "Não consegui baixar a imagem (o servidor recusou ou não é uma imagem)."}
-            art[self._ROLE_ART[r]] = f"/assets/art/{slug}/{self._ROLE_FILE[r]}?v={stamp}"
-            art_meta[r] = {"origin": "manual", "source_url": url,
-                           "manual": True, "updated_at": time.time()}
+            asset_url = f"/assets/art/_cache/{digest}.png?v={stamp}"
+            art[self._ROLE_ART[r]] = asset_url
+            if r == "icon":
+                game.setdefault("icon_original", game.get("icon", ""))
+                game["icon"] = asset_url
+            art_meta[r] = {"origin": origin, "mechanism": provider,
+                           "source_url": url, "source_page": source_page,
+                           "query": str(metadata.get("query") or "")[:300],
+                           "manual": True, "updated_at": time.time(),
+                           "sha256": digest, "width": downloaded.get("width"),
+                           "height": downloaded.get("height"), "mime": downloaded.get("mime")}
         art_meta["auto_status"] = "ready"
         self._persist_art(slug, game, art, art_meta)
+        # A escolha manual de arte também atualiza a identidade visual, exceto
+        # quando o usuário já fixou uma paleta manual para o jogo.
+        if not (game.get("palette") or {}).get("manual"):
+            self.recalculate_game_palette(slug)
         return {"ok": True, "art": art, "art_meta": art_meta}
+
+    def apply_web_art(self, slug: str, candidate: dict, role: str = "cover") -> dict:
+        """Aplica somente o candidato que o usuário aprovou na grade web."""
+        if not isinstance(candidate, dict):
+            return {"ok": False, "error": "Resultado de imagem inválido."}
+        url = str(candidate.get("url") or "").strip()
+        provider = str(candidate.get("provider") or "").lower()
+        if provider not in ("google", "yandex", "bing"):
+            return {"ok": False, "error": "Mecanismo de imagem inválido."}
+        result = self.set_game_cover(slug, url, role, {
+            "provider": provider,
+            "origin": candidate.get("host") or
+                      (urlparse(candidate.get("source_page") or
+                                candidate.get("source") or "").hostname or ""),
+            "source_page": candidate.get("source_page") or candidate.get("source") or "",
+            "query": candidate.get("query") or "",
+        })
+        if result.get("ok"):
+            result["provider"] = provider
+        return result
+
+    @staticmethod
+    def _safe_hex(value: str) -> str | None:
+        value = str(value or "").strip()
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            return value.upper()
+        return None
+
+    @staticmethod
+    def _contrast_text(color: str) -> str:
+        rgb = tuple(int(color[i:i + 2], 16) / 255 for i in (1, 3, 5))
+        linear = [c / 12.92 if c <= .04045 else ((c + .055) / 1.055) ** 2.4
+                  for c in rgb]
+        luminance = .2126 * linear[0] + .7152 * linear[1] + .0722 * linear[2]
+        return "#06101D" if luminance > .46 else "#FFFFFF"
+
+    @classmethod
+    def _palette_from_path(cls, path: Path) -> dict:
+        from PIL import Image
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            image.thumbnail((96, 96))
+            colors = image.quantize(colors=12).convert("RGB").getcolors(96 * 96) or []
+        ranked = []
+        for count, (r, g, b) in colors:
+            high, low = max(r, g, b), min(r, g, b)
+            saturation = high - low
+            brightness = (r + g + b) / 3
+            if brightness < 24 or brightness > 238 or saturation < 18:
+                continue
+            ranked.append((count * (1 + saturation / 255), (r, g, b)))
+        ranked.sort(reverse=True)
+        primary_rgb = ranked[0][1] if ranked else (47, 157, 255)
+        secondary_rgb = next((rgb for _weight, rgb in ranked[1:]
+                              if sum(abs(rgb[i] - primary_rgb[i]) for i in range(3)) > 90),
+                             tuple(min(255, int(c * 1.18 + 18)) for c in primary_rgb))
+        primary = "#%02X%02X%02X" % primary_rgb
+        secondary = "#%02X%02X%02X" % secondary_rgb
+        return {"primary": primary, "secondary": secondary,
+                "text": cls._contrast_text(primary), "manual": False,
+                "updated_at": time.time()}
+
+    def _palette_art_path(self, game: dict) -> Path | None:
+        art = game.get("art") or {}
+        value = art.get("background") or art.get("ingame") or art.get("cover") or art.get("box")
+        if not value or not str(value).startswith("/assets/"):
+            return None
+        relative = str(value).split("?", 1)[0].lstrip("/")
+        if relative.startswith("assets/art/"):
+            path = (ART_DIR / relative.removeprefix("assets/art/")).resolve()
+            base = ART_DIR.resolve()
+        else:
+            path = (DATA_DIR / relative).resolve()
+            base = (DATA_DIR / "assets").resolve()
+        return path if path.exists() and (path == base or base in path.parents) else None
+
+    def recalculate_game_palette(self, slug: str) -> dict:
+        path = GAMES_DIR / f"{slug}.json"
+        game = load_game_file(path)
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        art_path = self._palette_art_path(game)
+        if not art_path:
+            return {"ok": False, "error": "Nenhuma arte local disponível para extrair cores."}
+        try:
+            palette = self._palette_from_path(art_path)
+        except Exception as exc:
+            return {"ok": False, "error": f"Não foi possível analisar a arte: {exc}"}
+        game["palette"] = palette
+        game["accent"] = palette["primary"]
+        path.write_text(json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._lock:
+            if slug in self.state:
+                self.state[slug]["palette"] = palette
+                self.state[slug]["accent"] = palette["primary"]
+        return {"ok": True, "palette": palette}
+
+    def set_game_palette(self, slug: str, primary: str, secondary: str = "") -> dict:
+        primary = self._safe_hex(primary)
+        secondary = self._safe_hex(secondary) or primary
+        if not primary:
+            return {"ok": False, "error": "Cor primária inválida."}
+        path = GAMES_DIR / f"{slug}.json"
+        game = load_game_file(path)
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        palette = {"primary": primary, "secondary": secondary,
+                   "text": self._contrast_text(primary), "manual": True,
+                   "updated_at": time.time()}
+        game["palette"] = palette
+        game["accent"] = primary
+        path.write_text(json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._lock:
+            if slug in self.state:
+                self.state[slug]["palette"] = palette
+                self.state[slug]["accent"] = primary
+        return {"ok": True, "palette": palette}
 
     def clear_game_cover(self, slug: str, role: str = "cover") -> dict:
         """Volta à arte padrão da RA no papel pedido (`cover`, `background` ou
@@ -2138,6 +2630,8 @@ class Api:
                 continue
             art.pop(self._ROLE_ART[r], None)
             art_meta.pop(r, None)
+            if r == "icon":
+                game["icon"] = game.pop("icon_original", game.get("icon", ""))
             try:
                 (ART_DIR / slug / self._ROLE_FILE[r]).unlink(missing_ok=True)
             except OSError:
@@ -2160,6 +2654,7 @@ class Api:
             detail = self.state.get(slug)
             if detail is not None:
                 detail["art"] = art
+                detail["icon"] = game.get("icon", detail.get("icon", ""))
                 if art_meta is not None:
                     detail["art_meta"] = art_meta
 
@@ -2181,6 +2676,11 @@ class Api:
             self._overlay_input.close()
         except Exception:
             pass
+        for win in self._overlay_windows.values():
+            try:
+                self._window_op(win.destroy)
+            except Exception:
+                pass
         if self._window:
             self._window_op(self._window.destroy)
 
@@ -2207,6 +2707,198 @@ class Api:
         self._window_op(lambda: win.move(ix, iy))
         return {"ok": True}
 
+    def attach_overlay_window(self, surface: str, window) -> None:
+        """Registra uma das janelas filhas depois que o WebView terminou de carregar."""
+        if surface not in ("summary", "details"):
+            return
+        self._overlay_windows[surface] = window
+        self._overlay_loaded.add(surface)
+        if self._tracker:
+            try:
+                hwnd = self._tracker.own_window_handle(window, f"DigiTracker {surface}")
+                if hwnd:
+                    self._overlay_hwnds[surface] = hwnd
+            except Exception:
+                pass
+        self._layout_overlay_surfaces(self._current_overlay_rect(), resize=True)
+        self._configure_native_overlay()
+        self._notify_overlay_surfaces()
+
+    @staticmethod
+    def _surface_variant(surface: str) -> str:
+        return "expanded" if surface == "details" else "minimal"
+
+    def move_overlay_surface(self, surface: str, x, y) -> dict:
+        surface = str(surface or "").lower()
+        win = self._overlay_windows.get(surface)
+        if not win or not self._compact or not self._compact_edit_mode:
+            return {"ok": False, "error": "Ative o modo de edição do overlay."}
+        try:
+            ix, iy = int(x), int(y)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Posição inválida."}
+        self._window_op(lambda: win.move(ix, iy))
+        self.touch_overlay_edit_mode()
+        return {"ok": True, "surface": surface, "x": ix, "y": iy}
+
+    def resize_overlay_surface(self, surface: str, width, height) -> dict:
+        surface = str(surface or "").lower()
+        win = self._overlay_windows.get(surface)
+        if not win or not self._compact or not self._compact_edit_mode:
+            return {"ok": False, "error": "Ative o modo de edição do overlay."}
+        variant = self._surface_variant(surface)
+        low, high = self._compact_bounds(variant)
+        try:
+            width = max(low[0], min(high[0], int(width)))
+            height = max(low[1], min(high[1], int(height)))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Dimensões inválidas."}
+        self._overlay_expected_sizes[surface] = (width, height)
+        self._window_op(lambda: win.resize(width, height))
+        self.touch_overlay_edit_mode()
+        return {"ok": True, "surface": surface, "width": width, "height": height}
+
+    @staticmethod
+    def _compact_bounds(variant: str) -> tuple[tuple[int, int], tuple[int, int]]:
+        if variant == "both":
+            return COMPACT_BOTH_MIN, COMPACT_BOTH_MAX
+        if variant == "expanded":
+            return COMPACT_EXPANDED_MIN, COMPACT_EXPANDED_MAX
+        return COMPACT_MINIMAL_MIN, COMPACT_MINIMAL_MAX
+
+    def resize_compact_window(self, width, height) -> dict:
+        if not self._window or not self._compact or not self._compact_edit_mode:
+            return {"ok": False, "error": "Ative o modo de edição do overlay."}
+        low, high = self._compact_bounds(self._compact_variant)
+        try:
+            width = max(low[0], min(high[0], int(width)))
+            height = max(low[1], min(high[1], int(height)))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Dimensões inválidas."}
+        self._compact_expected_size = (width, height)
+        self._overlay_size = (width, height)
+        self._window_op(lambda: self._window.resize(width, height))
+        self.touch_overlay_edit_mode()
+        return {"ok": True, "width": width, "height": height}
+
+    def _compact_emulator_key(self) -> str:
+        try:
+            process = (self._tracker.status().get("process") or "").strip().lower()
+        except Exception:
+            process = ""
+        return process or "default"
+
+    def save_overlay_geometry(self, variant, x, y, width, height) -> dict:
+        """Salva tamanho e posição relativos à área cliente por emulador/HUD."""
+        variant = str(variant or self._compact_variant).lower()
+        if variant not in ("minimal", "expanded", "both", "summary", "details"):
+            return {"ok": False, "error": "Variante inválida."}
+        surface = variant if variant in ("summary", "details") else None
+        bounds_variant = self._surface_variant(surface) if surface else variant
+        low, high = self._compact_bounds(bounds_variant)
+        try:
+            x, y = int(x), int(y)
+            width = max(low[0], min(high[0], int(width)))
+            height = max(low[1], min(high[1], int(height)))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Geometria inválida."}
+        rect = self._current_overlay_rect()
+        offset_x = x - int(rect[0]) if rect else x
+        offset_y = y - int(rect[1]) if rect else y
+        key = self._compact_emulator_key()
+        with self._lock:
+            geometries = self.settings.setdefault("compact_geometries", {})
+            per_emulator = geometries.setdefault(key, {})
+            per_emulator[variant] = {
+                "width": width, "height": height,
+                "offset_x": offset_x, "offset_y": offset_y,
+            }
+            save_settings(self.settings)
+        self.touch_overlay_edit_mode()
+        return {"ok": True, "emulator": key, "variant": variant,
+                **per_emulator[variant]}
+
+    def _stored_compact_geometry(self, variant=None) -> dict:
+        variant = variant or self._compact_variant
+        with self._lock:
+            geometries = self.settings.get("compact_geometries") or {}
+            per_emulator = geometries.get(self._compact_emulator_key()) or {}
+            stored = per_emulator.get(variant)
+            # Primeira abertura após atualizar: reaproveita a geometria antiga
+            # correspondente e passa a salvar pelo nome da superfície.
+            if not stored and variant in ("summary", "details"):
+                legacy = "minimal" if variant == "summary" else "expanded"
+                stored = per_emulator.get(legacy)
+            return dict(stored or {})
+
+    def _surface_size(self, surface: str, rect=None) -> tuple[int, int]:
+        variant = self._surface_variant(surface)
+        stored = self._stored_compact_geometry(surface)
+        if stored.get("width") and stored.get("height"):
+            low, high = self._compact_bounds(variant)
+            return (max(low[0], min(high[0], int(stored["width"]))),
+                    max(low[1], min(high[1], int(stored["height"]))))
+        return self._compact_size(rect, variant=variant)
+
+    def _surface_dock(self, surface: str, rect, size: tuple[int, int]) -> tuple[int, int]:
+        stored = self._stored_compact_geometry(surface)
+        if stored and "offset_x" in stored and "offset_y" in stored:
+            x = int(rect[0]) + int(stored["offset_x"])
+            y = int(rect[1]) + int(stored["offset_y"])
+            x = max(int(rect[0]), min(x, int(rect[0] + rect[2] - size[0])))
+            y = max(int(rect[1]), min(y, int(rect[1] + rect[3] - size[1])))
+            return x, y
+        config = self._compact_surfaces_config()[surface]
+        corner = config.get("corner") or ("top-right" if surface == "summary" else "bottom-right")
+        if corner == "auto":
+            corner = "top-right" if surface == "summary" else "bottom-right"
+        return emulator_tracker.dock_position(rect, size, COMPACT_MARGIN, corner)
+
+    def _fallback_overlay_rect(self):
+        try:
+            screen = webview.screens()[0]
+            return screen.x, screen.y, screen.width, screen.height
+        except Exception:
+            return 0, 0, self._normal_size[0], self._normal_size[1]
+
+    def _set_surface_visible(self, surface: str, visible: bool) -> None:
+        # Os objetos Window existem antes do evento `loaded`, mas WinForms e
+        # WebView2 ainda nao. Ignorar a superficie nesse curto intervalo evita
+        # bloquear a thread de UI durante o bootstrap da build onefile.
+        if surface not in self._overlay_loaded:
+            return
+        win = self._overlay_windows.get(surface)
+        if not win:
+            return
+        hwnd = self._overlay_hwnds.get(surface)
+        native = (self._overlay_input.show_no_activate(hwnd) if visible and hwnd else
+                  self._overlay_input.hide_window(hwnd) if not visible and hwnd else False)
+        if not native:
+            self._window_op(win.show if visible else win.hide)
+
+    def _layout_overlay_surfaces(self, rect=None, resize: bool = True) -> None:
+        if not self._overlay_windows:
+            return
+        rect = rect or self._fallback_overlay_rect()
+        enabled = set(self._enabled_compact_surfaces()) if self._compact else set()
+        for surface, win in self._overlay_windows.items():
+            if surface not in self._overlay_loaded:
+                continue
+            if surface not in enabled:
+                self._set_surface_visible(surface, False)
+                continue
+            size = self._surface_size(surface, rect)
+            pos = self._surface_dock(surface, rect, size)
+            self._overlay_expected_sizes[surface] = size
+
+            def apply_layout(target=win, target_size=size, target_pos=pos):
+                if resize:
+                    target.resize(*target_size)
+                _move_after_resize(target, target_pos)
+
+            self._window_op(apply_layout)
+            self._set_surface_visible(surface, True)
+
     def set_compact(self, value: bool, dock=None, from_user: bool = True, size=None) -> dict:
         """Alterna entre o dashboard completo e um mini-overlay (quadradinho)
         com o progresso do jogo ativo — pensado para ficar por cima do
@@ -2221,6 +2913,35 @@ class Api:
         if from_user and self._auto_collapse_timer:
             self._auto_collapse_timer.cancel()
             self._auto_collapse_timer = None
+        # A versão nova não transforma mais a janela principal em um retângulo
+        # combinado. Ela alterna duas janelas filhas do tamanho exato de cada
+        # HUD; o caminho antigo permanece abaixo para testes e plataformas que
+        # não tenham criado as superfícies dedicadas.
+        if self._overlay_windows:
+            if not value:
+                self._overlay_input.restore()
+                self._overlay_native_status = {"passive": False, "error": ""}
+                self._overlay_native_by_surface = {}
+                self._compact_edit_mode = False
+                if self._compact_edit_timer:
+                    self._compact_edit_timer.cancel()
+                    self._compact_edit_timer = None
+            self._compact = value
+            self._compact_variant = self._legacy_variant_from_surfaces()
+            self._compact_state = self._compact_variant if value else "hidden"
+            self._layout_overlay_surfaces(self._current_overlay_rect(), resize=True)
+            if value:
+                self._configure_native_overlay()
+                if self._window:
+                    self._window_op(self._window.hide)
+            elif self._window:
+                self._window_op(self._window.show)
+            self._notify_ui_compact(value, self._compact_state)
+            if was_auto and self._overlay:
+                self._overlay.notify_manual_exit()
+            return {"ok": True, "compact": value, "state": self._compact_state,
+                    "editing": self._compact_edit_mode,
+                    "surfaces": list(self._enabled_compact_surfaces())}
         # Ao voltar para o aplicativo completo, recupere os cliques antes de
         # enfileirar resize/movimentação. Assim a janela nunca fica grande e
         # ainda marcada como passa-clique caso a operação visual demore.
@@ -2228,8 +2949,12 @@ class Api:
             self._overlay_input.restore()
             self._overlay_native_status = {"passive": False, "error": ""}
             self._compact_expected_size = None
+            self._compact_edit_mode = False
+            if self._compact_edit_timer:
+                self._compact_edit_timer.cancel()
+                self._compact_edit_timer = None
         self._compact = value
-        self._compact_state = "minimal" if value else "hidden"
+        self._compact_state = self._compact_variant if value else "hidden"
         win = self._window
 
         def op():
@@ -2240,7 +2965,9 @@ class Api:
                         int(getattr(win, "width", None) or self._normal_size[0]),
                         int(getattr(win, "height", None) or self._normal_size[1]),
                     )
-                w, h = size or self._compact_size(self._current_overlay_rect())
+                w, h = size or self._compact_size(
+                    self._current_overlay_rect(), variant=self._compact_variant
+                )
                 self._compact_expected_size = (int(w), int(h))
                 win.resize(w, h)
                 pos = dock
@@ -2263,9 +2990,11 @@ class Api:
         if win:
             self._window_op(op)
         self._configure_native_overlay()
+        self._notify_ui_compact(value, self._compact_state)
         if was_auto and self._overlay:
             self._overlay.notify_manual_exit()
-        return {"ok": True, "compact": value}
+        return {"ok": True, "compact": value, "state": self._compact_state,
+                "editing": self._compact_edit_mode}
 
     # ------------- overlay automático: grudar na janela do emulador --------- #
     def set_auto_overlay(self, value: bool) -> dict:
@@ -2292,14 +3021,30 @@ class Api:
         canto de dentro do emulador; o JS é avisado para trocar a tela."""
 
         def enter(rect):
+            if self._overlay_windows:
+                self.set_compact(True, from_user=False)
+                self._layout_overlay_surfaces(rect, resize=True)
+                self._notify_ui_compact(True)
+                return
             size = self._overlay_size_for(rect)
             self._overlay_size = size
             self.set_compact(True, dock=self._dock_for(rect, size), from_user=False, size=size)
             self._notify_ui_compact(True)
 
         def follow(rect):
+            if self._overlay_windows:
+                if self._compact_edit_mode:
+                    return
+                self._layout_overlay_surfaces(rect, resize=True)
+                self._configure_native_overlay()
+                return
             win = self._window
             if not win:
+                return
+            if self._compact_edit_mode:
+                # Não disputar a posição com o arraste/redimensionamento do
+                # usuário. Ao encerrar a edição, o watcher usa a geometria
+                # relativa recém-salva e volta a acompanhar o emulador.
                 return
             size = self._overlay_size_for(rect)
             # O emulador foi redimensionado? Reajusta o overlay antes de reposicionar.
@@ -2323,7 +3068,10 @@ class Api:
 
         def assert_top():
             tracker = self._tracker
-            if tracker and self._own_hwnd:
+            if tracker and self._overlay_windows:
+                for hwnd in self._overlay_hwnds.values():
+                    tracker.make_topmost(hwnd)
+            elif tracker and self._own_hwnd:
                 tracker.make_topmost(self._own_hwnd)
 
         def on_exclusive(rect, win):
@@ -2337,6 +3085,12 @@ class Api:
             if usar_2a_tela:
                 livre = emulator_tracker.pick_free_screen(rect, self._tracker.screens())
                 if livre:
+                    if self._overlay_windows:
+                        self.set_compact(True, from_user=False)
+                        self._layout_overlay_surfaces(livre, resize=True)
+                        self._warn_ui("O jogo está em tela cheia exclusiva; movi os HUDs "
+                                      "para o outro monitor.")
+                        return
                     size = self._overlay_size_for(livre)
                     self._overlay_size = size
                     self.set_compact(True, dock=self._dock_for(livre, size),
@@ -2371,8 +3125,8 @@ class Api:
             return tracker.status().get("rect")
         return None
 
-    def _compact_size(self, rect=None, expanded=None) -> tuple[int, int]:
-        """Calcula o tamanho mínimo/expandido ou manual do overlay."""
+    def _compact_size(self, rect=None, expanded=None, variant=None) -> tuple[int, int]:
+        """Calcula o tamanho do resumo, painel expandido ou visual combinado."""
         with self._lock:
             mode = self.settings.get("compact_size_mode", "auto")
             fit = self.settings.get("overlay_fit_emulator", True)
@@ -2380,28 +3134,55 @@ class Api:
             manual_h = int(self.settings.get("compact_height") or COMPACT_SIZE[1])
             expanded_w = int(self.settings.get("compact_expanded_width") or COMPACT_EXPANDED_SIZE[0])
             expanded_h = int(self.settings.get("compact_expanded_height") or COMPACT_EXPANDED_SIZE[1])
-        expanded = self._compact_state == "expanded" if expanded is None else bool(expanded)
+        if variant not in ("minimal", "expanded", "both"):
+            if expanded is None:
+                variant = self._compact_variant
+            else:
+                variant = "expanded" if bool(expanded) else "minimal"
+        expanded = variant in ("expanded", "both")
+        combined = variant == "both"
+        stored = self._stored_compact_geometry(variant)
+        if stored.get("width") and stored.get("height"):
+            w, h = int(stored["width"]), int(stored["height"])
+            low, high = self._compact_bounds(variant)
+            return max(low[0], min(high[0], w)), max(low[1], min(high[1], h))
         if mode == "manual" or not fit:
-            w, h = (expanded_w, expanded_h) if expanded else (manual_w, manual_h)
+            if combined:
+                w, h = expanded_w, manual_h + expanded_h + 10
+            else:
+                w, h = (expanded_w, expanded_h) if expanded else (manual_w, manual_h)
         elif not rect:
-            w, h = (COMPACT_EXPANDED_SIZE if expanded else COMPACT_SIZE)
+            if combined:
+                w, h = COMPACT_EXPANDED_SIZE[0], COMPACT_SIZE[1] + COMPACT_EXPANDED_SIZE[1] + 10
+            else:
+                w, h = (COMPACT_EXPANDED_SIZE if expanded else COMPACT_SIZE)
         else:
             _ex, _ey, ew, eh = rect
-            ratio_w = OVERLAY_EXPANDED_W if expanded else OVERLAY_FIT_W
-            ratio_h = OVERLAY_EXPANDED_H if expanded else OVERLAY_FIT_H
-            w, h = round(ew * ratio_w), round(eh * ratio_h)
-        low = COMPACT_EXPANDED_MIN if expanded else COMPACT_MINIMAL_MIN
-        high = COMPACT_EXPANDED_MAX if expanded else COMPACT_MINIMAL_MAX
+            if combined:
+                w = round(ew * OVERLAY_EXPANDED_W)
+                h = round(eh * OVERLAY_FIT_H) + round(eh * OVERLAY_EXPANDED_H) + 10
+            else:
+                ratio_w = OVERLAY_EXPANDED_W if expanded else OVERLAY_FIT_W
+                ratio_h = OVERLAY_EXPANDED_H if expanded else OVERLAY_FIT_H
+                w, h = round(ew * ratio_w), round(eh * ratio_h)
+        low, high = self._compact_bounds(variant)
         return max(low[0], min(high[0], w)), max(low[1], min(high[1], h))
 
     def _overlay_size_for(self, rect=None) -> tuple[int, int]:
         """Tamanho do overlay ao grudar: proporcional à janela do emulador quando
         'ajustar ao emulador' está ligado (preso a COMPACT_MIN/MAX); senão, o
         tamanho manual das Configurações."""
-        return self._compact_size(rect)
+        return self._compact_size(rect, variant=self._compact_variant)
 
     def _dock_for(self, rect, size=None):
         size = size or self._compact_size(rect)
+        stored = self._stored_compact_geometry(self._compact_variant)
+        if stored and "offset_x" in stored and "offset_y" in stored:
+            x = int(rect[0]) + int(stored["offset_x"])
+            y = int(rect[1]) + int(stored["offset_y"])
+            x = max(int(rect[0]), min(x, int(rect[0] + rect[2] - size[0])))
+            y = max(int(rect[1]), min(y, int(rect[1] + rect[3] - size[1])))
+            return x, y
         with self._lock:
             corner = self.settings.get("compact_corner", "auto")
         if corner == "auto":
@@ -2412,6 +3193,58 @@ class Api:
         return emulator_tracker.dock_position(rect, size, COMPACT_MARGIN, corner)
 
     def _configure_native_overlay(self):
+        if self._overlay_windows:
+            if self._tracker:
+                for surface, win in self._overlay_windows.items():
+                    if surface not in self._overlay_loaded:
+                        continue
+                    try:
+                        hwnd = self._tracker.own_window_handle(
+                            win, f"DigiTracker {surface}"
+                        )
+                        if hwnd:
+                            self._overlay_hwnds[surface] = hwnd
+                    except Exception:
+                        pass
+            if not self._compact:
+                self._overlay_input.restore()
+                self._overlay_native_by_surface = {}
+                self._overlay_native_status = {"passive": False, "error": ""}
+                return
+            hotkey = self._overlay_input.status()
+            if not hotkey.get("registered"):
+                self._overlay_input.restore()
+                error = str(hotkey.get("error") or
+                            "Hotkey global indisponível; modo de recuperação ativo.")
+                self._overlay_native_status = {"passive": False, "error": error}
+                return
+            enabled = set(self._enabled_compact_surfaces())
+            statuses = {}
+            for surface, hwnd in list(self._overlay_hwnds.items()):
+                if surface not in self._overlay_loaded:
+                    continue
+                if surface not in enabled:
+                    self._overlay_input.restore(hwnd)
+                    continue
+                expected = self._overlay_expected_sizes.get(surface) or self._surface_size(
+                    surface, self._current_overlay_rect()
+                )
+                result = self._overlay_input.apply_passive(
+                    hwnd, expected_size=expected, opacity=100,
+                    click_through=not self._compact_edit_mode,
+                )
+                statuses[surface] = result
+            self._overlay_native_by_surface = statuses
+            errors = [str(value.get("error")) for value in statuses.values()
+                      if value.get("error")]
+            self._overlay_native_status = {
+                "passive": bool(statuses) and all(value.get("passive") for value in statuses.values()),
+                "click_through": bool(statuses) and all(
+                    value.get("click_through", True) for value in statuses.values()
+                ),
+                "error": " · ".join(errors),
+            }
+            return
         if not self._window or not self._own_hwnd:
             return
         # O backend WinForms pode trocar o controle nativo após o WebView2
@@ -2436,13 +3269,15 @@ class Api:
                 }
                 return
             expected = self._compact_expected_size or self._compact_size(
-                self._current_overlay_rect(), expanded=self._compact_state == "expanded"
+                self._current_overlay_rect(), variant=self._compact_variant
             )
             result = self._overlay_input.apply_passive(
                 self._own_hwnd,
                 expected_size=expected,
                 opacity=100,
-                click_through=self._compact_state != "expanded",
+                # Os dois HUDs permanecem passivos durante a gameplay. Mouse
+                # só entra no modo de edição temporário (Ctrl+Alt+E).
+                click_through=not self._compact_edit_mode,
             )
             self._overlay_native_status = {
                 "passive": bool(result.get("passive")),
@@ -2453,26 +3288,76 @@ class Api:
             self._overlay_input.restore()
             self._overlay_native_status = {"passive": False, "error": ""}
 
+    def _toggle_compact_visibility(self):
+        """Ctrl+Alt+G apenas mostra/oculta, sem misturar variante e visibilidade."""
+        self.set_compact(not self._compact, from_user=True)
+
     def _cycle_compact_state(self):
-        if not self._compact:
-            self.set_compact_state("minimal", from_user=True)
-        elif self._compact_state == "minimal":
-            self.set_compact_state("expanded", from_user=True)
-        else:
-            self.set_compact(False, from_user=True)
+        """Alias legado: versões antigas chamavam um ciclo de três estados."""
+        self._toggle_compact_visibility()
+
+    def _schedule_edit_timeout(self):
+        if self._compact_edit_timer:
+            self._compact_edit_timer.cancel()
+        self._compact_edit_timer = threading.Timer(
+            15.0, lambda: self.set_overlay_edit_mode(False, from_hotkey=False)
+        )
+        self._compact_edit_timer.daemon = True
+        self._compact_edit_timer.start()
+
+    def set_overlay_edit_mode(self, value=None, from_hotkey: bool = False) -> dict:
+        """Libera mouse por 15 segundos, sem reativar teclado ou gamepad."""
+        if value is None:
+            value = not self._compact_edit_mode
+        value = bool(value) and self._compact
+        self._compact_edit_mode = value
+        if value:
+            self._schedule_edit_timeout()
+        elif self._compact_edit_timer:
+            self._compact_edit_timer.cancel()
+            self._compact_edit_timer = None
+        self._configure_native_overlay()
+        self._notify_ui_compact(self._compact, self._compact_state)
+        return {"ok": True, "editing": value, "state": self._compact_state,
+                "from_hotkey": bool(from_hotkey)}
+
+    def touch_overlay_edit_mode(self) -> dict:
+        if self._compact_edit_mode:
+            self._schedule_edit_timeout()
+        return {"ok": True, "editing": self._compact_edit_mode}
 
     def set_compact_state(self, state: str, from_user: bool = True) -> dict:
         state = str(state or "").lower()
-        if state not in ("minimal", "expanded"):
+        if state not in ("minimal", "expanded", "both"):
             return {"ok": False, "error": "Estado compacto inválido."}
         if from_user and self._auto_collapse_timer:
             self._auto_collapse_timer.cancel()
             self._auto_collapse_timer = None
+        self._compact_variant = state
         self._compact_state = state
+        enabled = set(self._surfaces_for_variant(state))
+        surfaces = self._compact_surfaces_config()
+        surfaces["summary"]["enabled"] = "summary" in enabled
+        surfaces["details"]["enabled"] = "details" in enabled
+        self.settings["compact_surfaces"] = surfaces
+        if from_user:
+            with self._lock:
+                self.settings["compact_view"] = state
+                save_settings(self.settings)
+        if self._overlay_windows:
+            if not self._compact:
+                self.set_compact(True, from_user=from_user)
+            else:
+                self._layout_overlay_surfaces(self._current_overlay_rect(), resize=True)
+                self._configure_native_overlay()
+                self._notify_ui_compact(True, state)
+            return {"ok": True, "compact": True, "state": state,
+                    "editing": self._compact_edit_mode,
+                    "surfaces": list(self._enabled_compact_surfaces())}
         if not self._compact:
             self.set_compact(True, from_user=from_user)
         rect = self._current_overlay_rect()
-        size = self._compact_size(rect, expanded=state == "expanded")
+        size = self._compact_size(rect, variant=state)
         self._compact_expected_size = size
         self._overlay_size = size
         dock = self._dock_for(rect, size) if rect else None
@@ -2484,7 +3369,8 @@ class Api:
             self._window_op(resize_and_dock)
         self._configure_native_overlay()
         self._notify_ui_compact(True, state)
-        return {"ok": True, "compact": True, "state": state}
+        return {"ok": True, "compact": True, "state": state,
+                "editing": self._compact_edit_mode}
 
     def get_compact_config(self) -> dict:
         """Tamanho e contagens do overlay compacto para a UI."""
@@ -2497,11 +3383,16 @@ class Api:
                 "expanded_width": int(self.settings.get("compact_expanded_width", COMPACT_EXPANDED_SIZE[0])),
                 "expanded_height": int(self.settings.get("compact_expanded_height", COMPACT_EXPANDED_SIZE[1])),
                 "size_mode": self.settings.get("compact_size_mode", "auto"),
-                "content": self.settings.get("compact_content", "objective"),
+                "tab": self.settings.get("compact_tab", "achievements"),
+                "view": self.settings.get("compact_view", "minimal"),
                 "corner": self.settings.get("compact_corner", "auto"),
                 "background_mode": self.settings.get("compact_background_mode", "background"),
                 "opacity": 100,
                 "hotkey": self.settings.get("compact_hotkey", "ctrl+alt+g"),
+                "edit_hotkey": self.settings.get("compact_edit_hotkey", "ctrl+alt+e"),
+                "editing": self._compact_edit_mode,
+                "variant": self._compact_variant,
+                "surfaces": self._compact_surfaces_config(),
                 "auto_expand": bool(self.settings.get("compact_auto_expand", False)),
                 "auto_collapse_seconds": int(self.settings.get("compact_auto_collapse_seconds", 0)),
             }
@@ -2509,10 +3400,10 @@ class Api:
                 "last": max(0, last), "next": max(0, nxt), **values}
 
     def set_compact_config(self, width=None, height=None, last=None, next=None,
-                           size_mode=None, content=None, corner=None, opacity=None,
-                           hotkey=None, auto_expand=None, auto_collapse_seconds=None,
+                           size_mode=None, content=None, tab=None, corner=None, opacity=None,
+                           hotkey=None, edit_hotkey=None, auto_expand=None, auto_collapse_seconds=None,
                            expanded_width=None, expanded_height=None,
-                           background_mode=None) -> dict:
+                           background_mode=None, view=None) -> dict:
         """Salva o tamanho/contagens do compacto. Se já estiver em modo compacto,
         redimensiona a janela na hora."""
         with self._lock:
@@ -2530,8 +3421,20 @@ class Api:
                 self.settings["compact_next"] = max(0, int(next))
             if size_mode in ("auto", "manual"):
                 self.settings["compact_size_mode"] = size_mode
-            if content in ("objective", "achievements", "guide"):
-                self.settings["compact_content"] = content
+            # `content` e aceito apenas como migracao das UIs 0.8.6.
+            selected_tab = tab or content
+            if selected_tab in ("achievements", "guide"):
+                self.settings["compact_tab"] = selected_tab
+            if view in ("minimal", "expanded", "both"):
+                self.settings["compact_view"] = view
+                self._compact_variant = view
+                enabled = set(self._surfaces_for_variant(view))
+                surfaces = self._compact_surfaces_config()
+                surfaces["summary"]["enabled"] = "summary" in enabled
+                surfaces["details"]["enabled"] = "details" in enabled
+                self.settings["compact_surfaces"] = surfaces
+                if self._compact:
+                    self._compact_state = view
             if corner in ("auto", "top-right", "bottom-right", "top-left", "bottom-left"):
                 self.settings["compact_corner"] = corner
             # Mantido na assinatura para compatibilidade com versões antigas da UI.
@@ -2542,6 +3445,12 @@ class Api:
                 except ValueError as exc:
                     return {"ok": False, "error": str(exc)}
                 self.settings["compact_hotkey"] = str(hotkey).strip().lower()
+            if edit_hotkey is not None:
+                try:
+                    emulator_tracker.parse_hotkey(edit_hotkey)
+                except ValueError as exc:
+                    return {"ok": False, "error": str(exc)}
+                self.settings["compact_edit_hotkey"] = str(edit_hotkey).strip().lower()
             if auto_expand is not None:
                 self.settings["compact_auto_expand"] = bool(auto_expand)
             if auto_collapse_seconds is not None:
@@ -2550,24 +3459,41 @@ class Api:
                 self.settings["compact_background_mode"] = background_mode
             save_settings(self.settings)
         win = self._window
-        if win and self._compact and any(value is not None for value in (
-                width, height, expanded_width, expanded_height, size_mode)):
+        if self._overlay_windows and self._compact and any(value is not None for value in (
+                width, height, expanded_width, expanded_height, size_mode, view)):
+            self._layout_overlay_surfaces(self._current_overlay_rect(), resize=True)
+        elif win and self._compact and any(value is not None for value in (
+                width, height, expanded_width, expanded_height, size_mode, view)):
             w, h = self._compact_size(self._current_overlay_rect())
             self._compact_expected_size = (w, h)
             self._window_op(lambda: win.resize(w, h))
-        if hotkey is not None:
-            self._start_overlay_hotkey()
+        if hotkey is not None or edit_hotkey is not None:
+            self._start_overlay_hotkeys()
         self._configure_native_overlay()
         return self.get_compact_config()
 
-    def _start_overlay_hotkey(self):
+    def _start_overlay_hotkeys(self):
         value = str(self.settings.get("compact_hotkey", "ctrl+alt+g"))
-        if value == self._hotkey_value and self._overlay_input.status().get("registered"):
+        edit_value = str(self.settings.get("compact_edit_hotkey", "ctrl+alt+e"))
+        if (value == self._hotkey_value and edit_value == self._edit_hotkey_value
+                and self._overlay_input.status().get("registered")):
             return
-        result = self._overlay_input.start_hotkey(value, self._cycle_compact_state)
+        starter = getattr(self._overlay_input, "start_hotkeys", None)
+        if starter:
+            result = starter({
+                "visibility": (value, self._toggle_compact_visibility),
+                "edit": (edit_value, lambda: self.set_overlay_edit_mode(None, from_hotkey=True)),
+            })
+        else:  # doubles antigos e plataformas sem suporte
+            result = self._overlay_input.start_hotkey(value, self._toggle_compact_visibility)
         self._hotkey_value = value if result.get("ok") else ""
+        self._edit_hotkey_value = edit_value if result.get("ok") else ""
         if not result.get("ok"):
             self._overlay_native_status["error"] = str(result.get("error") or "")
+
+    def _start_overlay_hotkey(self):
+        """Compatibilidade com extensoes/testes da versao anterior."""
+        return self._start_overlay_hotkeys()
 
     def _notify_ui_compact(self, compact: bool, state: str | None = None):
         """O backend mudou o modo sozinho — o JS precisa saber para re-renderizar
@@ -2576,11 +3502,27 @@ class Api:
         if not win:
             return
         state = state or (self._compact_state if compact else "hidden")
-        js = f"window.onOverlayChanged && window.onOverlayChanged({str(bool(compact)).lower()}, {json.dumps(state)})"
+        js = ("window.onOverlayChanged && window.onOverlayChanged("
+              f"{str(bool(compact)).lower()}, {json.dumps(state)}, "
+              f"{str(bool(self._compact_edit_mode)).lower()})")
         try:
             win.evaluate_js(js)
         except Exception:
             pass
+        self._notify_overlay_surfaces()
+
+    def _notify_overlay_surfaces(self):
+        """Atualiza os dois documentos compactos sem reinicializar o dashboard."""
+        for surface, win in list(self._overlay_windows.items()):
+            if surface not in self._overlay_loaded:
+                continue
+            try:
+                win.evaluate_js(
+                    "window.onCompactSurfaceChanged && "
+                    f"window.onCompactSurfaceChanged({json.dumps(surface)})"
+                )
+            except Exception:
+                pass
 
     def get_overlay_status(self) -> dict:
         tracker = self._tracker
@@ -2603,10 +3545,38 @@ class Api:
                                   else "interactive") if self._overlay_native_status.get("passive") else "fallback",
             "hotkey_registered": bool(self._overlay_input.status().get("registered")),
             "hotkey": self._overlay_input.status().get("hotkey", ""),
+            "hotkeys": self._overlay_input.status().get("bindings", {}),
             "hotkey_error": self._overlay_input.status().get("error", "") or self._overlay_native_status.get("error", ""),
             "compact_state": self._compact_state,
+            "compact_variant": self._compact_variant,
+            "compact_view": self.settings.get("compact_view", "minimal"),
+            "editing": self._compact_edit_mode,
+            "edit_hotkey": self.settings.get("compact_edit_hotkey", "ctrl+alt+e"),
+            "actual_size": list(self._compact_expected_size or []),
             "corner": self._compact_corner_actual,
         }
+        surface_config = self._compact_surfaces_config()
+        surface_status = {}
+        surface_rect = rect or self._fallback_overlay_rect()
+        for surface in ("summary", "details"):
+            expected = self._overlay_expected_sizes.get(surface) or self._surface_size(
+                surface, surface_rect
+            )
+            dock = self._surface_dock(surface, surface_rect, expected)
+            native = self._overlay_native_by_surface.get(surface) or {}
+            surface_status[surface] = {
+                "enabled": bool(surface_config[surface].get("enabled")),
+                "loaded": surface in self._overlay_loaded,
+                "visible": bool(self._compact and surface_config[surface].get("enabled")),
+                "native_handle": bool(self._overlay_hwnds.get(surface)),
+                "passive": bool(native.get("passive")),
+                "click_through": bool(native.get("click_through", True)),
+                "size": list(expected),
+                "dock": list(dock),
+                "corner": surface_config[surface].get("corner"),
+                "error": str(native.get("error") or ""),
+            }
+        result["surfaces"] = surface_status
         if rect:
             size = self._overlay_size_for(rect)
             result["overlay_size"] = list(size)
@@ -2641,6 +3611,15 @@ class Api:
             self._own_hwnd = self._tracker.own_window_handle(self._window)
         except Exception:
             self._own_hwnd = None
+        for surface, win in self._overlay_windows.items():
+            if surface not in self._overlay_loaded:
+                continue
+            try:
+                hwnd = self._tracker.own_window_handle(win, f"DigiTracker {surface}")
+                if hwnd:
+                    self._overlay_hwnds[surface] = hwnd
+            except Exception:
+                pass
         self._start_overlay_hotkey()
         self._configure_native_overlay()
 
@@ -2649,6 +3628,11 @@ class Api:
             try:
                 if not self._own_hwnd:
                     self._own_hwnd = self._tracker.own_window_handle(self._window)
+                for surface, win in self._overlay_windows.items():
+                    if surface not in self._overlay_hwnds:
+                        hwnd = self._tracker.own_window_handle(win, f"DigiTracker {surface}")
+                        if hwnd:
+                            self._overlay_hwnds[surface] = hwnd
                 if self._own_hwnd and self._compact:
                     self._configure_native_overlay()
                 with self._lock:
@@ -2727,6 +3711,88 @@ class Api:
             return ""
         return f"/assets/badges/{slug}/{badge}.png"
 
+    @staticmethod
+    def _progress_playtime(progress: dict) -> dict | None:
+        raw = progress.get("UserTotalPlaytime")
+        if raw in (None, "", 0, "0"):
+            return None
+        seconds = None
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            seconds = max(0, int(raw))
+        elif isinstance(raw, str) and raw.strip().isdigit():
+            seconds = max(0, int(raw.strip()))
+        if seconds is not None:
+            if seconds <= 0:
+                return None
+            hours, remainder = divmod(seconds, 3600)
+            minutes = remainder // 60
+            label = f"{hours}h {minutes:02d}min" if hours else f"{minutes}min"
+            return {"seconds": seconds, "label": label, "source": "retroachievements"}
+        label = str(raw).strip()
+        return {"seconds": None, "label": label, "source": "retroachievements"} if label else None
+
+    def _update_completion_events(self, game: dict, completion: dict, score: dict,
+                                  playtime: dict | None) -> dict:
+        state = game.setdefault("completion_events", {})
+        events = state.setdefault("events", [])
+        if not state.get("initialized"):
+            # Jogos concluídos antes desta versão não devem abrir um modal na
+            # migração, mas a celebração precisa existir para ser reproduzida
+            # posteriormente pelo Hall.
+            now = time.time()
+            if completion.get("softcore_complete"):
+                events.append({
+                    "id": f"softcore-migrated-{int(now * 1000)}", "kind": "softcore",
+                    "created_at": now, "pending": False,
+                    "achievements": completion.get("earned", 0),
+                    "points": score.get("earned", 0), "playtime": playtime,
+                    "date": completion.get("softcore_date", ""),
+                })
+            if completion.get("mastery_complete"):
+                events.append({
+                    "id": f"mastery-migrated-{int(now * 1000)}", "kind": "mastery",
+                    "created_at": now, "pending": False,
+                    "achievements": completion.get("hardcore", 0),
+                    "points": score.get("hardcore", 0), "playtime": playtime,
+                    "date": completion.get("mastery_date", ""),
+                })
+            state.update({
+                "initialized": True,
+                "softcore_seen": bool(completion.get("softcore_complete")),
+                "mastery_seen": bool(completion.get("mastery_complete")),
+            })
+        else:
+            new_soft = bool(completion.get("softcore_complete")) and not state.get("softcore_seen")
+            new_mastery = bool(completion.get("mastery_complete")) and not state.get("mastery_seen")
+            now = time.time()
+            if new_soft:
+                events.append({
+                    "id": f"softcore-{int(now * 1000)}", "kind": "softcore",
+                    "created_at": now, "pending": not new_mastery,
+                    "achievements": completion.get("earned", 0),
+                    "points": score.get("earned", 0), "playtime": playtime,
+                    "date": completion.get("softcore_date", ""),
+                })
+            if new_mastery:
+                events.append({
+                    "id": f"mastery-{int(now * 1000)}", "kind": "mastery",
+                    "created_at": now, "pending": True,
+                    "achievements": completion.get("hardcore", 0),
+                    "points": score.get("hardcore", 0), "playtime": playtime,
+                    "date": completion.get("mastery_date", ""),
+                })
+            state["softcore_seen"] = bool(state.get("softcore_seen") or new_soft)
+            state["mastery_seen"] = bool(state.get("mastery_seen") or new_mastery)
+        # histórico limitado, preservando celebrações mais recentes
+        state["events"] = events[-50:]
+        path = GAMES_DIR / f"{game.get('slug', '')}.json"
+        if path.exists():
+            try:
+                path.write_text(json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8")
+            except OSError:
+                pass
+        return state
+
     # -------------------- cálculo de progresso por jogo --------------------- #
     def _sync_game(self, game: dict) -> bool:
         """Consulta a API e recalcula o estado de um jogo. Devolve False se a API
@@ -2734,6 +3800,7 @@ class Api:
         slug = game["slug"]
 
         earned_map: dict[int, dict] = {}
+        progress: dict = {}
         limited = False
         if self._client:
             try:
@@ -2771,16 +3838,17 @@ class Api:
                     if slug in self.state:
                         return not limited
 
-        self._apply_progress(game, earned_map)
+        self._apply_progress(game, earned_map, progress)
         return not limited
 
-    def _apply_progress(self, game: dict, earned_map: dict) -> dict:
+    def _apply_progress(self, game: dict, earned_map: dict, progress_meta: dict | None = None) -> dict:
         """Parte pura do cálculo: cruza o walkthrough salvo com o que a API disse
         estar destravado e publica o resultado em `self.state`. Separado de
         `_sync_game` para a importação em lote reaproveitar o progresso que já
         veio na mesma resposta, sem uma segunda chamada de rede."""
         slug = game["slug"]
         meta = game.get("achievements_meta", {})
+        progress_meta = progress_meta if isinstance(progress_meta, dict) else {}
 
         ordered = []
         # Os "modos" agora vêm da RetroAchievements, não de curadoria: uma
@@ -2789,15 +3857,34 @@ class Api:
         modes = {m: {"total": 0, "earned": 0} for m in DEFAULT_MODES}
         last_earned = None
 
+        # O conjunto canônico vem da RA. A ordem do walkthrough continua sendo
+        # usada quando disponível, mas nunca define o denominador de pontos ou
+        # 100%: conquistas ausentes do guia são anexadas na ordem oficial.
+        ordered_ids = []
+        locations = {}
         for step in sorted(game.get("walkthrough", []), key=lambda s: s.get("step", 0)):
             for entry in step.get("achievements", []):
                 aid = int(entry["id"])
+                if aid not in ordered_ids:
+                    ordered_ids.append(aid)
+                    locations[aid] = (step.get("step"), step.get("area", ""))
+        for aid in sorted(earned_map, key=lambda key: (
+                earned_map[key].get("display_order", 10_000_000), key)):
+            if aid not in ordered_ids:
+                ordered_ids.append(aid)
+
+        score = {"available": 0, "earned": 0, "hardcore": 0,
+                 "true_ratio_available": 0, "true_ratio_earned": 0}
+        for aid in ordered_ids:
                 m = meta.get(str(aid), {})
                 live = earned_map.get(aid, {})
                 earned = bool(live.get("earned"))
                 hardcore = bool(live.get("hardcore"))
                 date = live.get("date", "")
                 badge = m.get("badge") or live.get("badge", "")
+                points = int(live.get("points") or m.get("points") or 0)
+                true_ratio = int(live.get("true_ratio") or 0)
+                step_number, area = locations.get(aid, (None, "Ordem RetroAchievements"))
 
                 row = {
                     "id": aid,
@@ -2808,16 +3895,29 @@ class Api:
                     "mode": "hardcore" if hardcore else "softcore",
                     "date": fmt_date(date),
                     "date_raw": date,
+                    "date_softcore": fmt_date(live.get("date_softcore", "")),
+                    "date_softcore_raw": live.get("date_softcore", ""),
+                    "date_hardcore": fmt_date(live.get("date_hardcore", "")),
+                    "date_hardcore_raw": live.get("date_hardcore", ""),
                     "badge_url": self._badge_url(slug, badge),
-                    "step": step.get("step"),
-                    "area": step.get("area", ""),
+                    "step": step_number,
+                    "area": area,
+                    "points": points,
+                    "true_ratio": true_ratio,
+                    "rarity": live.get("rarity"),
                 }
                 ordered.append(row)
+                score["available"] += points
+                score["true_ratio_available"] += true_ratio
 
                 for key in modes:
                     modes[key]["total"] += 1
                 if earned:
                     modes["hardcore" if hardcore else "softcore"]["earned"] += 1
+                    score["earned"] += points
+                    score["true_ratio_earned"] += true_ratio
+                    if hardcore:
+                        score["hardcore"] += points
 
                 if earned and date:
                     if last_earned is None or date > last_earned["date_raw"]:
@@ -2841,6 +3941,39 @@ class Api:
             "complete": total > 0 and hardcore_count >= total,
             "softcore_ids": [r["id"] for r in softcore_only],
         }
+        softcore_complete = total > 0 and mastery["earned"] >= total
+        mastery_dates = [r.get("date_hardcore_raw") for r in ordered if r.get("date_hardcore_raw")]
+        softcore_dates = [r.get("date_raw") for r in ordered if r.get("date_raw")]
+        playtime = self._progress_playtime(progress_meta)
+        completion = {
+            "softcore_complete": softcore_complete,
+            "mastery_complete": mastery["complete"],
+            "earned": mastery["earned"],
+            "hardcore": hardcore_count,
+            "total": total,
+            "softcore_date": fmt_date(max(softcore_dates)) if softcore_dates else "",
+            "mastery_date": fmt_date(max(mastery_dates)) if mastery_dates else "",
+            "softcore_date_raw": max(softcore_dates) if softcore_dates else "",
+            "mastery_date_raw": max(mastery_dates) if mastery_dates else "",
+            "highest_award_kind": progress_meta.get("HighestAwardKind") or "",
+            "highest_award_date": fmt_date(progress_meta.get("HighestAwardDate") or ""),
+            "highest_award_date_raw": progress_meta.get("HighestAwardDate") or "",
+        }
+        game["score"] = score
+        game["playtime"] = playtime
+        game["completion"] = completion
+        if not game.get("palette"):
+            try:
+                art_path = self._palette_art_path(game)
+                if art_path:
+                    game["palette"] = self._palette_from_path(art_path)
+                    game["accent"] = game["palette"]["primary"]
+            except Exception:
+                # Paleta é enriquecimento; arte corrompida nunca impede sync.
+                pass
+        completion_events = self._update_completion_events(
+            game, completion, score, playtime
+        )
 
         smart_bundle = {}
         if game.get("guide"):
@@ -2876,8 +4009,15 @@ class Api:
             "art": game.get("art", {}),
             "art_meta": game.get("art_meta", {}),
             "accent": game.get("accent", ACCENTS[0]),
+            "palette": game.get("palette", {}),
             "modes": modes,
             "mastery": mastery,
+            "score": score,
+            "playtime": playtime,
+            "completion": completion,
+            "completion_events": completion_events,
+            "compact_tab": (game.get("compact_ui") or {}).get(
+                "tab", self.settings.get("compact_tab", "achievements")),
             "achievements": ordered,
             "next_ids": next_ids,
             "last_earned": last_earned,
@@ -2900,13 +4040,18 @@ class Api:
         after = current.get("last_earned") or {}
         if not after.get("date_raw") or after.get("date_raw") == before.get("date_raw"):
             return
+        preferred = self.settings.get("compact_view", "minimal")
+        # Em Troféus/Ambos a nova conquista já fica visível, então não altere
+        # o layout escolhido pelo usuário só para reproduzir a mesma informação.
+        if preferred in ("expanded", "both"):
+            return
         self.set_compact_state("expanded", from_user=False)
         seconds = int(self.settings.get("compact_auto_collapse_seconds", 0) or 0)
         if seconds > 0:
             if self._auto_collapse_timer:
                 self._auto_collapse_timer.cancel()
             self._auto_collapse_timer = threading.Timer(
-                seconds, lambda: self.set_compact_state("minimal", from_user=False)
+                seconds, lambda: self.set_compact_state(preferred, from_user=False)
             )
             self._auto_collapse_timer.daemon = True
             self._auto_collapse_timer.start()
@@ -2989,6 +4134,7 @@ def main():
     api._normal_size = normal_size
     port = start_static_server()
     url = f"http://127.0.0.1:{port}/ui/index.html"
+    overlay_url = f"http://127.0.0.1:{port}/ui/overlay.html"
 
     window = webview.create_window(
         "DigiTracker",
@@ -3003,6 +4149,43 @@ def main():
         background_color="#050c18",
     )
     api._window = window
+
+    summary_window = webview.create_window(
+        "DigiTracker summary",
+        url=f"{overlay_url}?surface=summary",
+        js_api=api,
+        width=COMPACT_SIZE[0],
+        height=COMPACT_SIZE[1],
+        min_size=COMPACT_MINIMAL_MIN,
+        hidden=True,
+        frameless=True,
+        easy_drag=False,
+        shadow=False,
+        focus=False,
+        on_top=True,
+        background_color="#07111f",
+    )
+    details_window = webview.create_window(
+        "DigiTracker details",
+        url=f"{overlay_url}?surface=details",
+        js_api=api,
+        width=COMPACT_EXPANDED_SIZE[0],
+        height=COMPACT_EXPANDED_SIZE[1],
+        min_size=COMPACT_EXPANDED_MIN,
+        hidden=True,
+        frameless=True,
+        easy_drag=False,
+        shadow=False,
+        focus=False,
+        on_top=True,
+        background_color="#07111f",
+    )
+    # Disponibiliza as referências imediatamente para que uma detecção muito
+    # rápida já saiba que deve usar o caminho multi-HUD. Os callbacks loaded
+    # resolvem os HWNDs assim que cada WebView estiver pronto.
+    api._overlay_windows = {"summary": summary_window, "details": details_window}
+    summary_window.events.loaded += lambda: api.attach_overlay_window("summary", summary_window)
+    details_window.events.loaded += lambda: api.attach_overlay_window("details", details_window)
 
     services_started = threading.Event()
 

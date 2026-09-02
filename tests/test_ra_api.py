@@ -185,6 +185,21 @@ class TestParseAchievements:
     def test_resposta_vazia_nao_quebra(self):
         assert ra_api.RAClient.parse_achievements({}) == {}
 
+    def test_preserva_pontos_ratio_raridade_e_datas_separadas(self):
+        out = ra_api.RAClient.parse_achievements({
+            "NumDistinctPlayers": 200,
+            "Achievements": {"7": {
+                "ID": 7, "Points": "10", "TrueRatio": "37",
+                "NumAwarded": 50, "NumAwardedHardcore": 20,
+                "DateEarned": "2026-01-02 03:04:05",
+                "DateEarnedHardcore": "2026-02-03 04:05:06",
+            }},
+        })[7]
+        assert out["points"] == 10 and out["true_ratio"] == 37
+        assert out["rarity"] == 25.0
+        assert out["date_softcore"] == "2026-01-02 03:04:05"
+        assert out["date_hardcore"] == "2026-02-03 04:05:06"
+
 
 class TestFmtDate:
     @pytest.mark.parametrize("bruto,esperado", [

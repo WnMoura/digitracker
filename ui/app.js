@@ -103,7 +103,7 @@ async function carregarCores(jogos) {
   return true;
 }
 
-const corDe = (g) => (g && g.art?.box && CORES_DA_CAPA.get(g.art.box)) || (g && g.accent) || COR_PADRAO;
+const corDe = (g) => g?.palette?.primary || (g && g.art?.box && CORES_DA_CAPA.get(g.art.box)) || (g && g.accent) || COR_PADRAO;
 
 /* Fita de estado na capa. Só aparece quando há algo a dizer: jogo em
    progresso não recebe fita. */
@@ -120,11 +120,15 @@ const S = {
   library: [],
   libraryQuery: "",
   activeSlug: null,
-  tab: "tips",           // aba do painel: overview | walk | mastery | tips
+  tab: "tips",           // aba do painel: overview | walk | tips
+  achievementFilter: "all",
   onTop: true,
   compact: false,        // modo mini-overlay (progresso de conquistas)
-  compactState: "hidden", // hidden | minimal | expanded
-  compactContent: "objective", // objective | achievements | guide
+  compactState: "hidden", // hidden | minimal | expanded | both
+  compactTab: "achievements", // achievements | guide (por jogo/HUD)
+  compactEditing: false,
+  compactSlots: 3,
+  compactRowObserver: null,
   compactCfg: null,      // tamanho/conteúdo/fundo do overlay
   compactPassive: false, // só fica true após a hotkey nativa ser confirmada
   compactNativeError: "",
@@ -159,6 +163,9 @@ const S = {
   G: null,               // estado do painel do GameFAQs
   AI: null,              // estado do painel de configuração da IA
   SET: null,             // estado da tela de Configurações
+  hall: null,
+  hallPlatform: "all",
+  shownOverlayCelebrations: new Set(),
 };
 
 const root = document.getElementById("root");
@@ -186,6 +193,10 @@ const backend = {
   async game(slug) {
     if (S.mode === "demo") return DEMO_GAME(slug);
     return window.pywebview.api.get_game(slug);
+  },
+  async setActiveGame(slug) {
+    if (S.mode === "demo") return { ok: true, slug };
+    return window.pywebview.api.set_active_game(slug || "");
   },
   async saveSecrets(u, k) { return window.pywebview.api.save_secrets(u, k); },
   async search(q) {
@@ -234,6 +245,22 @@ const backend = {
   async setAutoOverlay(v) {
     if (S.mode === "demo") return { ok: true, auto_overlay: v };
     return window.pywebview.api.set_auto_overlay(v);
+  },
+  async masteryHall() {
+    if (S.mode === "demo") return { ok: true, mastery: S.library.filter((g) => g.mastery?.complete), softcore: [] };
+    return window.pywebview.api.get_mastery_hall();
+  },
+  async completionEvents(slug = "", pendingOnly = true) {
+    if (S.mode === "demo") return { ok: true, events: [] };
+    return window.pywebview.api.get_completion_events(slug, pendingOnly);
+  },
+  async confirmCompletionEvent(slug, id) {
+    if (S.mode === "demo") return { ok: true };
+    return window.pywebview.api.confirm_completion_event(slug, id);
+  },
+  async reopenCompletionEvent(slug, id = "") {
+    if (S.mode === "demo") return { ok: false };
+    return window.pywebview.api.reopen_completion_event(slug, id);
   },
   async setCompact(v) {
     if (S.mode === "demo") return { ok: true, compact: !!v };
@@ -384,6 +411,30 @@ const backend = {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
     return window.pywebview.api.set_game_cover(slug, url, role || "cover");
   },
+  async applyWebArt(slug, candidate, role) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.apply_web_art(slug, candidate, role || "cover");
+  },
+  async setGamePalette(slug, primary, secondary) {
+    if (S.mode === "demo") return { ok: true, palette: { primary, secondary, manual: true } };
+    return window.pywebview.api.set_game_palette(slug, primary, secondary || "");
+  },
+  async recalculateGamePalette(slug) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.recalculate_game_palette(slug);
+  },
+  async webImageSearch(slug, query, page = 0, safe = "moderate", role = "cover") {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real.", results: [] };
+    return window.pywebview.api.search_web_images(slug, query || "", page, safe, role, "google");
+  },
+  async openImageSource(url) {
+    if (S.mode === "demo") return { ok: false };
+    return window.pywebview.api.open_image_source(url || "");
+  },
+  async openWebImageSearch(slug, query, safe = "moderate", role = "cover") {
+    if (S.mode === "demo") return { ok: false };
+    return window.pywebview.api.open_web_image_search(slug, query || "", safe, role);
+  },
   async refreshGameArt(slug, force = false) {
     if (S.mode === "demo") return { ok: true, status: "ready", art: DEMO_GAME(slug)?.art || {} };
     return window.pywebview.api.refresh_game_art(slug, force);
@@ -397,19 +448,42 @@ const backend = {
     return window.pywebview.api.clear_game_cover(slug, role || "cover");
   },
   async getCompactConfig() {
-    if (S.mode === "demo") return { ok: true, width: 320, height: 110, expanded_width: 420, expanded_height: 300, last: 2, next: 0, size_mode: "auto", content: "objective", corner: "auto", background_mode: "background", opacity: 100, hotkey: "ctrl+alt+g", auto_expand: false, auto_collapse_seconds: 0 };
+    if (S.mode === "demo") return S.compactCfg || { ok: true, width: 320, height: 110, expanded_width: 420, expanded_height: 300, last: 3, next: 0, size_mode: "auto", tab: "achievements", view: "minimal", corner: "auto", background_mode: "background", opacity: 100, hotkey: "ctrl+alt+g", edit_hotkey: "ctrl+alt+e", editing: false, variant: "minimal", auto_expand: false, auto_collapse_seconds: 0 };
     return window.pywebview.api.get_compact_config();
   },
   async setCompactConfig(cfg) {
     if (S.mode === "demo") return { ok: true, ...cfg };
     return window.pywebview.api.set_compact_config(
-      cfg.width, cfg.height, cfg.last, cfg.next, cfg.size_mode, cfg.content,
-      cfg.corner, 100, cfg.hotkey, cfg.auto_expand, cfg.auto_collapse_seconds,
-      cfg.expanded_width, cfg.expanded_height, cfg.background_mode);
+      cfg.width, cfg.height, cfg.last, cfg.next, cfg.size_mode, null, cfg.tab,
+      cfg.corner, 100, cfg.hotkey, cfg.edit_hotkey, cfg.auto_expand, cfg.auto_collapse_seconds,
+      cfg.expanded_width, cfg.expanded_height, cfg.background_mode, cfg.view);
   },
   async setCompactState(state) {
     if (S.mode === "demo") return { ok: true, compact: true, state };
     return window.pywebview.api.set_compact_state(state, true);
+  },
+  async setCompactTab(slug, tab) {
+    if (S.mode === "demo") return { ok: true, tab };
+    return window.pywebview.api.set_compact_tab(slug, tab);
+  },
+  async setOverlayEditing(value) {
+    if (S.mode === "demo") return { ok: true, editing: !!value };
+    return window.pywebview.api.set_overlay_edit_mode(value, false);
+  },
+  touchOverlayEditing() {
+    if (S.mode === "demo" || !hasBackend()) return;
+    const now = Date.now();
+    if (now - (backend._lastEditTouch || 0) < 700) return;
+    backend._lastEditTouch = now;
+    try { window.pywebview.api.touch_overlay_edit_mode(); } catch (_) { /* fechando */ }
+  },
+  resizeCompact(width, height) {
+    if (S.mode === "demo" || !hasBackend()) return;
+    try { window.pywebview.api.resize_compact_window(width, height); } catch (_) { /* fechando */ }
+  },
+  saveOverlayGeometry(variant, x, y, width, height) {
+    if (S.mode === "demo" || !hasBackend()) return;
+    try { window.pywebview.api.save_overlay_geometry(variant, x, y, width, height); } catch (_) { /* fechando */ }
   },
   moveWindow(x, y) {
     if (S.mode === "demo" || !hasBackend()) return;
@@ -419,9 +493,10 @@ const backend = {
 
 /* O backend entra/sai do modo compacto sozinho quando detecta um emulador —
    ele chama esta função para a interface acompanhar na hora. */
-window.onOverlayChanged = async (compact, state) => {
+window.onOverlayChanged = async (compact, state, editing) => {
   S.compact = !!compact;
   S.compactState = compact ? (state || "minimal") : "hidden";
+  S.compactEditing = !!editing;
   await refreshCompactNativeStatus();
   syncInputMode();
   const btn = document.getElementById("btn-compact");
@@ -441,6 +516,7 @@ async function refreshCompactNativeStatus() {
   try {
     const status = await backend.overlayStatus();
     S.compactPassive = ["passive", "interactive"].includes(status?.native_input_mode) && !!status?.hotkey_registered;
+    S.compactEditing = !!status?.editing;
     S.compactNativeError = status?.hotkey_error || status?.compatibility_error || "";
   } catch (e) {
     S.compactPassive = false;
@@ -560,9 +636,16 @@ function renderSetup() {
 async function enterDashboard() {
   S.view = "dashboard";
   S.library = await backend.library();
-  if (!S.activeSlug && S.library.length) S.activeSlug = S.library[0].slug;
+  // Um jogo removido ou uma instalacao migrada pode deixar um slug antigo no
+  // localStorage. Nao abra o dashboard vazio quando ainda ha jogos validos.
+  if ((!S.activeSlug || !S.library.some((game) => game.slug === S.activeSlug)) && S.library.length) {
+    S.activeSlug = (S.library.find((game) => !isMastered(game)) || S.library[0]).slug;
+  }
+  if (S.activeSlug) await backend.setActiveGame(S.activeSlug).catch(() => null);
   S.compactCfg = await backend.getCompactConfig().catch(() => null);
-  if (S.compactCfg?.content) S.compactContent = S.compactCfg.content;
+  if (S.compactCfg?.tab) S.compactTab = S.compactCfg.tab;
+  if (S.compact && S.compactCfg?.variant) S.compactState = S.compactCfg.variant;
+  S.compactEditing = !!S.compactCfg?.editing;
   await carregarCores(S.library);       // a cor de cada jogo vem da capa dele
   await renderDashboard({ force: true });
   startPolling();
@@ -622,13 +705,13 @@ function restoreScroll(map) {
    lista não é interrompida. `force` para transições de tela. */
 async function renderDashboard({ force = false } = {}) {
   const game = S.activeSlug ? await backend.game(S.activeSlug) : null;
-  const sig = JSON.stringify([S.mode, S.compact, S.compactState, S.compactContent, S.tab, S.activeSlug, S.library, game]);
+  const sig = JSON.stringify([S.mode, S.compact, S.compactState, S.compactTab, S.compactEditing, S.compactSlots, S.tab, S.activeSlug, S.library, game]);
   if (!force && sig === S.sig) return;
   S.sig = sig;
 
   // Só faz sentido preservar o scroll se continuamos na MESMA tela; ao trocar
   // de jogo ou de aba o conteúdo é outro e deve começar do topo.
-  const screenKey = `${S.compact}|${S.compactState}|${S.compactContent}|${S.tab}|${S.activeSlug}`;
+  const screenKey = `${S.compact}|${S.compactState}|${S.compactTab}|${S.tab}|${S.activeSlug}`;
   const sameScreen = screenKey === S.screenKey;
   S.screenKey = screenKey;
 
@@ -637,6 +720,8 @@ async function renderDashboard({ force = false } = {}) {
   document.documentElement.classList.toggle("compact-window", S.compact);
   document.body.classList.toggle("compact-window", S.compact);
   $("#btn-library").hidden = !!S.compact;
+  S.compactRowObserver?.disconnect?.();
+  S.compactRowObserver = null;
   if (S.compact) {
     root.innerHTML = compactHTML(game);
     bindCompact();
@@ -649,6 +734,53 @@ async function renderDashboard({ force = false } = {}) {
   if (sameScreen) restoreScroll(scroll);
   else root.querySelectorAll("[data-scroll]").forEach((el) => { el.scrollTop = 0; });
   $("#sync-tag").textContent = S.mode === "demo" ? "DEMO" : "● SYNC 30s";
+  handlePendingCelebrations(game);
+}
+
+function handlePendingCelebrations(game) {
+  if (!game) return;
+  const events = ((game.completion_events || {}).events || []).filter((e) => e.pending);
+  if (!events.length) return;
+  const event = [...events].reverse().find((e) => e.kind === "mastery") || events[events.length - 1];
+  if (S.compact) {
+    if (S.shownOverlayCelebrations.has(event.id)) return;
+    S.shownOverlayCelebrations.add(event.id);
+    const notice = document.createElement("div");
+    notice.className = `completion-overlay-toast ${event.kind}`;
+    notice.innerHTML = `<span>${event.kind === "mastery" ? "★" : "100%"}</span><div><small>${event.kind === "mastery" ? "MASTERY CONQUISTADA" : "100% CONCLUÍDO"}</small><b>${esc(game.title)}</b><em>${event.points || 0} pontos${event.playtime?.label ? ` · ${esc(event.playtime.label)}` : ""}</em></div>`;
+    root.appendChild(notice);
+    setTimeout(() => notice.remove(), 6000);
+    return;
+  }
+  if (!document.querySelector(".completion-modal")) showCompletionCelebration({ ...event, game }, false);
+}
+
+function showCompletionCelebration(payload, replay = false) {
+  const previousFocus = document.activeElement;
+  const game = payload.game || S.library.find((g) => g.slug === payload.slug) || {};
+  const kind = payload.kind === "mastery" ? "mastery" : "softcore";
+  const playtime = payload.playtime?.label || game.playtime?.label || "";
+  const points = payload.points ?? (kind === "mastery" ? game.score?.hardcore : game.score?.earned) ?? 0;
+  const count = payload.achievements ?? game.mastery?.total ?? 0;
+  const date = payload.date || (kind === "mastery" ? game.completion?.mastery_date : game.completion?.softcore_date) || "";
+  const modal = document.createElement("div");
+  modal.className = `modal-bg completion-modal ${kind}`;
+  modal.style.setProperty("--jogo", corDe(game));
+  modal.innerHTML = `<div class="completion-panel" role="dialog" aria-modal="true"><button class="completion-close" aria-label="Fechar">×</button><div class="completion-rays"></div><div class="completion-emblem">${kind === "mastery" ? "★" : "100%"}</div><small>${kind === "mastery" ? "HARDCORE · CONCLUSÃO PERFEITA" : "CONCLUSÃO SOFTCORE"}</small><h2>${kind === "mastery" ? "MASTERY CONQUISTADA" : "100% CONCLUÍDO"}</h2><h3>${esc(game.title || "Jogo concluído")}</h3><div class="completion-stats"><span><b>${count}</b> conquistas</span><span><b>${points}</b> pontos</span>${playtime ? `<span><b>${esc(playtime)}</b> tempo RA</span>` : ""}${date ? `<span><b>${esc(date)}</b> conclusão</span>` : ""}</div><button class="completion-primary">${kind === "mastery" ? "Ver no Hall da Mastery" : "Continuar para a Mastery"}</button><p>As cores desta celebração foram adaptadas à identidade do jogo.</p></div>`;
+  document.body.appendChild(modal);
+  const onKey = (event) => {
+    if (event.key === "Escape") { event.preventDefault(); close(); }
+  };
+  const close = async () => {
+    document.removeEventListener("keydown", onKey);
+    modal.remove();
+    if (!replay && payload.id && (game.slug || payload.slug)) await backend.confirmCompletionEvent(game.slug || payload.slug, payload.id).catch(() => null);
+    previousFocus?.focus?.();
+  };
+  document.addEventListener("keydown", onKey);
+  modal.querySelector(".completion-close").onclick = close;
+  modal.querySelector(".completion-primary").onclick = async () => { await close(); if (kind === "mastery") enterHall(); };
+  modal.querySelector(".completion-close")?.focus();
 }
 
 /* ========================= MODO COMPACTO (OVERLAY) ======================= */
@@ -668,38 +800,57 @@ function compactHTML(game) {
   const mst = game.mastery || {};
   const cor = corDe(game);
   const cfg = S.compactCfg || {};
-  const state = S.compactState === "expanded" ? "expanded" : "minimal";
-  const content = cfg.content || S.compactContent || "objective";
+  const state = ["expanded", "both"].includes(S.compactState) ? S.compactState : "minimal";
+  const content = game.compact_tab || S.compactTab || cfg.tab || "achievements";
+  S.compactTab = content;
   const capa = game.art?.cover || game.art?.box;
   const fundo = compactBackground(game, cfg.background_mode || "background");
   const objective = compactObjective(game);
   const progress = Math.max(0, Math.min(100, Number(mst.percent || 0)));
-  const expanded = state === "expanded";
   const hotkey = String(cfg.hotkey || "Ctrl+Alt+G").replace(/\+/g, " + ").toUpperCase();
-  const body = expanded ? compactContentHTML(game, content, t) : `
-    <div class="cw-min-card">
-      ${capa ? `<img class="cw-min-cover" src="${esc(capa)}" alt="">` : `<span class="cw-min-cover cw-cover-fallback">D</span>`}
-      <div class="cw-min-objective"><span class="cw-kicker">PRÓXIMO OBJETIVO</span>
-        <strong>${esc(objective.title || "Continue seu guia")}</strong>
-        <small>${objective.text ? esc(objective.text) : `${mst.hardcore || 0} de ${t} conquistas`}</small>
-      </div>
-      <div class="cw-ring" style="--p:${progress}" aria-label="${progress}%"><span>${progress}%</span></div>
-    </div>`;
-  const tab = (id, icon, label) => `<button type="button" data-cw-content="${id}" class="${content === id ? "on" : ""}">${icon}<b>${label}</b></button>`;
-  return `<div class="cw cw-${state}" style="--jogo:${cor}">
-    ${fundo ? `<div class="cw-bg" style="background-image:url('${esc(fundo)}')"></div>` : ""}
-    <div class="cw-shade"></div>
-    <div class="cw-head" title="${esc(game.title)}">
-      <div class="cw-title"><span>DIGITRACKER</span>${expanded ? `<strong>${esc(game.title)}</strong>` : ""}</div>
-      <i class="cw-live-dot" title="Overlay passivo ativo"></i>
-      ${expanded ? `<button type="button" class="cw-collapse-mark" id="cw-collapse" title="Recolher HUD" aria-label="Recolher HUD">—</button>` : ""}
-      ${!S.compactPassive ? `<button class="cw-recover" id="cw-recover" title="${esc(S.compactNativeError || "Modo de recuperação: fechar overlay")}" aria-label="Fechar overlay">×</button>` : ""}
+  const summary = `<div class="cw-min-card">
+    ${capa ? `<img class="cw-min-cover" src="${esc(capa)}" alt="">` : `<span class="cw-min-cover cw-cover-fallback">D</span>`}
+    <div class="cw-min-objective"><span class="cw-kicker">PRÓXIMO OBJETIVO</span>
+      <strong>${esc(objective.title || "Continue seu guia")}</strong>
+      <small>${objective.text ? esc(objective.text) : `${mst.hardcore || 0} de ${t} conquistas`}</small>
     </div>
-    ${expanded ? `<div class="cw-tabs">${tab("achievements", "♜", "Conquistas")}${tab("guide", "♢", "Guia Inteligente")}</div>` : ""}
-    <div class="cw-content" data-scroll="compact">${body}</div>
-    ${expanded && objective.warning ? `<button type="button" class="cw-alert" id="cw-alert-guide"><span>⚠</span><b>ALERTA</b><em>${esc(objective.warning)}</em><i>›</i></button>` : ""}
-    ${expanded ? `<div class="cw-hotkey">${esc(hotkey)} · ocultar</div>` : ""}
+    <div class="cw-ring" style="--p:${progress}" aria-label="${progress}%"><span>${progress}%</span></div>
   </div>`;
+  const tab = (id, icon, label) => `<button type="button" data-cw-content="${id}" class="${content === id ? "on" : ""}">${icon}<b>${label}</b></button>`;
+  const viewControls = () => S.compactEditing ? `<div class="cw-view-switch" aria-label="Visual do overlay">
+    <button type="button" data-cw-view="minimal" class="${state === "minimal" ? "on" : ""}" title="Somente resumo" aria-label="Mostrar somente resumo">R</button>
+    <button type="button" data-cw-view="expanded" class="${state === "expanded" ? "on" : ""}" title="Somente troféus" aria-label="Mostrar somente troféus">T</button>
+    <button type="button" data-cw-view="both" class="${state === "both" ? "on" : ""}" title="Resumo e troféus" aria-label="Mostrar resumo e troféus">2</button>
+  </div>` : "";
+  const panel = (variant, includeSummary, primary) => {
+    const expanded = variant === "expanded";
+    const body = expanded ? compactContentHTML(game, content, t) : summary;
+    return `<section class="cw cw-${variant}" style="--jogo:${cor}">
+      ${fundo ? `<div class="cw-bg" style="background-image:url('${esc(fundo)}')"></div>` : ""}
+      <div class="cw-shade"></div>
+      <div class="cw-head" title="${esc(game.title)}">
+        <div class="cw-title"><span>DIGITRACKER</span>${expanded ? `<strong>${esc(game.title)}</strong>` : ""}</div>
+        <i class="cw-live-dot" title="${S.compactEditing ? "Modo de edição" : "Overlay passivo ativo"}"></i>
+        ${primary ? viewControls() : ""}
+        ${primary && !S.compactPassive ? `<button class="cw-recover" id="cw-recover" title="${esc(S.compactNativeError || "Modo de recuperação: fechar overlay")}" aria-label="Fechar overlay">×</button>` : ""}
+      </div>
+      ${expanded && includeSummary ? `<div class="cw-summary">${summary}</div>` : ""}
+      ${expanded ? `<div class="cw-tabs">${tab("achievements", "♜", "Troféus")}${tab("guide", "♢", "Guia Inteligente")}</div>` : ""}
+      <div class="cw-content" data-scroll="compact">${body}</div>
+      ${expanded && objective.warning ? `<button type="button" class="cw-alert" id="cw-alert-guide"><span>⚠</span><b>ALERTA</b><em>${esc(objective.warning)}</em><i>›</i></button>` : ""}
+      ${state !== "both" && (S.compactEditing || !S.compactPassive) ? `<div class="cw-hotkey">${esc(hotkey)} · mostrar/ocultar&nbsp;&nbsp; CTRL + ALT + E · editar</div>` : ""}
+      ${state !== "both" && S.compactEditing ? `<button class="cw-resize" id="cw-resize" aria-label="Redimensionar overlay" title="Arraste para redimensionar"></button>` : ""}
+    </section>`;
+  };
+  if (state === "both") {
+    return `<div class="cw-layout-both" style="--jogo:${cor};--cw-min-h:${Math.max(90, Math.min(130, Number(cfg.height || 110)))}px">
+      ${panel("minimal", false, true)}
+      ${panel("expanded", false, false)}
+      ${S.compactEditing || !S.compactPassive ? `<div class="cw-hotkey cw-both-hotkey">${esc(hotkey)} · mostrar/ocultar&nbsp;&nbsp; CTRL + ALT + E · editar</div>` : ""}
+      ${S.compactEditing ? `<button class="cw-resize" id="cw-resize" aria-label="Redimensionar overlay" title="Arraste para redimensionar"></button>` : ""}
+    </div>`;
+  }
+  return panel(state, state === "expanded", true);
 }
 
 function compactObjective(game) {
@@ -720,8 +871,7 @@ function compactObjective(game) {
 
 function compactContentHTML(game, content, total) {
   if (content === "achievements") return cwAchievementsHTML(game, total);
-  if (content === "guide") return cwGuideHTML(game);
-  return cwObjectiveHTML(game);
+  return cwGuideHTML(game);
 }
 
 function cwObjectiveHTML(game) {
@@ -744,15 +894,16 @@ function cwObjectiveHTML(game) {
 
 function cwAchievementsHTML(game, total) {
   const cfg = S.compactCfg || {};
-  const lastN = Math.max(0, Number(cfg.last ?? 2));
-  const nextN = Math.max(0, Number(cfg.next ?? 2)) || 2;
+  const slots = Math.max(1, Number(S.compactSlots || 3));
+  const lastN = Math.min(3, slots, Math.max(0, Number(cfg.last ?? 3)));
   const earned = (game.achievements || []).filter((a) => a.earned && a.date_raw)
     .sort((a, b) => (a.date_raw < b.date_raw ? 1 : a.date_raw > b.date_raw ? -1 : 0));
   const last = earned.slice(0, lastN);
+  const nextN = Math.max(0, slots - last.length);
   const next = (game.next_ids || []).map((id) => (game.achievements || []).find((a) => a.id === id))
     .filter(Boolean).slice(0, nextN);
   const rows = (label, list, locked) => list.length ? `<div class="cw-sec"><p class="cw-sec-label">${label}</p>${list.map((a) => cwRow(a, locked)).join("")}</div>` : "";
-  return `<div class="cw-detail"><div class="cw-detail-kicker">CONQUISTAS</div>
+  return `<div class="cw-detail cw-achievements"><div class="cw-detail-kicker">CONQUISTAS · ${game.score?.earned || 0} PTS</div>
     ${rows("Últimas obtidas", last, false)}${rows("Próximas", next, true)}
     ${!last.length && !next.length ? `<p class="cw-empty-sm">${total ? "Sem conquistas pendentes." : "Sem conquistas registradas."}</p>` : ""}</div>`;
 }
@@ -770,36 +921,91 @@ function cwRow(a, locked) {
   const badge = a.badge_url
     ? `<div class="cw-badge${locked && !a.earned ? " locked" : ""}" style="background-image:url('${esc(a.badge_url)}')"></div>`
     : `<div class="cw-badge${locked && !a.earned ? " locked" : ""}">${locked && !a.earned ? "🔒" : "🏆"}</div>`;
-  return `<div class="cw-row">
+  return `<div class="cw-row" data-mode="${a.earned ? (a.hardcore ? "hardcore" : "softcore") : "locked"}">
     ${badge}
     <div class="cw-info">
       <p class="cw-name">${esc(a.name)}</p>
-      <p class="cw-desc">${esc(a.desc || "")}</p>
+      <p class="cw-desc">${a.points ? `${esc(a.points)} pts · ` : ""}${esc(a.desc || "")}</p>
     </div>
   </div>`;
 }
 
 function bindCompact() {
   $("#cw-recover")?.addEventListener("click", () => toggleCompact(false));
-  $("#cw-collapse")?.addEventListener("click", async () => {
-    await backend.setCompactState("minimal").catch(() => null);
-    S.compactState = "minimal";
+  root.querySelectorAll("[data-cw-view]").forEach((button) => button.addEventListener("click", async () => {
+    if (!S.compactEditing) return;
+    const state = button.dataset.cwView;
+    const result = await backend.setCompactState(state).catch(() => null);
+    if (!result?.ok) return toast(result?.error || "Não foi possível alterar o HUD.", true);
+    S.compactState = state;
+    if (state !== "minimal") {
+      S.compactTab = "achievements";
+      await backend.setCompactTab(S.activeSlug, "achievements").catch(() => null);
+    }
+    if (S.compactCfg) { S.compactCfg.view = state; S.compactCfg.variant = state; }
+    backend.touchOverlayEditing();
     await renderDashboard({ force: true });
-  });
+  }));
   $("#cw-alert-guide")?.addEventListener("click", async () => {
-    S.compactContent = "guide";
-    S.compactCfg = { ...(S.compactCfg || {}), content: "guide" };
-    await backend.setCompactConfig(S.compactCfg).catch(() => null);
+    if (!S.compactEditing) return;
+    S.compactTab = "guide";
+    await backend.setCompactTab(S.activeSlug, "guide").catch(() => null);
+    backend.touchOverlayEditing();
     await renderDashboard({ force: true });
   });
   root.querySelectorAll("[data-cw-content]").forEach((button) => button.addEventListener("click", async () => {
-    if (S.compactState !== "expanded") return;
-    S.compactContent = button.dataset.cwContent;
-    S.compactCfg = { ...(S.compactCfg || {}), content: S.compactContent };
-    await backend.setCompactConfig(S.compactCfg).catch(() => null);
+    if (!["expanded", "both"].includes(S.compactState) || !S.compactEditing) return;
+    S.compactTab = button.dataset.cwContent;
+    await backend.setCompactTab(S.activeSlug, S.compactTab).catch(() => null);
+    backend.touchOverlayEditing();
     await renderDashboard({ force: true });
   }));
-  makeDraggable(root.querySelector(".cw-head"));
+  if (S.compactEditing) {
+    root.querySelectorAll(".cw-head").forEach(makeDraggable);
+    makeResizable($("#cw-resize"));
+    root.querySelector(".cw")?.addEventListener("pointermove", backend.touchOverlayEditing, { passive: true });
+  }
+  observeCompactRows();
+}
+
+function observeCompactRows() {
+  if (!["expanded", "both"].includes(S.compactState) || S.compactTab !== "achievements") return;
+  const area = root.querySelector(".cw-expanded .cw-content");
+  if (!area || typeof ResizeObserver === "undefined") return;
+  const update = () => {
+    const labels = 36;
+    const slots = Math.max(1, Math.min(10, Math.floor((area.clientHeight - labels - 16) / 36)));
+    if (slots !== S.compactSlots) {
+      S.compactSlots = slots;
+      renderDashboard({ force: true });
+    }
+  };
+  const observer = new ResizeObserver(update);
+  S.compactRowObserver = observer;
+  observer.observe(area);
+  requestAnimationFrame(update);
+}
+
+function makeResizable(el) {
+  if (!el || !S.compactEditing) return;
+  let startX = 0, startY = 0, startW = 0, startH = 0;
+  const onMove = (e) => {
+    backend.resizeCompact(startW + e.screenX - startX, startH + e.screenY - startY);
+    backend.touchOverlayEditing();
+  };
+  const onUp = () => {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    backend.saveOverlayGeometry(S.compactState, window.screenX, window.screenY, window.innerWidth, window.innerHeight);
+  };
+  el.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    startX = e.screenX; startY = e.screenY;
+    startW = window.innerWidth; startH = window.innerHeight;
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    e.preventDefault();
+  });
 }
 
 function switchCompactGame(dir) {
@@ -826,13 +1032,15 @@ function makeDraggable(el) {
   const onUp = () => {
     document.removeEventListener("mousemove", onMove);
     document.removeEventListener("mouseup", onUp);
+    backend.saveOverlayGeometry(S.compactState, window.screenX, window.screenY, window.innerWidth, window.innerHeight);
   };
   el.addEventListener("mousedown", (e) => {
     // botão esquerdo, e nunca sobre um controle (abas): esses clicam, não arrastam
-    if (e.button !== 0 || e.target.closest("button")) return;
+    if (!S.compactEditing || e.button !== 0 || e.target.closest("button")) return;
     grabX = e.clientX; grabY = e.clientY;
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
+    backend.touchOverlayEditing();
     e.preventDefault();
   });
 }
@@ -841,7 +1049,7 @@ function makeDraggable(el) {
    aparece no hover do próprio overlay, já que a barra some no compacto). */
 async function toggleCompact(value) {
   S.compact = value !== undefined ? !!value : !S.compact;
-  S.compactState = S.compact ? "minimal" : "hidden";
+  S.compactState = S.compact ? (S.compactCfg?.view || S.compactCfg?.variant || "minimal") : "hidden";
   syncInputMode();
   const btn = document.getElementById("btn-compact");
   if (btn) {
@@ -850,16 +1058,21 @@ async function toggleCompact(value) {
   }
   if (hasBackend()) await backend.setCompact(S.compact);
   await refreshCompactNativeStatus();
+  if (S.compact && S.view !== "dashboard") {
+    await enterDashboard();
+    return;
+  }
   if (S.view === "dashboard") await renderDashboard({ force: true });
 }
 
 function sidebarHTML() {
   const query = S.libraryQuery.trim().toLocaleLowerCase("pt-BR");
+  const activeLibrary = S.library.filter((game) => !isMastered(game));
   const visible = query
-    ? S.library.filter((g) => g.title.toLocaleLowerCase("pt-BR").includes(query))
-    : S.library;
-  const done = visible.filter(isMastered);
-  const prog = visible.filter((g) => !isMastered(g));
+    ? activeLibrary.filter((g) => g.title.toLocaleLowerCase("pt-BR").includes(query))
+    : activeLibrary;
+  const done = S.library.filter(isMastered);
+  const prog = visible;
   /* Cápsula de capa: a arte identifica o jogo, a fita diz o que exige ação,
      e a selecionada brilha com a própria cor. */
   const tile = (g) => {
@@ -881,6 +1094,7 @@ function sidebarHTML() {
         <div class="name">${esc(g.title)}</div>
         <div class="tile-bar"><i style="width:${m.percent || 0}%"></i></div>
         <div class="tile-num">${m.hardcore || 0} / ${m.total || 0} · ${m.percent || 0}%</div>
+        ${g.playtime?.label ? `<div class="tile-time" title="Tempo registrado pela RetroAchievements">◷ ${esc(g.playtime.label)}</div>` : ""}
       </div>
       <span class="tile-star" aria-hidden="true">${isMastered(g) ? "★" : "☆"}</span>
     </button>`;
@@ -898,16 +1112,63 @@ function sidebarHTML() {
         <input id="library-search" type="search" placeholder="Buscar jogo" value="${esc(S.libraryQuery)}" aria-label="Buscar jogo na biblioteca">
       </label>
     </div>
+    <button class="hall-entry ${S.view === "hall" ? "active" : ""}" id="hall-entry"><span>✦</span><div><b>Hall da Mastery</b><small>${done.length} jogos no espaço VIP</small></div><i>›</i></button>
     <div class="sidebar-list" data-scroll="sidebar">
-      ${done.length ? `<p class="section-label done">★ MASTERY</p>${done.map(tile).join("")}<div style="height:8px"></div>` : ""}
       ${prog.length ? `<p class="section-label progress">◎ EM PROGRESSO</p>${prog.map(tile).join("")}` : ""}
-      <p class="library-empty ${visible.length ? "hidden" : ""}" id="library-filter-empty">${query ? "Nenhum jogo encontrado." : "Nenhum jogo ainda."}</p>
+      <div class="library-empty ${visible.length ? "hidden" : ""}" id="library-filter-empty"><p>${query ? "Nenhum jogo em progresso encontrado." : (done.length ? "Todos os jogos estão no Hall da Mastery." : "Nenhum jogo ainda.")}</p>${!query && done.length ? `<button class="btn-ghost" id="library-open-hall">Abrir Hall da Mastery</button>` : ""}</div>
     </div>
     <div class="sidebar-foot">
       <button class="add-btn" id="btn-add"><span class="foot-icon">＋</span><span class="foot-label">Adicionar jogo</span></button>
       <button class="import-btn" id="btn-import-all" title="Trazer de uma vez todos os jogos em que você já tem conquistas"><span class="foot-icon">⤓</span><span class="foot-label">Importar meus jogos</span></button>
     </div>
   </aside>`;
+}
+
+async function enterHall() {
+  S.view = "hall";
+  stopPolling();
+  S.library = await backend.library();
+  S.hall = await backend.masteryHall().catch(() => ({ ok: false, mastery: [], softcore: [] }));
+  renderHall();
+}
+
+function renderHall() {
+  const hall = S.hall || { mastery: [], softcore: [] };
+  const all = [...(hall.mastery || []), ...(hall.softcore || [])];
+  const platforms = [...new Set(all.map((g) => g.platform).filter(Boolean))].sort();
+  const filter = (list) => S.hallPlatform === "all" ? list : list.filter((g) => g.platform === S.hallPlatform);
+  const card = (game, kind) => {
+    const completion = game.completion || {};
+    const score = game.score || {};
+    const cover = game.art?.cover || game.art?.box;
+    const date = kind === "mastery" ? completion.mastery_date : completion.softcore_date;
+    const event = [...((game.completion_events || {}).events || [])].reverse().find((e) => e.kind === kind);
+    return `<article class="hall-card ${kind}" style="--jogo:${corDe(game)}">
+      <div class="hall-cover">${cover ? `<img src="${esc(cover)}" alt="">` : `<span>${esc(initials(game.title))}</span>`}<i>${kind === "mastery" ? "★" : "100%"}</i></div>
+      <div class="hall-card-body"><small>${kind === "mastery" ? "MASTERY HARDCORE" : "CONCLUSÃO SOFTCORE"}</small><h3>${esc(game.title)}</h3><p>${esc(game.platform || "Plataforma não informada")}</p>
+      <div class="hall-stats"><span><b>${kind === "mastery" ? score.hardcore || 0 : score.earned || 0}</b> pontos</span>${game.playtime?.label ? `<span><b>${esc(game.playtime.label)}</b> tempo RA</span>` : ""}${date ? `<span><b>${esc(date)}</b> conclusão</span>` : ""}</div>
+      <div class="hall-actions"><button data-hall-open="${esc(game.slug)}">Abrir jogo</button><button data-hall-replay="${esc(game.slug)}" data-event="${esc(event?.id || "")}">Rever celebração</button></div></div>
+    </article>`;
+  };
+  root.innerHTML = `${sidebarHTML()}<main class="main hall-main"><div class="hall-hero"><span>✦ ARQUIVO DE CONQUISTAS</span><h1>Hall da Mastery</h1><p>Seu espaço VIP de conclusões. Pontos e tempo são registrados oficialmente pela RetroAchievements.</p><select id="hall-platform"><option value="all">Todas as plataformas</option>${platforms.map((p) => `<option value="${esc(p)}" ${S.hallPlatform === p ? "selected" : ""}>${esc(p)}</option>`).join("")}</select></div>
+    <div class="hall-scroll" data-scroll="hall"><section class="hall-section mastery"><div class="hall-section-title"><div><span>★</span><h2>Hall da Mastery</h2></div><b>${filter(hall.mastery || []).length}</b></div><div class="hall-grid">${filter(hall.mastery || []).map((g) => card(g, "mastery")).join("") || `<p class="hall-empty">Nenhuma Mastery nesta seleção ainda.</p>`}</div></section>
+    <section class="hall-section softcore"><div class="hall-section-title"><div><span>◇</span><h2>Conclusões 100%</h2></div><b>${filter(hall.softcore || []).length}</b></div><div class="hall-grid">${filter(hall.softcore || []).map((g) => card(g, "softcore")).join("") || `<p class="hall-empty">Nenhuma conclusão Softcore nesta seleção.</p>`}</div></section></div></main>`;
+  bindSidebar();
+  $("#hall-platform")?.addEventListener("change", (e) => { S.hallPlatform = e.target.value; renderHall(); });
+  root.querySelectorAll("[data-hall-open]").forEach((b) => b.onclick = async () => { S.activeSlug = b.dataset.hallOpen; await backend.setActiveGame(S.activeSlug).catch(() => null); await enterDashboard(); });
+  root.querySelectorAll("[data-hall-replay]").forEach((b) => b.onclick = async () => {
+    const label = b.textContent;
+    b.disabled = true; b.textContent = "Abrindo…";
+    try {
+      const res = await backend.reopenCompletionEvent(b.dataset.hallReplay, b.dataset.event);
+      if (!res?.ok) return toast(res?.error || "Não foi possível rever a comemoração.", true);
+      showCompletionCelebration({ ...res.event, game: res.game, slug: b.dataset.hallReplay }, true);
+    } catch (error) {
+      toast(`Não foi possível rever a comemoração: ${error}`, true);
+    } finally {
+      b.disabled = false; b.textContent = label;
+    }
+  });
 }
 
 function mainHTML(game) {
@@ -917,6 +1178,9 @@ function mainHTML(game) {
       <p>Use "Adicionar Jogo" para importar seu primeiro título da RetroAchievements.</p>
     </div></main>`;
   }
+  // A antiga aba Mastery foi incorporada a Conquistas. Converta estados
+  // persistidos por versões anteriores sem mandar o usuário para uma tela vazia.
+  if (S.tab === "mastery") S.tab = "walk";
   const { t, e, pct } = totals(game);
   const le = game.last_earned;
   const tips = (game.guide || []).length;
@@ -966,6 +1230,7 @@ function mainHTML(game) {
               <div class="hero-bar" title="Progresso de Mastery: ${mst.hardcore || 0} de ${t} em hardcore">
                 <i style="width:${mst.percent || 0}%"></i>
               </div>
+              <div class="hero-ra-meta"><span>${game.score?.earned || 0}/${game.score?.available || 0} pts</span>${game.playtime?.label ? `<span title="Tempo registrado pela RetroAchievements">◷ ${esc(game.playtime.label)}</span>` : ""}</div>
             </div>
             ${le ? `<div class="hero-achievement-card">
               <span class="spark">✦</span>
@@ -979,8 +1244,7 @@ function mainHTML(game) {
     <div class="panel-tabs">
       <span class="tab-bumper">LB</span>
       <button class="ptab ${S.tab === "overview" ? "active" : ""}" data-tab="overview"><b>▦</b> Visão geral</button>
-      <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk"><b>⚑</b> Walkthrough</button>
-      <button class="ptab ${S.tab === "mastery" ? "active" : ""}" data-tab="mastery"><b>♜</b> Conquistas${mst.softcore_only ? `<span class="count">${mst.softcore_only}</span>` : ""}</button>
+      <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk"><b>♜</b> Conquistas${mst.softcore_only ? `<span class="count">${mst.softcore_only}</span>` : ""}</button>
       <button class="ptab ${S.tab === "tips" ? "active" : ""}" data-tab="tips"><b>✦</b> Guia Inteligente${(smartDoc.chapters || []).length ? `<span class="count">${smartDoc.chapters.length}</span>` : tips ? `<span class="count">${tips}</span>` : ""}</button>
       <span class="tab-bumper">RB</span>
     </div>
@@ -1008,10 +1272,10 @@ function mainHTML(game) {
           <ul>${nextSteps.length ? nextSteps.map((b, i) => `<li class="${i ? "" : "done"}">${esc(b.title || b.text || `Passo ${i + 1}`)}</li>`).join("") : `<li>Organize o guia para receber os próximos passos.</li>`}</ul>
           <i>${smartDone} concluídos <b>→</b></i>
         </div>
-        <div class="guide-progress-strip">
+        <button class="guide-progress-strip" data-open-achievements title="Abrir conquistas e ordem recomendada">
           <span class="progress-trophy">♜</span><div><small>PROGRESSO DE CONQUISTAS</small><strong>${e}/${t} (${pct}%)</strong></div>
           <div class="guide-progress-bar"><i style="width:${pct}%"></i></div><span>${Math.max(0, t - e)} restantes</span><b>→</b>
-        </div>
+        </button>
       </div>
       <aside class="activity-side-grid">
         <div class="activity-card missable ${missables ? "warn" : "clear"}">
@@ -1027,79 +1291,38 @@ function mainHTML(game) {
         </button>
       </aside>
     </section>` : ""}
-    ${S.tab === "tips" ? guideHTML(game) : S.tab === "mastery" ? masteryHTML(game) : S.tab === "overview" ? guideHTML(game) : walkHTML(game)}
+    ${S.tab === "tips" ? guideHTML(game) : S.tab === "overview" ? guideHTML(game) : achievementsHTML(game)}
   </main>`;
 }
 
-/* ============================ ABA MASTERY ============================== */
-/* O Mastery da RetroAchievements exige 100% em hardcore — savestate, rewind e
-   cheat desqualificam o desbloqueio. Esta aba mostra o quanto falta e, mais
-   útil, QUAIS conquistas você tem só em softcore e precisaria refazer. */
-function masteryHTML(game) {
+/* ======================= CONQUISTAS + ROTEIRO ========================== */
+/* Progresso, porcentagem e ordem recomendada moram na mesma sessão. O filtro
+   substitui a antiga troca constante entre Walkthrough e Mastery. */
+function achievementsHTML(game) {
   const m = game.mastery || {};
   const total = m.total || 0;
-  const bar = (label, value, color, extra = "") => {
-    const pct = total ? Math.round((value / total) * 100) : 0;
-    return `<div class="ms-row">
-      <div class="ms-row-head">
-        <span class="ms-label">${label}</span>
-        <span class="ms-num" style="color:${color}">${value}/${total} · ${pct}%</span>
-      </div>
-      <div class="ms-bar"><div class="ms-fill" style="width:${pct}%;background:${color}"></div></div>
-      ${extra ? `<p class="ms-note">${extra}</p>` : ""}
-    </div>`;
-  };
-
+  const hardPct = total ? Math.round(((m.hardcore || 0) / total) * 100) : 0;
+  const earnedPct = total ? Math.round(((m.earned || 0) / total) * 100) : 0;
   const softIds = new Set(m.softcore_ids || []);
-  const softRows = (game.achievements || []).filter((a) => softIds.has(a.id));
-  const badge = (a) => a.badge_url
-    ? `<div class="ach-badge soft" style="background-image:url('${esc(a.badge_url)}')"></div>`
-    : `<div class="ach-badge soft">🏆</div>`;
-
-  const header = m.complete
-    ? `<div class="ms-done">★ MASTERY COMPLETO — ${total}/${total} em hardcore</div>`
-    : `<div class="ms-remaining">FALTAM <b>${m.remaining || 0}</b> ${(m.remaining === 1) ? "CONQUISTA" : "CONQUISTAS"} PARA O MASTERY</div>`;
-
-  const list = softRows.length ? `
-    <p class="list-title" style="margin-top:22px">○ SÓ EM SOFTCORE (${softRows.length})</p>
-    <p class="ms-hint">Destravadas com savestate/rewind. Para o Mastery precisam ser refeitas em hardcore.</p>
-    ${softRows.map((a) => `<div class="ach-row soft">
-      ${badge(a)}
-      <div class="ach-body">
-        <div class="ach-titleline">
-          <span class="ach-name">${esc(a.name)}</span>
-          ${modeTag("softcore")}
-        </div>
-        <div class="ach-desc">${esc(a.desc)}</div>
-      </div>
-      <span class="ach-date">${esc(a.date || "")}</span>
-    </div>`).join("")}` : "";
-
-  return `<div class="list-wrap">
-    <p class="list-title">PROGRESSO DE MASTERY</p>
-    ${bar("⚡ HARDCORE", m.hardcore || 0, MODE_COLOR.hardcore)}
-    ${bar("○ SÓ EM SOFTCORE", m.softcore_only || 0, MODE_COLOR.softcore)}
-    ${header}
-    ${list}
-    ${!softRows.length && !m.complete ? `<p class="ms-hint" style="margin-top:16px">Nenhuma conquista presa em softcore — tudo o que você destravou já vale Mastery.</p>` : ""}
-  </div>`;
-}
-
-function walkHTML(game) {
   const nextIds = game.next_ids || [];
   const badge = (a) => a.badge_url
     ? `<div class="ach-badge ${a.earned ? "" : "locked"}" style="background-image:url('${esc(a.badge_url)}')"></div>`
     : `<div class="ach-badge ${a.earned ? "" : "locked"}">${a.earned ? "🏆" : "🔒"}</div>`;
 
-  // agrupa visualmente por etapa/área
+  const filter = S.achievementFilter || "all";
+  const visible = (game.achievements || []).filter((a) => {
+    if (filter === "pending") return !a.earned;
+    if (filter === "softcore") return softIds.has(a.id);
+    return true;
+  });
   let rows = "", lastStep = null;
-  for (const a of game.achievements) {
+  for (const a of visible) {
     if (a.step !== lastStep) {
       lastStep = a.step;
       if (a.area) rows += `<p class="step-area">▸ ETAPA ${a.step} — ${esc(a.area)}</p>`;
     }
     const isNext = nextIds.includes(a.id);
-    rows += `<div class="ach-row ${isNext ? "next" : ""} ${a.earned || isNext ? "" : "locked"}">
+    rows += `<div class="ach-row ${isNext ? "next" : ""} ${a.earned || isNext ? "" : "locked"}" data-ach-state="${softIds.has(a.id) ? "softcore" : a.earned ? "earned" : "pending"}">
       ${badge(a)}
       <div class="ach-body">
         <div class="ach-titleline">
@@ -1112,11 +1335,27 @@ function walkHTML(game) {
       ${a.earned ? `<span class="ach-check" style="color:${modeColor(a.mode)}">✓</span>` : ""}
     </div>`;
   }
-  return `<div class="list-wrap">
-    <p class="list-title">ORDEM DO WALKTHROUGH</p>
-    ${rows || `<p style="color:var(--text-low);font-size:11px">Sem conquistas no walkthrough.</p>`}
+  const status = m.complete
+    ? `<div class="ms-done">★ MASTERY COMPLETO — ${total}/${total} em hardcore</div>`
+    : `<div class="ms-remaining">FALTAM <b>${m.remaining || 0}</b> ${(m.remaining === 1) ? "CONQUISTA" : "CONQUISTAS"} PARA O MASTERY</div>`;
+  const filterButton = (id, label, count = "") => `<button class="achievement-filter ${filter === id ? "on" : ""}" data-ach-filter="${id}">${label}${count !== "" ? `<span>${count}</span>` : ""}</button>`;
+  return `<div class="list-wrap achievements-hub">
+    <section class="achievement-overview">
+      <div class="achievement-overview-head"><div><small>PROGRESSO DE CONQUISTAS</small><h2>${hardPct}% Mastery</h2></div><div class="achievement-score"><b>${game.score?.hardcore || 0}</b><span>pontos hardcore</span></div></div>
+      <div class="achievement-progress-grid">
+        <div class="ms-row"><div class="ms-row-head"><span class="ms-label">⚡ HARDCORE</span><span class="ms-num" style="color:${MODE_COLOR.hardcore}">${m.hardcore || 0}/${total} · ${hardPct}%</span></div><div class="ms-bar"><div class="ms-fill" style="width:${hardPct}%;background:${MODE_COLOR.hardcore}"></div></div></div>
+        <div class="ms-row"><div class="ms-row-head"><span class="ms-label">○ TOTAL OBTIDO</span><span class="ms-num" style="color:${MODE_COLOR.softcore}">${m.earned || 0}/${total} · ${earnedPct}%</span></div><div class="ms-bar"><div class="ms-fill" style="width:${earnedPct}%;background:${MODE_COLOR.softcore}"></div></div></div>
+      </div>
+      ${status}
+    </section>
+    <div class="achievement-list-head"><div><p class="list-title">ORDEM RECOMENDADA</p><span>Conquistas organizadas pelo walkthrough importado.</span></div><div class="achievement-filters">${filterButton("all", "Todas", total)}${filterButton("pending", "Pendentes", m.remaining || 0)}${filterButton("softcore", "Só softcore", m.softcore_only || 0)}</div></div>
+    ${rows || `<p class="achievement-empty">Nenhuma conquista corresponde a este filtro.</p>`}
   </div>`;
 }
+
+// Contratos antigos ainda podem chamar estes nomes durante uma atualização.
+const masteryHTML = achievementsHTML;
+const walkHTML = achievementsHTML;
 
 /* Renderiza as seções de dicas/tutoriais extraídas do PDF do guia. */
 function guideHTML(game) {
@@ -1387,11 +1626,15 @@ async function acompanharDicasIa() {
 }
 
 function bindSidebar() {
+  $("#hall-entry")?.addEventListener("click", enterHall);
+  $("#library-open-hall")?.addEventListener("click", enterHall);
   root.querySelectorAll(".tile").forEach((b) => {
     b.onclick = async () => {
       S.activeSlug = b.dataset.slug;
+      await backend.setActiveGame(S.activeSlug).catch(() => null);
       closeLibraryDrawer();
-      await renderDashboard();
+      if (S.view === "hall") await enterDashboard();
+      else await renderDashboard();
     };
   });
   $("#library-scrim")?.addEventListener("click", closeLibraryDrawer);
@@ -1411,6 +1654,16 @@ function bindSidebar() {
   });
   root.querySelectorAll(".ptab").forEach((b) => {
     b.onclick = () => { S.tab = b.dataset.tab; renderDashboard(); };
+  });
+  root.querySelectorAll("[data-ach-filter]").forEach((b) => {
+    b.onclick = () => {
+      S.achievementFilter = b.dataset.achFilter || "all";
+      renderDashboard({ force: true });
+    };
+  });
+  $("[data-open-achievements]")?.addEventListener("click", () => {
+    S.tab = "walk";
+    renderDashboard({ force: true });
   });
   $("#smart-generate")?.addEventListener("click", gerarSmartGuide);
   $("#guide-consent")?.addEventListener("click", () => enterSettings("experience", { slug: S.activeSlug, tab: "tips" }));
@@ -1582,14 +1835,20 @@ function settingsSnapshot(section) {
     overlay_second_screen: !!e.overlay_second_screen, overlay_fit_emulator: !!e.overlay_fit_emulator,
   };
   if (section === "compact") return {
+    compact_summary_enabled: cc.surfaces?.summary?.enabled ?? ["minimal", "both"].includes(cc.view || cc.variant || "minimal"),
+    compact_details_enabled: cc.surfaces?.details?.enabled ?? ["expanded", "both"].includes(cc.view || cc.variant || "minimal"),
+    compact_summary_corner: cc.surfaces?.summary?.corner || "top-right",
+    compact_details_corner: cc.surfaces?.details?.corner || "bottom-right",
     compact_size_mode: cc.size_mode || "auto",
+    compact_view: cc.view || cc.variant || "minimal",
     compact_width: Number(cc.width || 320), compact_height: Number(cc.height || 110),
     compact_expanded_width: Number(cc.expanded_width || 420),
     compact_expanded_height: Number(cc.expanded_height || 300),
-    compact_last: Number(cc.last || 2), compact_next: Number(cc.next || 0),
-    compact_content: cc.content || "objective", compact_corner: cc.corner || "auto",
+    compact_last: Math.min(3, Number(cc.last ?? 3)), compact_next: Number(cc.next || 0),
+    compact_corner: cc.corner || "auto",
     compact_background_mode: cc.background_mode || "background",
     compact_hotkey: cc.hotkey || "ctrl+alt+g",
+    compact_edit_hotkey: cc.edit_hotkey || "ctrl+alt+e",
     compact_auto_expand: !!cc.auto_expand,
     compact_auto_collapse_seconds: Number(cc.auto_collapse_seconds || 0),
   };
@@ -1638,16 +1897,31 @@ function renderSettings() {
   const ovState = ov.detected ? `${esc(ov.process || "processo desconhecido")} · ${esc(ov.title || "sem título")}` : (ov.error ? esc(ov.error) : "Nenhum emulador detectado agora");
   const upText = up.update_available ? `Versão ${esc(up.latest_version)} disponível` : (up.phase === "error" ? esc(up.error || "Falha ao consultar") : "Você está na versão atual");
   const field = (key, value, type = "text", extra = "") => `<input class="set-field" data-draft-field="${key}" type="${type}" value="${esc(value ?? "")}" ${extra} />`;
-  const panel = id === "account" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Conta conectada</h3><div class="set-row"><div><div class="set-txt">RetroAchievements</div><div class="set-sub">${estado.username ? esc(estado.username) : "não conectada"}</div></div><button class="btn-ghost" id="set-reconnect">Trocar conta</button></div></div>
+  let panel = id === "account" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Conta conectada</h3><div class="set-row"><div><div class="set-txt">RetroAchievements</div><div class="set-sub">${estado.username ? esc(estado.username) : "não conectada"}</div></div><button class="btn-ghost" id="set-reconnect">Trocar conta</button></div></div>
     <div class="settings-card"><h3>Atualizações</h3><div class="set-row"><div><div class="set-txt">DigiTracker ${esc(estado.version || S.version)}</div><div class="set-sub">${upText}</div></div><button class="btn-ghost" id="set-update-check">Procurar agora</button></div>${settingsToggle("auto_check_updates", draft.auto_check_updates, "Procurar atualizações ao iniciar", "Apenas releases estáveis; a instalação sempre pede confirmação")}</div>`)
   : id === "experience" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Experiência DigiTracker Console</h3><p class="set-hint">Combina a apresentação cinematográfica da PSN, a navegação do Steam Deck e a identidade do DigiTracker. O Guia Inteligente nunca apaga sua fonte importada.</p>${settingsToggle("smart_guide_auto", draft.smart_guide_auto, "Organizar guias automaticamente", "Depois de cada importação, cria uma revisão compacta e validada")}${settingsToggle("smart_guide_consent", draft.smart_guide_consent, "Permitir envio do guia à IA", "O provedor configurado pode cobrar pelo processamento. Imagens pesquisadas continuam exigindo aprovação")}${settingsToggle("reduced_motion", draft.reduced_motion, "Reduzir animações", "Remove transições de profundidade e movimentos não essenciais")}</div><div class="settings-card"><div class="experience-grid"><div><label class="set-label">Densidade</label><select class="set-field" data-draft-field="guide_density"><option value="comfortable" ${draft.guide_density === "comfortable" ? "selected" : ""}>Confortável adaptável</option><option value="compact" ${draft.guide_density === "compact" ? "selected" : ""}>Compacta</option></select></div><div><label class="set-label">Escala da interface: <b id="settings-scale-label">${draft.ui_scale}%</b></label><input class="set-range" data-draft-field="ui_scale" type="range" min="80" max="140" step="5" value="${draft.ui_scale}"></div></div></div>`)
   : id === "ai" ? settingsPanelFrame(id, ia ? `<div class="settings-card"><h3>Provedor ativo</h3><div class="ai-providers">${ia.providers.map((p) => `<button class="ai-prov ${p.id === draft.provider ? "on" : ""}" data-settings-provider="${esc(p.id)}"><span class="ai-prov-name">${esc(p.label)}</span>${p.has_key ? `<span class="ai-prov-ok">✓ chave salva</span>` : ""}</button>`).join("")}</div></div><div class="settings-card"><label class="set-label">Chave da API${(ia.providers.find((p) => p.id === draft.provider) || {}).has_key ? " (salva — deixe em branco para manter)" : ""}</label>${field("api_key", "", "password", `placeholder="${((ia.providers.find((p) => p.id === draft.provider) || {}).has_key) ? "••••••••••••••••" : "cole a chave aqui"}" autocomplete="off"`)}<button class="btn-ghost settings-inline-action ${draft.clear_key ? "selected" : ""}" data-ai-clear>${draft.clear_key ? "Chave será removida" : "Remover chave salva"}</button><label class="set-label">Modelo</label>${field("model", draft.model, "text", "autocomplete=off")}${(ia.providers.find((p) => p.id === draft.provider) || {}).needs_base_url ? `<label class="set-label">Endpoint (OpenRouter, Ollama, LM Studio…)</label>${field("base_url", draft.base_url, "text", "autocomplete=off")}` : ""}<p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.</p></div>` : `<div class="settings-card"><h3>Inteligência artificial</h3><p class="set-hint">Indisponível no modo demonstração.</p></div>`)
   : id === "images" ? settingsPanelFrame(id, `<p class="set-hint settings-intro">Configure as fontes opcionais de capas e fundos. As credenciais só serão enviadas quando você salvar esta sessão.</p>${[["steamgriddb","SteamGridDB","Capas da comunidade.",ready.steamgriddb],["rawg","RAWG","Fundos e screenshots para jogos retrô.",ready.rawg],["igdb","IGDB","Capas de qualidade via Twitch.",ready.igdb]].map(([key,label,sub,has]) => `<div class="src-cfg settings-card"><h3>${label} ${has ? "✓" : ""}</h3><p class="set-hint">${sub}</p>${field(`${key}.key1`, "", key === "igdb" ? "text" : "password", `placeholder="${has ? "•••••••• (salva — em branco mantém)" : (key === "igdb" ? "Twitch Client ID" : "chave da API")}" autocomplete="off"`)}${key === "igdb" ? field(`${key}.key2`, "", "password", `placeholder="${has ? "•••• (segredo salvo — em branco mantém)" : "Twitch Client Secret"}" autocomplete="off"`) : ""}<button class="btn-ghost settings-inline-action ${draft[key].clear ? "selected" : ""}" data-source-clear="${key}">${draft[key].clear ? "Fonte será removida" : "Remover credencial salva"}</button></div>`).join("")}`)
   : id === "library" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Entrada de jogos</h3>${settingsToggle("auto_import", draft.auto_import, "Importar jogos novos automaticamente", "Verifica a cada 5 minutos e traz os jogos em que você começou a jogar")}</div>`)
   : id === "overlay" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Comportamento</h3>${settingsToggle("auto_overlay", draft.auto_overlay, "Grudar no emulador", "Vira overlay e acompanha a janela quando um emulador abre")}${settingsToggle("overlay_exit_fullscreen", draft.overlay_exit_fullscreen, "Sair do fullscreen exclusivo", "Manda Alt+Enter para o emulador quando autorizado")}${settingsToggle("overlay_second_screen", draft.overlay_second_screen, "Usar o segundo monitor", "Leva o overlay para a tela que o jogo não ocupa")}${settingsToggle("overlay_fit_emulator", draft.overlay_fit_emulator, "Ajustar ao tamanho do emulador", "Mantém o overlay proporcional à janela do emulador")}</div><div class="overlay-diag settings-card ${ov.detected ? "ok" : ""}"><h3>Diagnóstico de detecção</h3><div class="set-sub">${ovState}</div><div class="overlay-diag-grid"><span>Área interna</span><code>${esc(ovRect)}</code><span>Overlay</span><code>${esc((ov.overlay_size || []).join(" × ") || "—")}</code><span>Posição</span><code>${esc((ov.dock || []).join(", ") || "—")}</code><span>Modo nativo</span><code>${esc(ov.native_input_mode || "—")}</code><span>Hotkey</span><code>${esc(ov.hotkey || "—")}${ov.hotkey_error ? ` · ${esc(ov.hotkey_error)}` : ""}</code></div><button class="btn-ghost" id="overlay-test">Testar detecção agora</button></div>`)
-  : settingsPanelFrame(id, `<div class="settings-card"><h3>HUD passivo</h3><p class="set-hint">O overlay não captura foco, mouse, teclado ou controle durante a gameplay. A hotkey alterna oculto, mínimo e expandido.</p><div class="set-grid2"><div><label class="set-label">Tamanho</label><select class="set-field" data-draft-field="compact_size_mode"><option value="auto" ${draft.compact_size_mode === "auto" ? "selected" : ""}>Adaptar ao emulador</option><option value="manual" ${draft.compact_size_mode === "manual" ? "selected" : ""}>Manual</option></select></div><div><label class="set-label">Conteúdo expandido</label><select class="set-field" data-draft-field="compact_content"><option value="objective" ${draft.compact_content === "objective" ? "selected" : ""}>Próximo objetivo + alerta</option><option value="achievements" ${draft.compact_content === "achievements" ? "selected" : ""}>Conquistas</option><option value="guide" ${draft.compact_content === "guide" ? "selected" : ""}>Guia Inteligente</option></select></div><div><label class="set-label">HUD mínimo · largura</label>${field("compact_width", draft.compact_width, "number", "min=260 max=380")}</div><div><label class="set-label">HUD mínimo · altura</label>${field("compact_height", draft.compact_height, "number", "min=90 max=120")}</div><div><label class="set-label">HUD expandido · largura</label>${field("compact_expanded_width", draft.compact_expanded_width, "number", "min=360 max=520")}</div><div><label class="set-label">HUD expandido · altura</label>${field("compact_expanded_height", draft.compact_expanded_height, "number", "min=240 max=360")}</div><div><label class="set-label">Canto</label><select class="set-field" data-draft-field="compact_corner"><option value="auto" ${draft.compact_corner === "auto" ? "selected" : ""}>Automático (preferir superior direito)</option><option value="top-right" ${draft.compact_corner === "top-right" ? "selected" : ""}>Superior direito</option><option value="bottom-right" ${draft.compact_corner === "bottom-right" ? "selected" : ""}>Inferior direito</option><option value="top-left" ${draft.compact_corner === "top-left" ? "selected" : ""}>Superior esquerdo</option><option value="bottom-left" ${draft.compact_corner === "bottom-left" ? "selected" : ""}>Inferior esquerdo</option></select></div></div></div><div class="settings-card"><h3>Fundo do modo compacto</h3><p class="set-hint">O painel é sempre opaco. A arte escolhida aparece dentro do HUD com uma máscara escura para manter o texto legível.</p><div class="set-grid2"><div><label class="set-label">Arte usada no HUD</label><select class="set-field" data-draft-field="compact_background_mode"><option value="background" ${draft.compact_background_mode === "background" ? "selected" : ""}>Fundo do jogo (recomendado)</option><option value="cover" ${draft.compact_background_mode === "cover" ? "selected" : ""}>Capa do jogo</option><option value="title" ${draft.compact_background_mode === "title" ? "selected" : ""}>Arte de título</option><option value="solid" ${draft.compact_background_mode === "solid" ? "selected" : ""}>Cor sólida</option></select></div><div class="settings-art-action"><label class="set-label">Fundo do jogo atual</label><button class="btn-ghost" id="compact-art-picker" ${S.activeSlug ? "" : "disabled"}>Escolher imagem…</button></div></div></div><div class="settings-card"><h3>Hotkey e eventos</h3><div class="set-grid2"><div><label class="set-label">Hotkey</label>${field("compact_hotkey", draft.compact_hotkey, "text", "placeholder=ctrl+alt+g autocomplete=off")}</div><div>${settingsToggle("compact_auto_expand", draft.compact_auto_expand, "Expandir ao obter conquista", "Desligado por padrão para preservar a imersão")}</div><div><label class="set-label">Recolher automaticamente (segundos)</label>${field("compact_auto_collapse_seconds", draft.compact_auto_collapse_seconds, "number", "min=0 max=60")}</div></div></div><div class="settings-card"><h3>Conteúdo</h3><div class="set-grid2"><div><label class="set-label">Últimas conquistas</label>${field("compact_last", draft.compact_last, "number", "min=0 max=10")}</div><div><label class="set-label">Próximas conquistas</label>${field("compact_next", draft.compact_next, "number", "min=0 max=10")}</div></div></div>`);
+  : settingsPanelFrame(id, `<div class="settings-card"><h3>HUD passivo</h3><p class="set-hint">Durante a gameplay, os HUDs passam cliques e não capturam teclado, mouse ou controle. Use a hotkey de edição para arrastar, redimensionar ou trocar o visual.</p><div class="set-grid2"><div><label class="set-label">Visual ao abrir</label><select class="set-field" data-draft-field="compact_view"><option value="minimal" ${draft.compact_view === "minimal" ? "selected" : ""}>Resumo mínimo</option><option value="expanded" ${draft.compact_view === "expanded" ? "selected" : ""}>Troféus</option><option value="both" ${draft.compact_view === "both" ? "selected" : ""}>Resumo + troféus</option></select></div><div><label class="set-label">Tamanho</label><select class="set-field" data-draft-field="compact_size_mode"><option value="auto" ${draft.compact_size_mode === "auto" ? "selected" : ""}>Adaptar ao emulador</option><option value="manual" ${draft.compact_size_mode === "manual" ? "selected" : ""}>Manual</option></select></div><div><label class="set-label">HUD mínimo · largura</label>${field("compact_width", draft.compact_width, "number", "min=260 max=380")}</div><div><label class="set-label">HUD mínimo · altura</label>${field("compact_height", draft.compact_height, "number", "min=90 max=130")}</div><div><label class="set-label">HUD de troféus · largura</label>${field("compact_expanded_width", draft.compact_expanded_width, "number", "min=340 max=560")}</div><div><label class="set-label">HUD de troféus · altura</label>${field("compact_expanded_height", draft.compact_expanded_height, "number", "min=220 max=480")}</div><div><label class="set-label">Canto</label><select class="set-field" data-draft-field="compact_corner"><option value="auto" ${draft.compact_corner === "auto" ? "selected" : ""}>Automático (preferir superior direito)</option><option value="top-right" ${draft.compact_corner === "top-right" ? "selected" : ""}>Superior direito</option><option value="bottom-right" ${draft.compact_corner === "bottom-right" ? "selected" : ""}>Inferior direito</option><option value="top-left" ${draft.compact_corner === "top-left" ? "selected" : ""}>Superior esquerdo</option><option value="bottom-left" ${draft.compact_corner === "bottom-left" ? "selected" : ""}>Inferior esquerdo</option></select></div></div></div><div class="settings-card"><h3>Fundo do modo compacto</h3><p class="set-hint">O painel é sempre opaco. A arte escolhida aparece dentro do HUD com uma máscara escura para manter o texto legível.</p><div class="set-grid2"><div><label class="set-label">Arte usada no HUD</label><select class="set-field" data-draft-field="compact_background_mode"><option value="background" ${draft.compact_background_mode === "background" ? "selected" : ""}>Fundo do jogo (recomendado)</option><option value="cover" ${draft.compact_background_mode === "cover" ? "selected" : ""}>Capa do jogo</option><option value="title" ${draft.compact_background_mode === "title" ? "selected" : ""}>Arte de título</option><option value="solid" ${draft.compact_background_mode === "solid" ? "selected" : ""}>Cor sólida</option></select></div><div class="settings-art-action"><label class="set-label">Fundo do jogo atual</label><button class="btn-ghost" id="compact-art-picker" ${S.activeSlug ? "" : "disabled"}>Escolher imagem…</button></div></div></div><div class="settings-card"><h3>Hotkeys e recuperação</h3><div class="set-grid2"><div><label class="set-label">Mostrar / ocultar</label>${field("compact_hotkey", draft.compact_hotkey, "text", "placeholder=ctrl+alt+g autocomplete=off")}</div><div><label class="set-label">Editar por 15 segundos</label>${field("compact_edit_hotkey", draft.compact_edit_hotkey, "text", "placeholder=ctrl+alt+e autocomplete=off")}</div><div>${settingsToggle("compact_auto_expand", draft.compact_auto_expand, "Mostrar troféus ao obter conquista", "Desligado por padrão para preservar a imersão")}</div><div><label class="set-label">Recolher automaticamente (segundos)</label>${field("compact_auto_collapse_seconds", draft.compact_auto_collapse_seconds, "number", "min=0 max=60")}</div></div></div><div class="settings-card"><h3>Conquistas responsivas</h3><p class="set-hint">O HUD calcula automaticamente quantas linhas completas cabem. São exibidas no máximo três conquistas recentes e o espaço restante recebe as próximas.</p><div class="set-grid2"><div><label class="set-label">Máximo de obtidas recentes</label>${field("compact_last", draft.compact_last, "number", "min=0 max=3")}</div></div></div>`);
 
+  if (id === "compact") {
+    const corners = (value) => `<option value="top-right" ${value === "top-right" ? "selected" : ""}>Superior direito</option><option value="bottom-right" ${value === "bottom-right" ? "selected" : ""}>Inferior direito</option><option value="top-left" ${value === "top-left" ? "selected" : ""}>Superior esquerdo</option><option value="bottom-left" ${value === "bottom-left" ? "selected" : ""}>Inferior esquerdo</option>`;
+    const surfaceCard = `<div class="settings-card compact-surfaces-card"><h3>Janelas independentes</h3><p class="set-hint">Resumo e Conquistas/Guia são janelas separadas. Você pode usar uma ou ambas e posicioná-las individualmente.</p>${settingsToggle("compact_summary_enabled", draft.compact_summary_enabled, "Mostrar Resumo", "Capa, próximo objetivo e progresso")}${settingsToggle("compact_details_enabled", draft.compact_details_enabled, "Mostrar Conquistas/Guia", "Painel separado com as duas abas")}<div class="set-grid2"><div><label class="set-label">Canto inicial do Resumo</label><select class="set-field" data-draft-field="compact_summary_corner">${corners(draft.compact_summary_corner)}</select></div><div><label class="set-label">Canto inicial de Conquistas/Guia</label><select class="set-field" data-draft-field="compact_details_corner">${corners(draft.compact_details_corner)}</select></div></div></div>`;
+    panel = panel.replace(`<div class="settings-panel-scroll" id="settings-panel-scroll">`, `<div class="settings-panel-scroll" id="settings-panel-scroll">${surfaceCard}`);
+  }
+  if (id === "images") {
+    const webCard = `<div class="settings-card"><h3>Google Imagens / Web ✓</h3><p class="set-hint">Fonte padrão, sem chave. A consulta direta ao Google é experimental; se houver CAPTCHA ou mudança no site, o DigiTracker usa resultados relevantes do Yandex e, por último, do Bing. O mecanismo usado é identificado e nenhuma arte é aplicada sem sua escolha.</p></div>`;
+    panel = panel.replace(`<div class="settings-panel-scroll" id="settings-panel-scroll">`, `<div class="settings-panel-scroll" id="settings-panel-scroll">${webCard}`);
+  }
   root.innerHTML = `<div class="view"><div class="wiz-head"><button class="back" id="set-back" title="Voltar">←</button><div><div class="t">Configurações</div><div class="s">Central de controle · sessão independente</div></div></div><div class="settings"><div class="settings-shell"><nav class="settings-nav" aria-label="Categorias das configurações"><p>Preferências</p>${Object.entries(SETTINGS_META).map(([key,meta]) => `<button class="set-nav-btn ${id === key ? "active" : ""}" data-set-target="${key}"><span>${meta[0]}</span><span>${esc(meta[1])}</span>${settingsHasChanges(key) ? "<i>•</i>" : ""}</button>`).join("")}</nav><main class="settings-inner">${panel}</main></div></div></div>`;
+  if (id === "compact") {
+    // Os controles legados continuam no DOM apenas para migração das builds
+    // antigas, mas não disputam a decisão com as duas superfícies novas.
+    root.querySelector('[data-draft-field="compact_view"]')?.closest("div")?.setAttribute("hidden", "");
+    root.querySelector('[data-draft-field="compact_corner"]')?.closest("div")?.setAttribute("hidden", "");
+  }
   const scroll = $("#settings-panel-scroll");
   if (scroll) { scroll.scrollTop = S.SET.scroll?.[id] || 0; scroll.onscroll = () => { S.SET.scroll[id] = scroll.scrollTop; }; }
   $("#set-back").onclick = leaveSettings;
@@ -1715,7 +1989,20 @@ async function saveSettingsSession() {
       }
       if (res.ok) S.SET.sources = res.ready;
     } else {
-      const payload = id === "compact" ? draft : draft;
+      const payload = id === "compact" ? {
+        ...draft,
+        compact_surfaces: {
+          version: 1,
+          summary: { enabled: !!draft.compact_summary_enabled, corner: draft.compact_summary_corner },
+          details: { enabled: !!draft.compact_details_enabled, corner: draft.compact_details_corner },
+        },
+      } : draft;
+      if (id === "compact") {
+        delete payload.compact_summary_enabled;
+        delete payload.compact_details_enabled;
+        delete payload.compact_summary_corner;
+        delete payload.compact_details_corner;
+      }
       res = await backend.setSettingsSession(id, payload);
     }
   } catch (e) { res = { ok: false, error: String(e) }; }
@@ -1726,7 +2013,14 @@ async function saveSettingsSession() {
   if (id === "account") S.autoCheckUpdates = !!draft.auto_check_updates;
   if (id === "library") S.autoImport = !!draft.auto_import;
   if (id === "overlay") { S.autoOverlay = !!draft.auto_overlay; S.overlayExitFullscreen = !!draft.overlay_exit_fullscreen; S.overlaySecondScreen = !!draft.overlay_second_screen; S.overlayFitEmulator = !!draft.overlay_fit_emulator; }
-  if (id === "compact") { S.compactCfg = { ok: true, width: draft.compact_width, height: draft.compact_height, expanded_width: draft.compact_expanded_width, expanded_height: draft.compact_expanded_height, last: draft.compact_last, next: draft.compact_next, size_mode: draft.compact_size_mode, content: draft.compact_content, corner: draft.compact_corner, background_mode: draft.compact_background_mode, opacity: 100, hotkey: draft.compact_hotkey, auto_expand: draft.compact_auto_expand, auto_collapse_seconds: draft.compact_auto_collapse_seconds }; S.compactContent = draft.compact_content; }
+  if (id === "compact") {
+    const legacyView = draft.compact_summary_enabled && draft.compact_details_enabled ? "both" : (draft.compact_details_enabled ? "expanded" : "minimal");
+    if (draft.compact_details_enabled) {
+      S.compactTab = "achievements";
+      if (S.activeSlug) await backend.setCompactTab(S.activeSlug, "achievements").catch(() => null);
+    }
+    S.compactCfg = { ok: true, width: draft.compact_width, height: draft.compact_height, expanded_width: draft.compact_expanded_width, expanded_height: draft.compact_expanded_height, last: Math.min(3, draft.compact_last), next: 0, size_mode: draft.compact_size_mode, tab: S.compactTab, view: legacyView, variant: legacyView, surfaces: { version: 1, summary: { enabled: !!draft.compact_summary_enabled, corner: draft.compact_summary_corner }, details: { enabled: !!draft.compact_details_enabled, corner: draft.compact_details_corner } }, corner: draft.compact_corner, background_mode: draft.compact_background_mode, opacity: 100, hotkey: draft.compact_hotkey, edit_hotkey: draft.compact_edit_hotkey, auto_expand: draft.compact_auto_expand, auto_collapse_seconds: draft.compact_auto_collapse_seconds };
+  }
   renderSettings(); toast("Sessão salva com sucesso."); return true;
 }
 
@@ -2098,9 +2392,11 @@ async function gfBaixar(url) {
 const CV_ROLES = [
   { id: "cover", label: "Capa" },
   { id: "background", label: "Fundo" },
+  { id: "icon", label: "Ícone" },
   { id: "both", label: "Ambos" },
 ];
 const CV_SOURCES = [
+  { id: "web", label: "Buscar na web" },
   { id: "steamgriddb", label: "SteamGridDB" },
   { id: "rawg", label: "RAWG" },
   { id: "igdb", label: "IGDB" },
@@ -2111,14 +2407,17 @@ const CV_SRC_LABEL = { steamgriddb: "SteamGridDB", rawg: "RAWG", igdb: "IGDB" };
 async function openCoverPicker(game, initialRole = "cover") {
   const cfg = await backend.getSourcesConfig().catch(() => ({ ready: {} }));
   const ready = (cfg && cfg.ready) || {};
-  const first = ["steamgriddb", "rawg", "igdb"].find((s) => ready[s]) || "steamgriddb";
+  const first = "web";
   S.CV = {
-    slug: game.slug, title: game.title, query: game.title,
+    slug: game.slug, title: game.title, query: `${game.title} ${game.platform || ""}`.trim(),
     source: first, ready, role: initialRole, returnView: S.view, urlValue: "",
-    busy: false, error: "", matches: [], chosen: null, covers: [], heroes: [],
+    busy: false, error: "", blocked: false, openUrl: "", page: 0, safe: "moderate",
+    provider: "google", fallbackUsed: false, webResults: [],
+    palette: game.palette || { primary: corDe(game), secondary: corDe(game) },
+    matches: [], chosen: null, covers: [], heroes: [],
   };
   renderCoverPicker();
-  if (ready[first]) cvBuscar("");   // só busca se a fonte tem chave
+  cvBuscar("");
 }
 
 function closeCoverPicker() {
@@ -2139,9 +2438,12 @@ function renderCoverPicker() {
 
   const outros = (V.matches || []).filter((m) => !V.chosen || m.id !== V.chosen.id);
   const cell = (c, cls) => `
-    <button class="cv-cell ${cls}" data-url="${esc(c.url)}" title="Aplicar (${esc(cvRoleLabel())})">
+    <div class="cv-cell-wrap">
+    <button class="cv-cell ${cls}" data-url="${esc(c.url)}" data-web-index="${V.source === "web" ? (V.webResults || []).indexOf(c) : ""}" title="Aplicar (${esc(cvRoleLabel())})">
       <img src="${esc(c.thumb)}" alt="" loading="lazy" />
-    </button>`;
+      ${c.width && c.height ? `<span>${c.width}×${c.height}</span>` : ""}
+    </button>${c.source_page || c.source ? `<button class="cv-origin" data-origin="${esc(c.source_page || c.source)}" title="Abrir página original">${esc(c.host || c.provider || "origem")}</button>` : ""}
+    </div>`;
   const capas = (V.covers || []).map((c) => cell(c, "portrait")).join("");
   const fundos = (V.heroes || []).map((c) => cell(c, "landscape")).join("");
 
@@ -2157,6 +2459,21 @@ function renderCoverPicker() {
       </div>
       ${V.busy ? `<div class="status-msg">⏳ Baixando…</div>` : ""}
       ${V.error ? `<div class="gf-error">${esc(V.error)}</div>` : ""}`;
+  } else if (V.source === "web") {
+    corpo = `<div class="search-box">
+        <span style="color:var(--text-low)">🔎</span>
+        <input id="cv-q" placeholder="Nome do jogo + plataforma" aria-label="Buscar arte na web"
+               autocomplete="off" spellcheck="false" value="${esc(V.query || "")}" />
+        <button class="cv-go" id="cv-go">Buscar</button>
+      </div>
+      <div class="cv-web-options"><label>SafeSearch <select id="cv-safe"><option value="strict" ${V.safe === "strict" ? "selected" : ""}>Rigoroso</option><option value="moderate" ${V.safe === "moderate" ? "selected" : ""}>Padrão</option><option value="off" ${V.safe === "off" ? "selected" : ""}>Desativado</option></select></label><span>${V.fallbackUsed ? `Google indisponível · resultados relevantes do ${V.provider === "yandex" ? "Yandex" : "Bing"}` : "Google Imagens · aprovação manual"}</span></div>
+      ${V.busy ? `<div class="status-msg">⏳ Buscando artes na web…</div>` : ""}
+      ${V.error ? `<div class="gf-error">${esc(V.error)}</div>` : ""}
+      ${V.blocked || V.fallbackUsed ? `<button class="btn-primary" id="cv-open-web">Abrir esta busca no Google Imagens</button>${V.blocked && !capas && !fundos ? `<p class="cv-url-hint">Depois, use “Colar URL” para aprovar a imagem escolhida.</p>` : ""}` : ""}
+      ${capas ? `<p class="cv-grid-label">CAPAS</p><div class="cv-grid">${capas}</div>` : ""}
+      ${fundos ? `<p class="cv-grid-label">FUNDOS</p><div class="cv-grid wide">${fundos}</div>` : ""}
+      ${!V.busy && !V.blocked && !capas && !fundos ? `<p class="cv-empty">Nenhuma imagem encontrada. Ajuste a consulta ou abra a busca no navegador.</p>` : ""}
+      ${!V.busy && (capas || fundos) ? `<button class="btn-ghost cv-load-more" id="cv-more">Carregar mais</button>` : ""}`;
   } else if (!V.ready[V.source]) {
     corpo = `<div class="cv-nokey">
       <p>Configure a chave do <b>${esc(CV_SRC_LABEL[V.source] || V.source)}</b> nas
@@ -2196,8 +2513,8 @@ function renderCoverPicker() {
     <div class="gf-body">
       <div class="cv-sources">
         ${CV_SOURCES.map((s) => `<button class="cv-src ${V.source === s.id ? "on" : ""}${
-          s.id !== "url" && !V.ready[s.id] ? " off" : ""}" data-src="${s.id}"
-          title="${s.id !== "url" && !V.ready[s.id] ? "sem chave configurada" : ""}">${s.label}</button>`).join("")}
+          !["url","web"].includes(s.id) && !V.ready[s.id] ? " off" : ""}" data-src="${s.id}"
+          title="${!["url","web"].includes(s.id) && !V.ready[s.id] ? "sem chave configurada" : ""}">${s.label}</button>`).join("")}
       </div>
       <div class="cv-roles">
         <span class="cv-roles-label">Aplicar como:</span>
@@ -2209,21 +2526,34 @@ function renderCoverPicker() {
 
     <div class="gf-foot">
       <button class="btn-ghost" id="cv-clear">↺ Remover ${esc(cvRoleLabel().toLowerCase())}</button>
-      <span></span>
+      <div class="cv-palette"><label title="Cor primária do jogo"><input type="color" id="cv-primary" value="${esc(V.palette?.primary || "#2F9DFF")}"></label><label title="Cor secundária"><input type="color" id="cv-secondary" value="${esc(V.palette?.secondary || V.palette?.primary || "#66D7FF")}"></label><button class="btn-ghost" id="cv-palette-save">Salvar cores</button><button class="btn-ghost" id="cv-palette-auto">Extrair da arte</button></div>
     </div>
   </div>`;
 
   $("#cv-x").onclick = closeCoverPicker;
   $("#cv-settings")?.addEventListener("click", () => { closeCoverPicker(); enterSettings(); });
   $("#cv-clear")?.addEventListener("click", cvLimpar);
+  $("#cv-palette-save")?.addEventListener("click", async () => {
+    const res = await backend.setGamePalette(V.slug, $("#cv-primary").value, $("#cv-secondary").value).catch((e) => ({ ok: false, error: String(e) }));
+    if (!res?.ok) return toast(res?.error || "Não foi possível salvar as cores.", true);
+    V.palette = res.palette; toast("Cores do jogo atualizadas.");
+  });
+  $("#cv-palette-auto")?.addEventListener("click", async () => {
+    const res = await backend.recalculateGamePalette(V.slug).catch((e) => ({ ok: false, error: String(e) }));
+    if (!res?.ok) return toast(res?.error || "Não foi possível extrair as cores.", true);
+    V.palette = res.palette; renderCoverPicker(); toast("Paleta recalculada pela arte.");
+  });
   el.querySelectorAll(".cv-src").forEach((b) =>
     b.onclick = () => cvTrocarFonte(b.dataset.src));
   el.querySelectorAll(".cv-role").forEach((b) =>
-    b.onclick = () => { V.role = b.dataset.role; renderCoverPicker(); });
+    b.onclick = () => { V.role = b.dataset.role; V.page = 0; renderCoverPicker(); if (V.source === "web") cvBuscar(V.query); });
   const go = $("#cv-go");
   if (go) go.onclick = () => cvBuscar(($("#cv-q")?.value || "").trim());
   const q = $("#cv-q");
   if (q) q.onkeydown = (e) => { if (e.key === "Enter") cvBuscar((q.value || "").trim()); };
+  $("#cv-safe")?.addEventListener("change", (e) => { V.safe = e.target.value; V.page = 0; cvBuscar(V.query); });
+  $("#cv-more")?.addEventListener("click", () => { V.page += 1; cvBuscar(V.query, true); });
+  $("#cv-open-web")?.addEventListener("click", () => backend.openWebImageSearch(V.slug, V.query, V.safe, V.role));
   const urlGo = $("#cv-url-go");
   if (urlGo) urlGo.onclick = () => cvAplicar(($("#cv-url")?.value || "").trim());
   const urlIn = $("#cv-url");
@@ -2234,7 +2564,10 @@ function renderCoverPicker() {
   el.querySelectorAll(".cv-alt").forEach((b) =>
     b.onclick = () => cvTrocarJogo(b.dataset.gid));
   el.querySelectorAll(".cv-cell").forEach((b) =>
-    b.onclick = () => cvAplicar(b.dataset.url));
+    b.onclick = () => cvAplicar(b.dataset.url,
+      V.source === "web" ? V.webResults?.[Number(b.dataset.webIndex)] : null));
+  el.querySelectorAll("[data-origin]").forEach((b) =>
+    b.onclick = () => backend.openImageSource(b.dataset.origin));
 }
 
 function cvRoleLabel() {
@@ -2245,26 +2578,41 @@ function cvTrocarFonte(source) {
   const V = S.CV;
   if (!V || V.source === source) return;
   V.source = source; V.error = "";
-  V.matches = []; V.chosen = null; V.covers = []; V.heroes = [];
+  V.matches = []; V.chosen = null; V.covers = []; V.heroes = []; V.webResults = [];
   renderCoverPicker();
-  if (source !== "url" && V.ready[source]) cvBuscar("");
+  if (source === "web" || (source !== "url" && V.ready[source])) cvBuscar("");
 }
 
-async function cvBuscar(query) {
+async function cvBuscar(query, append = false) {
   const V = S.CV;
   if (!V) return;
-  V.busy = true; V.error = ""; if (query) V.query = query;
+  V.busy = true; V.error = ""; V.blocked = false; V.fallbackUsed = false;
+  if (query) V.query = query;
   renderCoverPicker();
   try {
-    const res = await backend.coversSearch(V.slug, query || "", V.source);
+    const res = V.source === "web"
+      ? await backend.webImageSearch(V.slug, query || "", V.page || 0, V.safe || "moderate", V.role || "cover")
+      : await backend.coversSearch(V.slug, query || "", V.source);
     V.busy = false;
     if (!res.ok) {
       V.error = res.error || "Não consegui buscar artes.";
+      V.blocked = !!res.blocked; V.openUrl = res.open_url || "";
     } else {
+      if (V.source === "web") {
+        const results = res.results || [];
+        V.provider = res.provider || "google"; V.fallbackUsed = !!res.fallback_used;
+        V.webResults = append ? [...V.webResults, ...results] : results;
+        const covers = results.filter((item) => V.role === "icon" || !item.width || !item.height || item.orientation !== "landscape");
+        const heroes = results.filter((item) => item.orientation === "landscape");
+        V.covers = append ? [...V.covers, ...covers] : covers;
+        V.heroes = append ? [...V.heroes, ...heroes] : heroes;
+        V.blocked = !!res.blocked; V.openUrl = res.open_google_url || res.open_url || ""; V.chosen = { name: V.query };
+      } else {
       V.matches = res.matches || [];
       V.chosen = res.chosen || null;
       V.covers = res.covers || [];
       V.heroes = res.heroes || [];
+      }
     }
   } catch (e) {
     V.busy = false; V.error = "Erro: " + e;
@@ -2289,14 +2637,17 @@ async function cvTrocarJogo(gameId) {
   renderCoverPicker();
 }
 
-async function cvAplicar(url) {
+async function cvAplicar(url, candidate = null) {
   const V = S.CV;
   if (!V) return;
   url = (url || "").trim();
   if (!url) return toast("Cole uma URL de imagem.", true);
   const role = V.role;
   V.busy = true; V.error = ""; renderCoverPicker();
-  const res = await backend.setGameCover(V.slug, url, role).catch((e) => ({ ok: false, error: "" + e }));
+  if (candidate) candidate = { ...candidate, query: candidate.query || V.query };
+  const res = await (candidate
+    ? backend.applyWebArt(V.slug, candidate, role)
+    : backend.setGameCover(V.slug, url, role)).catch((e) => ({ ok: false, error: "" + e }));
   if (!res || !res.ok) {
     V.busy = false; V.error = (res && res.error) || "Não consegui aplicar a arte.";
     renderCoverPicker();
@@ -3067,7 +3418,7 @@ function closeLibraryDrawer() {
 /* ─────────────────────────  ATALHOS DE TECLADO  ─────────────────────────
    O rodapé anuncia essas teclas, então elas precisam existir. Também é a
    navegação por teclado que o app não tinha. */
-const ABAS = ["overview", "walk", "mastery", "tips"];
+const ABAS = ["overview", "walk", "tips"];
 
 function visibleFocusables() {
   return [...document.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled]), summary, [tabindex]:not([tabindex='-1'])")]
@@ -3098,7 +3449,8 @@ function spatialMove(direction) {
 
 function cyclePanelTab(dir) {
   if (S.view !== "dashboard" || S.compact) return;
-  const i = ABAS.indexOf(S.tab);
+  if (S.tab === "mastery") S.tab = "walk";
+  const i = Math.max(0, ABAS.indexOf(S.tab));
   S.tab = ABAS[(i + dir + ABAS.length) % ABAS.length];
   renderDashboard({ force: true }).then(() => $(".ptab.active")?.focus());
 }
@@ -3196,20 +3548,26 @@ function syncInputMode() {
 }
 
 async function trocarJogo(dir) {
-  if (!S.library.length) return;
-  const i = S.library.findIndex((g) => g.slug === S.activeSlug);
-  S.activeSlug = S.library[(i + dir + S.library.length) % S.library.length].slug;
+  const games = S.library.filter((game) => !isMastered(game));
+  if (!games.length) return;
+  const i = games.findIndex((g) => g.slug === S.activeSlug);
+  S.activeSlug = games[(i + dir + games.length) % games.length].slug;
+  await backend.setActiveGame(S.activeSlug).catch(() => null);
   await renderDashboard({ force: true });
 }
 
 async function toggleCompacto() {
   const btn = $("#btn-compact");
   S.compact = !S.compact;
-  S.compactState = S.compact ? "minimal" : "hidden";
+  S.compactState = S.compact ? (S.compactCfg?.view || S.compactCfg?.variant || "minimal") : "hidden";
   syncInputMode();
   btn?.classList.toggle("active", S.compact);
   if (hasBackend()) await backend.setCompact(S.compact);
   await refreshCompactNativeStatus();
+  if (S.compact && S.view !== "dashboard") {
+    await enterDashboard();
+    return;
+  }
   if (S.view === "dashboard") await renderDashboard({ force: true });
 }
 
@@ -3261,7 +3619,9 @@ async function boot() {
     if (st.overlay_exit_fullscreen !== undefined) S.overlayExitFullscreen = st.overlay_exit_fullscreen;
     if (st.overlay_second_screen !== undefined) S.overlaySecondScreen = st.overlay_second_screen;
     if (st.overlay_fit_emulator !== undefined) S.overlayFitEmulator = st.overlay_fit_emulator;
-    if (st.compact_content) S.compactContent = st.compact_content;
+    if (st.compact_tab) S.compactTab = st.compact_tab;
+    if (st.compact_view && S.compactCfg) S.compactCfg.view = st.compact_view;
+    if (st.compact_editing !== undefined) S.compactEditing = !!st.compact_editing;
     if (st.compact !== undefined) { S.compact = !!st.compact; S.compactState = st.compact ? (st.compact_state || "minimal") : "hidden"; }
     if (S.mode === "real" && !st.configured) renderSetup();
     else enterDashboard();
