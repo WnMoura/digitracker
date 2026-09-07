@@ -707,6 +707,16 @@ class WindowsOverlayInput:
         except Exception:
             return False
 
+    def dpi_scale(self, hwnd):
+        get_dpi = getattr(self.user32, "GetDpiForWindow", None)
+        return max(1.0, (int(get_dpi(hwnd)) if get_dpi else 96) / 96.0)
+
+    def move_no_activate(self, hwnd, x, y, width, height):
+        if not hwnd:
+            return False
+        return bool(self.user32.SetWindowPos(hwnd, self.HWND_TOPMOST, int(x), int(y),
+                                            int(width), int(height), self.SWP_NOACTIVATE))
+
     def hide_window(self, hwnd):
         if not hwnd:
             return False

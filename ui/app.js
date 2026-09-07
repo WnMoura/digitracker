@@ -120,7 +120,7 @@ const S = {
   library: [],
   libraryQuery: "",
   activeSlug: null,
-  tab: "tips",           // aba do painel: overview | walk | tips
+  tab: "journey",        // jornada | achievements | atlas
   achievementFilter: "all",
   onTop: true,
   compact: false,        // modo mini-overlay (progresso de conquistas)
@@ -146,9 +146,12 @@ const S = {
   aiModel: "",
   tipsAI: null,          // progresso persistente da tradução/melhoria das dicas
   tipsAIPolling: false,
-  guideMode: "compact", // compact | full | source
+  guideMode: "compact", // compatibilidade com estados antigos
+  guideReader: false,
+  guideChapter: 0,
   guideQuery: "",
   guideFilter: "all",
+  guideAtlas: { systemId: "", nodeId: "", group: "all", tag: "all", availability: "all", spoilers: false, zoom: 1, panX: 24, panY: 24 },
   smartGuideAuto: true,
   smartGuideConsent: false,
   guideDensity: "comfortable",
@@ -163,9 +166,11 @@ const S = {
   G: null,               // estado do painel do GameFAQs
   AI: null,              // estado do painel de configuração da IA
   SET: null,             // estado da tela de Configurações
+  sourceManager: null,
   hall: null,
   hallPlatform: "all",
   shownOverlayCelebrations: new Set(),
+  dashboardGame: null,
 };
 
 const root = document.getElementById("root");
@@ -175,6 +180,38 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
 
 /* ---------------------------- camada de dados ---------------------------- */
 const hasBackend = () => typeof window.pywebview !== "undefined" && window.pywebview.api;
+
+async function appCall(method, ...args) {
+  if (!hasBackend() || S.mode === "demo") return { ok: false, error: "Disponível no aplicativo conectado." };
+  try { return await window.pywebview.api[method](...args); }
+  catch (error) { return { ok: false, error: String(error) }; }
+}
+
+// Every modal lives in the same fixed layer, including dialogs added to body.
+new MutationObserver((mutations) => {
+  for (const change of mutations) for (const modal of change.addedNodes) {
+    if (!(modal instanceof HTMLElement) || !modal.matches(".modal-bg")) continue;
+    const previous = document.activeElement;
+    modal.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault(); event.stopImmediatePropagation();
+        const close = modal.querySelector('[id$="-close"], [id$="-cancel"], [data-modal-close]');
+        if (close) close.click(); else modal.remove();
+      } else if (event.key === "Tab") {
+        const focusable = [...modal.querySelectorAll('button,input,select,textarea,a[href],[tabindex="0"]')].filter((el) => !el.disabled && el.getClientRects().length);
+        if (!focusable.length) return event.preventDefault();
+        const first = focusable[0], last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
+    });
+    requestAnimationFrame(() => modal.querySelector('input,button,select,textarea')?.focus());
+    const removal = new MutationObserver(() => {
+      if (!modal.isConnected) { removal.disconnect(); if (previous?.isConnected) previous.focus(); }
+    });
+    removal.observe(document.body, { childList: true, subtree: true });
+  }
+}).observe(document.body, { childList: true, subtree: true });
 
 const backend = {
   async appState() {
@@ -344,6 +381,41 @@ const backend = {
     if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
     return window.pywebview.api.start_smart_guide(slug, !!force);
   },
+  async walkthroughSources(slug) {
+    if (S.mode === "demo") return { ok: true, sources: [] };
+    return window.pywebview.api.list_walkthrough_sources(slug);
+  },
+  async walkthroughSource(slug, sourceId) {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.get_walkthrough_source(slug, sourceId);
+  },
+  async addWalkthroughPdf(slug, data, filename) {
+    return window.pywebview.api.add_walkthrough_pdf(slug, data, filename);
+  },
+  async addWalkthroughGameFaqs(slug, url) {
+    return window.pywebview.api.add_walkthrough_gamefaqs(slug, url);
+  },
+  async addWalkthroughText(slug, title, value) {
+    return window.pywebview.api.add_walkthrough_text(slug, title, value);
+  },
+  async updateWalkthroughSource(slug, sourceId, title = null, enabled = null) {
+    return window.pywebview.api.update_walkthrough_source(slug, sourceId, title, enabled);
+  },
+  async removeWalkthroughSource(slug, sourceId) {
+    return window.pywebview.api.remove_walkthrough_source(slug, sourceId);
+  },
+  async startWalkthroughMerge(slug, sourceIds) {
+    return window.pywebview.api.start_walkthrough_merge(slug, sourceIds);
+  },
+  async walkthroughMergeStatus(slug) {
+    return window.pywebview.api.get_walkthrough_merge_status(slug);
+  },
+  async resolveWalkthroughConflict(slug, conflictId, choice) {
+    return window.pywebview.api.resolve_walkthrough_conflict(slug, conflictId, choice);
+  },
+  async publishWalkthroughMerge(slug) {
+    return window.pywebview.api.publish_walkthrough_merge(slug);
+  },
   async smartGuideStatus(slug) {
     if (S.mode === "demo") return { ok: true, phase: "idle" };
     return window.pywebview.api.get_smart_guide_status(slug);
@@ -355,6 +427,65 @@ const backend = {
   },
   async restoreSmartGuide(slug, revisionId) {
     return window.pywebview.api.restore_smart_guide_revision(slug, revisionId);
+  },
+  async guideSystems(slug) {
+    if (S.mode === "demo") return { ok: true, systems: [], approved: [], suggested: [], state: {}, media: [] };
+    return window.pywebview.api.get_guide_systems(slug);
+  },
+  async saveGuideSystem(slug, system) {
+    if (S.mode === "demo") {
+      const systems = S.dashboardGame?.smart_guide?.current?.systems || [];
+      const index = systems.findIndex((item) => item.id === system.id);
+      const saved = { ...system, id: system.id || `sys-demo-${Date.now()}` };
+      if (index >= 0) systems[index] = saved; else systems.push(saved);
+      return { ok: true, system: saved, revision: { revision_id: `demo-${Date.now()}` } };
+    }
+    return window.pywebview.api.save_guide_system(slug, system);
+  },
+  async createGuideSystemPdf(slug, title, data, filename) {
+    return window.pywebview.api.create_guide_system_from_pdf(slug, title, data, filename);
+  },
+  async createGuideSystemGameFaqs(slug, title, url) {
+    return window.pywebview.api.create_guide_system_from_gamefaqs(slug, title, url);
+  },
+  async guideSystemSource(slug, systemId) {
+    return window.pywebview.api.get_guide_system_source(slug, systemId);
+  },
+  async replaceGuideSystemSource(slug, systemId, source) {
+    return window.pywebview.api.replace_guide_system_source(slug, systemId, source);
+  },
+  async deleteGuideSystem(slug, systemId) {
+    if (S.mode === "demo") return { ok: true };
+    return window.pywebview.api.delete_guide_system(slug, systemId);
+  },
+  async setGuideSystemGoal(slug, systemId, nodeId) {
+    if (S.mode === "demo") {
+      const state = S.dashboardGame.smart_guide.system_state;
+      state.active_system = nodeId ? systemId : "";
+      if (nodeId) state.goals[systemId] = nodeId; else delete state.goals[systemId];
+      return { ok: true, state };
+    }
+    return window.pywebview.api.set_guide_system_goal(slug, systemId, nodeId);
+  },
+  async updateGuideRequirement(slug, systemId, edgeId, requirementId, completed) {
+    if (S.mode === "demo") {
+      const list = new Set(S.dashboardGame.smart_guide.system_state.completed_requirements || []);
+      if (completed) list.add(requirementId); else list.delete(requirementId);
+      S.dashboardGame.smart_guide.system_state.completed_requirements = [...list];
+      return { ok: true, state: S.dashboardGame.smart_guide.system_state };
+    }
+    return window.pywebview.api.update_guide_requirement(slug, systemId, edgeId, requirementId, !!completed);
+  },
+  async searchGuideSystemMedia(slug, systemId, nodeId, query, page = 0) {
+    if (S.mode === "demo") return { ok: true, results: [], query, provider: "demo" };
+    return window.pywebview.api.search_guide_system_media(slug, systemId, nodeId, query || "", page);
+  },
+  async setGuideSystemMedia(slug, systemId, nodeId, mediaId) {
+    if (S.mode === "demo") {
+      S.dashboardGame.smart_guide.system_state.node_media[`${systemId}:${nodeId}`] = mediaId;
+      return { ok: true, state: S.dashboardGame.smart_guide.system_state };
+    }
+    return window.pywebview.api.set_guide_system_media(slug, systemId, nodeId, mediaId || "");
   },
   async searchGuideMedia(query, source) {
     return window.pywebview.api.search_guide_media(query, source || "openverse");
@@ -649,6 +780,10 @@ async function enterDashboard() {
   await carregarCores(S.library);       // a cor de cada jogo vem da capa dele
   await renderDashboard({ force: true });
   startPolling();
+  if (!S.experienceOpened && !S.compact && typeof renderExperience === "function") {
+    S.experienceOpened = true;
+    await renderExperience("home");
+  }
 }
 
 function startPolling() {
@@ -704,7 +839,11 @@ function restoreScroll(map) {
    quando a assinatura (estado de UI + dados) muda de fato — assim a leitura da
    lista não é interrompida. `force` para transições de tela. */
 async function renderDashboard({ force = false } = {}) {
+  if (S.view !== "dashboard") return;
+  const requestedSlug = S.activeSlug;
   const game = S.activeSlug ? await backend.game(S.activeSlug) : null;
+  if (S.view !== "dashboard" || requestedSlug !== S.activeSlug) return;
+  S.dashboardGame = game;
   const sig = JSON.stringify([S.mode, S.compact, S.compactState, S.compactTab, S.compactEditing, S.compactSlots, S.tab, S.activeSlug, S.library, game]);
   if (!force && sig === S.sig) return;
   S.sig = sig;
@@ -726,7 +865,8 @@ async function renderDashboard({ force = false } = {}) {
     root.innerHTML = compactHTML(game);
     bindCompact();
   } else {
-    root.innerHTML = `${sidebarHTML()}${mainHTML(game)}`;
+    root.innerHTML = xpShell(mainHTML(game), true);
+    $("#btn-library").hidden = true;
     bindSidebar();
   }
   // Trocou de jogo ou de aba? Começa do topo. Só faz sentido preservar a
@@ -1105,6 +1245,7 @@ function sidebarHTML() {
       <span>DigiTracker</span>
       <button class="console-search-button" type="button" title="Buscar na biblioteca" aria-label="Buscar na biblioteca">⌕</button>
     </div>
+    ${typeof experienceNav === "function" ? experienceNav() : ""}
     <div class="sidebar-head">
       <div class="sidebar-title-row"><h2>BIBLIOTECA</h2><span class="library-chevron">⌄</span></div>
       <label class="library-search" title="Buscar na biblioteca">
@@ -1129,6 +1270,7 @@ async function enterHall() {
   stopPolling();
   S.library = await backend.library();
   S.hall = await backend.masteryHall().catch(() => ({ ok: false, mastery: [], softcore: [] }));
+  if (S.view !== "hall") return;
   renderHall();
 }
 
@@ -1150,9 +1292,10 @@ function renderHall() {
       <div class="hall-actions"><button data-hall-open="${esc(game.slug)}">Abrir jogo</button><button data-hall-replay="${esc(game.slug)}" data-event="${esc(event?.id || "")}">Rever celebração</button></div></div>
     </article>`;
   };
-  root.innerHTML = `${sidebarHTML()}<main class="main hall-main"><div class="hall-hero"><span>✦ ARQUIVO DE CONQUISTAS</span><h1>Hall da Mastery</h1><p>Seu espaço VIP de conclusões. Pontos e tempo são registrados oficialmente pela RetroAchievements.</p><select id="hall-platform"><option value="all">Todas as plataformas</option>${platforms.map((p) => `<option value="${esc(p)}" ${S.hallPlatform === p ? "selected" : ""}>${esc(p)}</option>`).join("")}</select></div>
+  root.innerHTML = xpShell(`<main class="main hall-main"><div class="hall-hero"><span>✦ ARQUIVO DE CONQUISTAS</span><h1>Hall da Mastery</h1><p>Seu espaço VIP de conclusões. Pontos e tempo são registrados oficialmente pela RetroAchievements.</p><select id="hall-platform"><option value="all">Todas as plataformas</option>${platforms.map((p) => `<option value="${esc(p)}" ${S.hallPlatform === p ? "selected" : ""}>${esc(p)}</option>`).join("")}</select></div>
     <div class="hall-scroll" data-scroll="hall"><section class="hall-section mastery"><div class="hall-section-title"><div><span>★</span><h2>Hall da Mastery</h2></div><b>${filter(hall.mastery || []).length}</b></div><div class="hall-grid">${filter(hall.mastery || []).map((g) => card(g, "mastery")).join("") || `<p class="hall-empty">Nenhuma Mastery nesta seleção ainda.</p>`}</div></section>
-    <section class="hall-section softcore"><div class="hall-section-title"><div><span>◇</span><h2>Conclusões 100%</h2></div><b>${filter(hall.softcore || []).length}</b></div><div class="hall-grid">${filter(hall.softcore || []).map((g) => card(g, "softcore")).join("") || `<p class="hall-empty">Nenhuma conclusão Softcore nesta seleção.</p>`}</div></section></div></main>`;
+    <section class="hall-section softcore"><div class="hall-section-title"><div><span>◇</span><h2>Conclusões 100%</h2></div><b>${filter(hall.softcore || []).length}</b></div><div class="hall-grid">${filter(hall.softcore || []).map((g) => card(g, "softcore")).join("") || `<p class="hall-empty">Nenhuma conclusão Softcore nesta seleção.</p>`}</div></section></div></main>`, true);
+  $("#btn-library").hidden = true;
   bindSidebar();
   $("#hall-platform")?.addEventListener("change", (e) => { S.hallPlatform = e.target.value; renderHall(); });
   root.querySelectorAll("[data-hall-open]").forEach((b) => b.onclick = async () => { S.activeSlug = b.dataset.hallOpen; await backend.setActiveGame(S.activeSlug).catch(() => null); await enterDashboard(); });
@@ -1178,9 +1321,9 @@ function mainHTML(game) {
       <p>Use "Adicionar Jogo" para importar seu primeiro título da RetroAchievements.</p>
     </div></main>`;
   }
-  // A antiga aba Mastery foi incorporada a Conquistas. Converta estados
-  // persistidos por versões anteriores sem mandar o usuário para uma tela vazia.
-  if (S.tab === "mastery") S.tab = "walk";
+  // Migra estados de navegação persistidos pelas versões anteriores.
+  if (["mastery", "walk"].includes(S.tab)) S.tab = "achievements";
+  if (["overview", "tips"].includes(S.tab)) S.tab = "journey";
   const { t, e, pct } = totals(game);
   const le = game.last_earned;
   const tips = (game.guide || []).length;
@@ -1194,9 +1337,14 @@ function mainHTML(game) {
   const smartDone = completedSmart.size;
   const pendingBlocks = smartBlocks.filter((b) => !completedSmart.has(b.id));
   const nextSteps = pendingBlocks.filter((b) => ["objective", "checklist", "checkpoint", "challenge"].includes(b.type)).slice(0, 3);
-  const pendingMissables = pendingBlocks.filter((b) => b.type === "missable");
-  const missables = pendingMissables.length;
-  const firstMissable = pendingMissables[0] || {};
+  const pendingGuideMissables = pendingBlocks.filter((b) => b.type === "missable");
+  const pendingRAMissables = game.pending_missables || [];
+  const journeySteps = [
+    ...pendingRAMissables.slice(0, 1).map((row) => ({ title: `Perdível: ${row.name}${row.earned && !row.hardcore ? " · refazer em Hardcore" : ""}`, urgent: true })),
+    ...nextSteps,
+  ].slice(0, 3);
+  const missables = pendingRAMissables.length + pendingGuideMissables.length;
+  const firstMissable = pendingRAMissables[0] || pendingGuideMissables[0] || {};
   const personalNotes = Object.keys(smartProgress.notes || {}).length;
   const sessionMinutes = smartProgress.session_minutes || 30;
 
@@ -1226,11 +1374,11 @@ function mainHTML(game) {
           <div class="hero-insights">
             <div class="hero-progress-card">
               <span>PROGRESSO</span>
-              <div><strong>${mst.percent || pct || 0}%</strong><small>${mst.hardcore || 0}/${t}</small></div>
+              <div><strong>${t ? Math.round((mst.hardcore || 0) / t * 100) : 0}%</strong><small>${mst.hardcore || 0}/${t} Hardcore</small></div>
               <div class="hero-bar" title="Progresso de Mastery: ${mst.hardcore || 0} de ${t} em hardcore">
-                <i style="width:${mst.percent || 0}%"></i>
+                <i style="width:${t ? Math.round((mst.hardcore || 0) / t * 100) : 0}%"></i>
               </div>
-              <div class="hero-ra-meta"><span>${game.score?.earned || 0}/${game.score?.available || 0} pts</span>${game.playtime?.label ? `<span title="Tempo registrado pela RetroAchievements">◷ ${esc(game.playtime.label)}</span>` : ""}</div>
+              <div class="hero-ra-meta"><span>${game.score?.hardcore || 0}/${game.score?.available || 0} pts</span>${game.playtime?.label ? `<span title="Tempo registrado pela RetroAchievements">◷ ${esc(game.playtime.label)}</span>` : ""}</div>
             </div>
             ${le ? `<div class="hero-achievement-card">
               <span class="spark">✦</span>
@@ -1243,18 +1391,13 @@ function mainHTML(game) {
     </div>
     <div class="panel-tabs">
       <span class="tab-bumper">LB</span>
-      <button class="ptab ${S.tab === "overview" ? "active" : ""}" data-tab="overview"><b>▦</b> Visão geral</button>
-      <button class="ptab ${S.tab === "walk" ? "active" : ""}" data-tab="walk"><b>♜</b> Conquistas${mst.softcore_only ? `<span class="count">${mst.softcore_only}</span>` : ""}</button>
-      <button class="ptab ${S.tab === "tips" ? "active" : ""}" data-tab="tips"><b>✦</b> Guia Inteligente${(smartDoc.chapters || []).length ? `<span class="count">${smartDoc.chapters.length}</span>` : tips ? `<span class="count">${tips}</span>` : ""}</button>
+      <button class="ptab ${S.tab === "journey" ? "active" : ""}" data-tab="journey"><b>✦</b> Guia${(smartDoc.chapters || []).length ? `<span class="count">${smartDoc.chapters.length}</span>` : tips ? `<span class="count">${tips}</span>` : ""}</button>
+      <button class="ptab ${S.tab === "achievements" ? "active" : ""}" data-tab="achievements"><b>♜</b> Conquistas${mst.softcore_only ? `<span class="count">${mst.softcore_only}</span>` : ""}</button>
+      <button class="ptab ${S.tab === "atlas" ? "active" : ""}" data-tab="atlas"><b>◇</b> Atlas${(smartDoc.systems || []).filter((item) => item.status !== "rejected").length ? `<span class="count">${(smartDoc.systems || []).filter((item) => item.status !== "rejected").length}</span>` : ""}</button>
       <span class="tab-bumper">RB</span>
     </div>
-    ${S.tab === "tips" ? `<div class="guide-commandbar dashboard-commandbar">
-      <label class="guide-search"><span>⌕</span><input id="guide-search" value="${esc(S.guideQuery)}" placeholder="Buscar no guia"></label>
-      <div class="segmented" role="tablist">${[["compact","Compacto"],["full","Completo"],["source","Fonte"]].map(([id,label]) => `<button class="${S.guideMode === id ? "on" : ""}" data-guide-mode="${id}">${label}</button>`).join("")}</div>
-      <select id="guide-filter" aria-label="Filtrar guia"><option value="all">Tudo</option><option value="pending">Pendentes</option><option value="missable">Perdíveis</option><option value="warning">Avisos</option><option value="favorites">Favoritos</option><option value="achievement">Conquistas</option></select>
-      <select id="guide-session" aria-label="Tempo da sessão">${[15,30,45,60,90,120].map((m) => `<option value="${m}" ${Number(sessionMinutes) === m ? "selected" : ""}>${m} min</option>`).join("")}</select>
-    </div>` : ""}
-    ${["tips", "overview"].includes(S.tab) ? `<section class="activity-deck hybrid-dashboard" aria-label="Continuar jogando">
+    ${S.tab === "journey" && S.guideReader ? `<div class="guide-commandbar dashboard-commandbar journey-reader-bar"><button class="btn-ghost" id="guide-reader-close">← Jornada</button><label class="guide-search"><span>⌕</span><input id="guide-search" value="${esc(S.guideQuery)}" placeholder="Buscar neste capítulo"></label><select id="guide-filter" aria-label="Filtrar guia"><option value="all">Tudo</option><option value="pending">Pendentes</option><option value="missable">Perdíveis</option><option value="warning">Avisos</option><option value="favorites">Favoritos</option><option value="achievement">Conquistas</option></select></div>` : ""}
+    ${S.tab === "journey" && !S.guideReader ? `<section class="activity-deck hybrid-dashboard" aria-label="Continuar jogando">
       <div class="activity-main-grid">
         <button class="activity-card primary" data-jump-guide="${esc(next.block_id || "")}">
           <span class="activity-kicker">CONTINUAR DE ONDE PAREI</span>
@@ -1269,7 +1412,7 @@ function mainHTML(game) {
         </div>
         <div class="activity-card steps">
           <span class="activity-kicker">PRÓXIMOS PASSOS</span>
-          <ul>${nextSteps.length ? nextSteps.map((b, i) => `<li class="${i ? "" : "done"}">${esc(b.title || b.text || `Passo ${i + 1}`)}</li>`).join("") : `<li>Organize o guia para receber os próximos passos.</li>`}</ul>
+          <ul>${journeySteps.length ? journeySteps.map((b, i) => `<li class="${b.urgent ? "urgent" : (i ? "" : "done")}">${esc(b.title || b.text || `Passo ${i + 1}`)}</li>`).join("") : `<li>Organize o guia para receber os próximos passos.</li>`}</ul>
           <i>${smartDone} concluídos <b>→</b></i>
         </div>
         <button class="guide-progress-strip" data-open-achievements title="Abrir conquistas e ordem recomendada">
@@ -1281,7 +1424,9 @@ function mainHTML(game) {
         <div class="activity-card missable ${missables ? "warn" : "clear"}">
           <span class="activity-kicker">△ PERDÍVEL</span>
           <div><strong>${missables}</strong><span>${missables === 1 ? " perdível nesta seção" : " perdíveis pendentes"}</span></div>
-          <p>${esc(firstMissable.title || firstMissable.text || "Nenhum alerta crítico para o próximo objetivo.")}</p>
+          ${missables ? `<small class="missable-origin">${pendingRAMissables.length ? "Classificação oficial RetroAchievements" : "Aviso do guia"}</small>` : ""}
+          <p>${esc(firstMissable.name || firstMissable.title || firstMissable.text || "Nenhum alerta crítico para o próximo objetivo.")}</p>
+          ${pendingRAMissables[0]?.earned && !pendingRAMissables[0]?.hardcore ? `<span class="missable-softcore">Refazer em Hardcore</span>` : ""}
           <i>Ver detalhes <b>→</b></i>
         </div>
         <button class="activity-card personal-notes" data-jump-guide="${esc(next.block_id || "")}">
@@ -1290,8 +1435,8 @@ function mainHTML(game) {
           <i><b>→</b></i>
         </button>
       </aside>
-    </section>` : ""}
-    ${S.tab === "tips" ? guideHTML(game) : S.tab === "overview" ? guideHTML(game) : achievementsHTML(game)}
+    </section><div class="journey-actions"><button class="journey-open-guide" id="guide-reader-open"><span>▤</span><div><b>Abrir walkthrough completo</b><small>Leia um capítulo por vez, sem poluir sua Jornada.</small></div><i>→</i></button><button class="journey-manage-sources" id="journey-sources"><span>＋</span><div><b>Fontes dos guias</b><small>${(smart.walkthrough_sources || []).length} de 10 adicionadas</small></div></button></div>` : ""}
+    ${S.tab === "atlas" ? guideSystemsHTML(game) : S.tab === "achievements" ? achievementsHTML(game) : (S.guideReader ? guideHTML(game) : "")}
   </main>`;
 }
 
@@ -1309,31 +1454,67 @@ function achievementsHTML(game) {
     ? `<div class="ach-badge ${a.earned ? "" : "locked"}" style="background-image:url('${esc(a.badge_url)}')"></div>`
     : `<div class="ach-badge ${a.earned ? "" : "locked"}">${a.earned ? "🏆" : "🔒"}</div>`;
 
+  const guideOrder = new Map();
+  const guideSteps = new Map();
+  const guideCompleted = new Set(game.smart_guide?.effective_progress?.completed || game.smart_guide?.progress?.completed || []);
+  (game.smart_guide?.current?.chapters || []).forEach((chapter, chapterIndex) => {
+    (chapter.blocks || []).forEach((block, blockIndex) => {
+      const achievementId = Number(block.achievement_id || 0);
+      if (block.type === "achievement" && achievementId > 0 && !guideOrder.has(achievementId)) {
+        guideOrder.set(achievementId, { position: chapterIndex * 10000 + blockIndex, step: chapterIndex + 1, area: chapter.title });
+      } else if (["objective", "checklist", "checkpoint", "warning", "missable", "challenge"].includes(block.type)) {
+        if (!guideSteps.has(chapterIndex + 1)) guideSteps.set(chapterIndex + 1, []);
+        guideSteps.get(chapterIndex + 1).push(block);
+      }
+    });
+  });
+  const orderedAchievements = (game.achievements || []).map((achievement, officialIndex) => {
+    const guide = guideOrder.get(Number(achievement.id));
+    return { ...achievement, step: guide?.step ?? achievement.step, area: guide?.area || achievement.area, _position: guide ? guide.position : 100000000 + officialIndex };
+  }).sort((a, b) => a._position - b._position);
   const filter = S.achievementFilter || "all";
-  const visible = (game.achievements || []).filter((a) => {
-    if (filter === "pending") return !a.earned;
+  const visible = orderedAchievements.filter((a) => {
+    if (filter === "pending") return !a.hardcore;
     if (filter === "softcore") return softIds.has(a.id);
+    if (filter === "missable") return a.achievement_type === "missable";
     return true;
   });
+  const renderGuideRows = (step) => (guideSteps.get(Number(step)) || []).filter((block) => {
+    if (filter === "pending") return !guideCompleted.has(block.id);
+    if (filter === "missable") return block.type === "missable";
+    if (filter === "softcore") return false;
+    return true;
+  }).map((block) => `<div class="guide-step-row type-${esc(block.type)} ${guideCompleted.has(block.id) ? "done" : ""}" data-guide-block="${esc(block.id)}"><button class="smart-check" data-guide-action="complete" data-value="${!guideCompleted.has(block.id)}">${guideCompleted.has(block.id) ? "✓" : block.type === "missable" ? "◆" : block.type === "warning" ? "!" : "→"}</button><div><span>${block.type === "missable" ? "AVISO DO GUIA · PERDÍVEL" : esc(block.type)}</span><b>${esc(block.title || block.text)}</b>${block.title && block.text ? `<small>${esc(block.text)}</small>` : ""}</div></div>`).join("");
   let rows = "", lastStep = null;
+  const renderedGuideSteps = new Set();
   for (const a of visible) {
     if (a.step !== lastStep) {
       lastStep = a.step;
-      if (a.area) rows += `<p class="step-area">▸ ETAPA ${a.step} — ${esc(a.area)}</p>`;
+      if (a.area) rows += `<p class="step-area">▸ ETAPA ${a.step || "—"} — ${esc(a.area)}</p>`;
+      renderedGuideSteps.add(Number(a.step));
+      rows += renderGuideRows(a.step);
     }
     const isNext = nextIds.includes(a.id);
-    rows += `<div class="ach-row ${isNext ? "next" : ""} ${a.earned || isNext ? "" : "locked"}" data-ach-state="${softIds.has(a.id) ? "softcore" : a.earned ? "earned" : "pending"}">
+    if (a.achievement_type === "missable" && !a.hardcore) rows += `<div class="achievement-missable-alert"><span>△ PERDÍVEL</span><b>${a.earned ? "Obtida somente em Softcore · refaça em Hardcore" : "Conclua antes de avançar além desta etapa"}</b></div>`;
+    rows += `<div class="ach-row ${isNext ? "next" : ""} ${a.earned || isNext ? "" : "locked"} ${a.achievement_type === "missable" ? "missable" : ""}" data-ach-id="${esc(a.id)}" data-ach-state="${softIds.has(a.id) ? "softcore" : a.earned ? "earned" : "pending"}">
       ${badge(a)}
       <div class="ach-body">
         <div class="ach-titleline">
           <span class="ach-name">${esc(a.name)}</span>
           ${a.earned ? modeTag(a.mode) : ""}
+          ${a.achievement_type === "missable" ? `<span class="missable-tag">PERDÍVEL</span>` : ""}
           ${isNext ? `<span class="next-tag">PRÓXIMO</span>` : ""}
         </div>
         <div class="ach-desc">${esc(a.desc)}</div>
       </div>
       ${a.earned ? `<span class="ach-check" style="color:${modeColor(a.mode)}">✓</span>` : ""}
     </div>`;
+  }
+  for (const [step] of [...guideSteps.entries()].sort((a, b) => a[0] - b[0])) {
+    if (renderedGuideSteps.has(step)) continue;
+    const chapter = game.smart_guide?.current?.chapters?.[step - 1];
+    const extra = renderGuideRows(step);
+    if (extra) rows += `<p class="step-area">▸ ETAPA ${step} — ${esc(chapter?.title || "Jornada")}</p>${extra}`;
   }
   const status = m.complete
     ? `<div class="ms-done">★ MASTERY COMPLETO — ${total}/${total} em hardcore</div>`
@@ -1348,7 +1529,7 @@ function achievementsHTML(game) {
       </div>
       ${status}
     </section>
-    <div class="achievement-list-head"><div><p class="list-title">ORDEM RECOMENDADA</p><span>Conquistas organizadas pelo walkthrough importado.</span></div><div class="achievement-filters">${filterButton("all", "Todas", total)}${filterButton("pending", "Pendentes", m.remaining || 0)}${filterButton("softcore", "Só softcore", m.softcore_only || 0)}</div></div>
+      <div class="achievement-list-head"><div><p class="list-title">ORDEM RECOMENDADA</p><span>Conquistas organizadas pelo walkthrough importado.</span></div><div class="achievement-filters">${filterButton("all", "Todas", total)}${filterButton("pending", "Pendentes", m.remaining || 0)}${filterButton("missable", "Perdíveis", (game.pending_missables || []).length)}${filterButton("softcore", "Só softcore", m.softcore_only || 0)}</div></div>
     ${rows || `<p class="achievement-empty">Nenhuma conquista corresponde a este filtro.</p>`}
   </div>`;
 }
@@ -1357,123 +1538,193 @@ function achievementsHTML(game) {
 const masteryHTML = achievementsHTML;
 const walkHTML = achievementsHTML;
 
-/* Renderiza as seções de dicas/tutoriais extraídas do PDF do guia. */
+function guideSystemLayout(system, visibleNodes) {
+  const visible = new Set(visibleNodes.map((node) => node.id));
+  const edges = (system.edges || []).filter((edge) => visible.has(edge.from) && visible.has(edge.to));
+  const incoming = new Map(visibleNodes.map((node) => [node.id, 0]));
+  edges.forEach((edge) => incoming.set(edge.to, (incoming.get(edge.to) || 0) + 1));
+  const levels = new Map(), queue = visibleNodes.filter((node) => !incoming.get(node.id)).map((node) => node.id);
+  queue.forEach((id) => levels.set(id, 0));
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const id = queue[cursor], level = levels.get(id) || 0;
+    edges.filter((edge) => edge.from === id).forEach((edge) => {
+      levels.set(edge.to, Math.max(levels.get(edge.to) || 0, level + 1));
+      incoming.set(edge.to, Math.max(0, (incoming.get(edge.to) || 0) - 1));
+      if (!incoming.get(edge.to)) queue.push(edge.to);
+    });
+  }
+  visibleNodes.forEach((node, index) => { if (!levels.has(node.id)) levels.set(node.id, index % 4); });
+  const columns = new Map();
+  visibleNodes.forEach((node) => {
+    const level = levels.get(node.id) || 0;
+    if (!columns.has(level)) columns.set(level, []);
+    columns.get(level).push(node);
+  });
+  const positions = new Map();
+  [...columns.entries()].sort((a, b) => a[0] - b[0]).forEach(([level, nodes]) => {
+    nodes.forEach((node, row) => positions.set(node.id, { x: 42 + level * 242, y: 42 + row * 154 }));
+  });
+  const maxLevel = Math.max(0, ...levels.values());
+  const maxRows = Math.max(1, ...[...columns.values()].map((items) => items.length));
+  let width = Math.max(760, 260 + maxLevel * 242), height = Math.max(520, 82 + maxRows * 154);
+  if (system.layout === "vertical") {
+    [...positions.entries()].forEach(([id, pos]) => positions.set(id, { x: pos.y, y: pos.x }));
+    [width, height] = [Math.max(760, height), Math.max(520, width)];
+  } else if (system.layout === "radial") {
+    const radius = Math.max(190, visibleNodes.length * 26), center = radius + 130;
+    visibleNodes.forEach((node, index) => {
+      const angle = (Math.PI * 2 * index / Math.max(1, visibleNodes.length)) - Math.PI / 2;
+      positions.set(node.id, { x: center + Math.cos(angle) * radius - 84, y: center + Math.sin(angle) * radius - 53 });
+    });
+    width = height = Math.max(760, center * 2);
+  }
+  return { edges, positions, width, height };
+}
+
+function atlasSystems(game) {
+  const draft = (game.smart_guide?.atlas_drafts || []).find((item) => item.source_id === S.guideAtlas.draftSource);
+  return draft?.system ? [{ ...draft.system, _draftSource: draft.source_id }] : (game.smart_guide?.current?.systems || []);
+}
+
+function atlasJobsHTML(game) {
+  const labels = { running: "Analisando a fonte…", suggested: "Prévia pronta para revisão", error: "Falha na análise", interrupted: "Análise interrompida", cancelled: "Análise cancelada", awaiting_consent: "Aguardando consentimento", awaiting_configuration: "Aguardando configuração da IA" };
+  return `<div class="atlas-jobs">${(game.smart_guide?.atlas_jobs || []).filter((job) => labels[job.status]).map((job) => `<article class="atlas-job"><div><b>${esc(job.title)}</b><p>${labels[job.status]}</p>${job.error ? `<p class="atlas-job-error">${esc(job.error)}</p>` : ""}</div>${job.status === "suggested" ? `<button data-atlas-review-job="${esc(job.id)}">Revisar prévia</button>` : job.status === "running" ? `<button data-atlas-cancel-job="${esc(job.id)}">Cancelar</button>` : `<button data-atlas-retry-job="${esc(job.id)}">Tentar novamente</button><button data-atlas-manual-job="${esc(job.id)}">Editar manualmente</button>`}</article>`).join("")}</div>`;
+}
+
+function guideSystemsHTML(game) {
+  const bundle = game.smart_guide || {}, doc = bundle.current || {};
+  const systems = atlasSystems(game).filter((item) => item.status !== "rejected");
+  const jobs = atlasJobsHTML(game);
+  if (!systems.length) return `${jobs}<section class="atlas-empty"><span>◇</span><h3>Crie o primeiro sistema visual</h3><p>Cada sistema usa um PDF ou GameFAQs exclusivo para gerar caminhos e requisitos fiéis à fonte.</p><button id="atlas-create">＋ Novo sistema com fonte própria</button></section>`;
+  const A = S.guideAtlas;
+  let system = systems.find((item) => item.id === A.systemId) || systems.find((item) => item.status === "approved") || systems[0];
+  A.systemId = system.id;
+  const state = bundle.system_state || {}, completed = new Set(state.completed_requirements || []);
+  const groups = [...new Set((system.nodes || []).map((node) => node.group).filter(Boolean))];
+  const tags = [...new Set((system.nodes || []).flatMap((node) => node.tags || []).filter(Boolean))];
+  const available = (node) => {
+    const incoming = (system.edges || []).filter((edge) => edge.to === node.id);
+    return !incoming.length || incoming.some((edge) => (edge.requirements || []).every((req) => completed.has(req.id)));
+  };
+  const visibleNodes = (system.nodes || []).filter((node) => {
+    if (node.spoiler && !A.spoilers) return false;
+    if (A.group !== "all" && node.group !== A.group) return false;
+    if (A.tag !== "all" && !(node.tags || []).includes(A.tag)) return false;
+    if (A.availability === "available" && !available(node)) return false;
+    if (A.availability === "blocked" && available(node)) return false;
+    return true;
+  });
+  const selectedId = visibleNodes.some((node) => node.id === A.nodeId)
+    ? A.nodeId : (visibleNodes.find(node => node.id === (state.goals || {})[system.id])?.id || visibleNodes[0]?.id || "");
+  A.nodeId = selectedId;
+  const selected = (system.nodes || []).find((node) => node.id === selectedId) || null;
+  const layout = guideSystemLayout(system, visibleNodes);
+  const routeEdges = new Set();
+  const trace = (nodeId, seen = new Set()) => {
+    if (seen.has(nodeId)) return; seen.add(nodeId);
+    (system.edges || []).filter((edge) => edge.to === nodeId).forEach((edge) => { routeEdges.add(edge.id); trace(edge.from, seen); });
+  };
+  if (selectedId) trace(selectedId);
+  const path = (edge) => {
+    const from = layout.positions.get(edge.from), to = layout.positions.get(edge.to);
+    if (!from || !to) return "";
+    const x1 = from.x + 168, y1 = from.y + 53, x2 = to.x, y2 = to.y + 53, bend = Math.max(45, (x2 - x1) * .5);
+    return `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}`;
+  };
+  const refsHTML = (refs) => (refs || []).map((ref) => ref.page ? `p.${ref.page}` : `§${ref.section}.${ref.block}`).join(" · ");
+  const nodeHTML = visibleNodes.map((node) => {
+    const pos = layout.positions.get(node.id), mediaId = (state.node_media || {})[`${system.id}:${node.id}`];
+    const media = (bundle.media || []).find((item) => item.id === mediaId);
+    const goal = (state.goals || {})[system.id] === node.id;
+    return `<button class="atlas-node ${node.id === selectedId ? "selected" : ""} ${available(node) ? "available" : "blocked"} ${goal ? "goal" : ""}" data-atlas-node="${esc(node.id)}" style="left:${pos.x}px;top:${pos.y}px">
+      <span class="atlas-node-art">${media?.url ? `<img src="${esc(media.url)}" alt="">` : `<i>◇</i>`}</span>
+      <span class="atlas-node-copy"><small>${esc(node.stage || node.group || "NÓ")}</small><b>${esc(node.label)}</b><em>${esc(node.subtitle || (node.tags || []).slice(0, 2).join(" · "))}</em></span>
+      ${goal ? `<span class="atlas-goal-badge">OBJETIVO</span>` : ""}
+    </button>`;
+  }).join("");
+  const edgeHTML = layout.edges.map((edge) => `<path class="atlas-edge ${routeEdges.has(edge.id) ? "route" : "muted"} ${edge.path_kind === "alternative" ? "alternative" : ""} ${edge.missable ? "missable" : ""}" d="${path(edge)}"><title>${esc(edge.label || "Caminho")}</title></path>`).join("");
+  const incoming = selected ? (system.edges || []).filter((edge) => edge.to === selected.id) : [];
+  const chosenPath = incoming.find(edge => edge.id === state.preferences?.[system.id]?.edge_id) || [...incoming].sort((a,b) => a.requirements.filter(r=>!completed.has(r.id)).length-b.requirements.filter(r=>!completed.has(r.id)).length)[0];
+  const requirements = chosenPath ? (chosenPath.requirements || []).map(req => ({...req,edge_id:chosenPath.id,missable:chosenPath.missable})) : [];
+  const mediaId = selected ? (state.node_media || {})[`${system.id}:${selected.id}`] : "";
+  const media = (bundle.media || []).find((item) => item.id === mediaId);
+  const inspector = selected ? `<aside class="atlas-inspector">
+    ${incoming.length > 1 ? `<label class="atlas-path-label">Caminho para este objetivo<select id="atlas-path">${incoming.map(edge=>`<option value="${esc(edge.id)}" ${edge.id===chosenPath?.id?'selected':''}>${esc(system.nodes.find(node=>node.id===edge.from)?.label || edge.label)}</option>`).join('')}</select></label>` : ''}
+    <div class="atlas-inspector-art">${media?.url ? `<img src="${esc(media.url)}" alt="${esc(selected.label)}">` : `<span>◇</span>`}</div>
+    <small>${esc(selected.stage || selected.group || "SISTEMA")}</small><h3>${esc(selected.label)}</h3><p>${esc(selected.subtitle || "Selecione uma imagem e acompanhe os requisitos deste objetivo.")}</p>
+    ${(selected.tags || []).length ? `<div class="atlas-tags">${selected.tags.map((tag) => `<span>${esc(tag)}</span>`).join("")}</div>` : ""}
+    ${Object.keys(selected.attributes || {}).length ? `<dl>${Object.entries(selected.attributes).map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>` : ""}
+    <div class="atlas-requirements"><b>REQUISITOS</b>${requirements.length ? requirements.map((req) => `<label class="${req.missable ? "missable" : ""}"><input type="checkbox" data-atlas-requirement="${esc(req.id)}" data-edge="${esc(req.edge_id)}" ${completed.has(req.id) ? "checked" : ""}><span>${esc(req.text)}</span></label>`).join("") : `<p>Nenhum requisito documentado.</p>`}</div>
+    ${system.source_id ? `<button class="atlas-source" data-atlas-source="${esc(selected.id)}">Fonte exclusiva: ${esc(system.source_id === "legacy-main" ? "guia migrado" : refsHTML(selected.source_refs || system.source_refs || []))}</button>` : ""}
+    <div class="atlas-inspector-actions"><button class="primary" id="atlas-goal">${(state.goals || {})[system.id] === selected.id ? "✓ Objetivo fixado" : "◎ Fixar como objetivo"}</button><button id="atlas-media">▧ Trocar imagem</button><button id="atlas-edit">✎ Editar sistema</button><button id="atlas-replace-source">↺ Trocar fonte</button></div>
+  </aside>` : `<aside class="atlas-inspector empty">Selecione um nó para ver seus detalhes.</aside>`;
+  const review = system.status === "suggested" ? `<div class="atlas-review"><span>REVISÃO NECESSÁRIA</span><p>Confira nomes, caminhos, requisitos, spoilers e perdíveis antes de publicar.</p><button id="atlas-approve">Aprovar sistema</button><button id="atlas-edit">Revisar e editar</button><button id="atlas-reject">Rejeitar</button></div>` : "";
+  return `${jobs}<section class="atlas-shell ${A.list ? "list-view" : ""}" style="--atlas-zoom:${A.zoom};--atlas-x:${A.panX}px;--atlas-y:${A.panY}px">
+    <header class="atlas-toolbar"><div><span>ATLAS DE SISTEMAS</span><h2>${esc(system.title)}</h2><p>${esc(system.description)}</p></div><button id="atlas-create">＋ Novo sistema</button></header>
+    ${review}<div class="atlas-filters">
+      <select id="atlas-system">${systems.map((item) => `<option value="${esc(item.id)}" ${item.id === system.id ? "selected" : ""}>${esc(item.title)}${item.status === "suggested" ? " · revisar" : ""}</option>`).join("")}</select>
+      <select id="atlas-group"><option value="all">Todos os ${esc(system.group_label || "grupos")}</option>${groups.map((group) => `<option value="${esc(group)}" ${A.group === group ? "selected" : ""}>${esc(group)}</option>`).join("")}</select>
+      <select id="atlas-tag"><option value="all">Todas as tags</option>${tags.map((tag) => `<option value="${esc(tag)}" ${A.tag === tag ? "selected" : ""}>${esc(tag)}</option>`).join("")}</select>
+      <select id="atlas-availability"><option value="all">Toda disponibilidade</option><option value="available" ${A.availability === "available" ? "selected" : ""}>Disponíveis</option><option value="blocked" ${A.availability === "blocked" ? "selected" : ""}>Bloqueados</option></select>
+      <label><input id="atlas-spoilers" type="checkbox" ${A.spoilers ? "checked" : ""}> Spoilers</label>
+      <div class="atlas-zoom"><button data-atlas-zoom="out">−</button><button data-atlas-zoom="fit">Ajustar</button><button data-atlas-zoom="in">＋</button><button id="atlas-list-toggle">${A.list ? "Mapa" : "Lista"}</button>${A.draftSource ? '<button id="atlas-back-published">Voltar ao publicado</button>' : ""}</div>
+    </div>
+    <div class="atlas-layout"><div class="atlas-viewport" id="atlas-viewport"><div class="atlas-world" style="width:${layout.width}px;height:${layout.height}px"><svg width="${layout.width}" height="${layout.height}" aria-hidden="true">${edgeHTML}</svg>${nodeHTML}</div>${!visibleNodes.length ? `<p class="atlas-no-results">Nenhum nó corresponde aos filtros.</p>` : ""}</div>${inspector}</div>
+  </section>`;
+}
+
+/* Leitor focado da Jornada. As fontes permanecem preservadas, mas sua gestão
+   vive apenas em Configurações > Biblioteca para manter a navegação limpa. */
 function guideHTML(game) {
-  const secs = game.guide || [];
   const bundle = game.smart_guide || {};
   const doc = bundle.current || {};
+  const chapters = doc.chapters || [];
+  if (!chapters.length) return `<div class="list-wrap"><div class="guide-empty-state">
+    <span class="guide-empty-kicker">JORNADA</span><h2>Crie seu walkthrough completo</h2>
+    <p>Adicione PDFs, GameFAQs ou textos em Fontes dos guias e consolide o melhor de cada um.</p>
+    <button class="guide-import-card primary" id="journey-sources-empty"><span class="guide-import-icon">＋</span><span><b>Gerenciar fontes</b><small>Até dez fontes independentes por jogo</small></span><span class="guide-arrow">→</span></button>
+  </div></div>`;
+  S.guideChapter = Math.max(0, Math.min(Number(S.guideChapter || 0), chapters.length - 1));
+  const chapter = chapters[S.guideChapter];
   const progress = bundle.effective_progress || bundle.progress || {};
   const completed = new Set(progress.completed || []);
   const favorites = new Set(progress.favorites || []);
   const revealed = new Set(progress.revealed_spoilers || []);
   const notes = progress.notes || {};
-  const media = bundle.media || [];
-  const mediaById = new Map(media.map((m) => [m.id, m]));
-  const status = S.smartStatuses[S.activeSlug] || bundle.status || {};
-  const mode = S.guideMode || "compact";
+  const mediaById = new Map((bundle.media || []).map((item) => [item.id, item]));
   const query = S.guideQuery.trim().toLocaleLowerCase("pt-BR");
   const filter = S.guideFilter || "all";
-  const importBtn = S.mode === "demo" ? "" : secs.length ? `
-    <details class="guide-more"><summary>Importar/substituir <span>⌄</span></summary>
-      <div class="guide-more-menu">
-        <button class="guide-menu-btn" id="guide-gamefaqs"><span>◎</span><span><b>GameFAQs</b><small>Buscar guia online</small></span></button>
-        <button class="guide-menu-btn" id="guide-import"><span>▤</span><span><b>Arquivo PDF</b><small>Texto e imagens locais</small></span></button>
-      </div></details>` : `
-    <div class="guide-empty-actions">
-      <button class="guide-import-card primary" id="guide-gamefaqs"><span class="guide-import-icon">◎</span><span><b>Importar do GameFAQs</b><small>Busque e escolha um guia online</small></span><span class="guide-arrow">→</span></button>
-      <button class="guide-import-card" id="guide-import"><span class="guide-import-icon">▤</span><span><b>Importar arquivo PDF</b><small>Inclui imagens incorporadas</small></span><span class="guide-arrow">→</span></button>
-    </div>`;
-  if (!secs.length) return `<div class="list-wrap"><div class="guide-empty-state">
-    <span class="guide-empty-kicker">GUIA INTELIGENTE</span><h2>Transforme informação em próxima ação</h2>
-    <p>Importe qualquer detonado. A fonte permanece intacta e o DigiTracker cria uma versão compacta, pesquisável e reversível.</p>${importBtn}
-  </div></div>`;
-
-  const phaseClass = ["error", "cancelled"].includes(status.phase) ? "err"
-    : ["success", "ready"].includes(status.phase) ? "ok" : "";
-  const statusAction = status.phase === "awaiting_consent"
-    ? `<button class="guide-status-action" id="guide-consent">Revisar e ativar</button>`
-    : status.phase === "awaiting_configuration"
-      ? `<button class="guide-status-action" id="guide-config-ai">Configurar IA</button>`
-      : status.phase === "error"
-        ? `<button class="guide-status-action" id="guide-retry">Tentar novamente</button>` : "";
-  const statusHTML = status.phase && status.phase !== "idle" ? `<div class="guide-ai-status ${phaseClass}" role="status">
-    <span class="task-icon">${status.phase === "running" ? "✦" : status.phase === "error" ? "!" : "✓"}</span>
-      <div class="task-copy"><b>${status.phase === "running" ? "Organizando o guia" : status.phase === "queued" ? "Guia na fila de organização" : status.phase === "awaiting_consent" ? "Sua confirmação é necessária" : status.phase === "awaiting_configuration" ? "IA ainda não configurada" : status.phase === "error" ? "Não foi possível publicar" : "Guia protegido e versionado"}</b>
-      <span>${esc(status.error || status.message || "Fonte original preservada.")}</span></div>
-    ${status.total ? `<div class="guide-ai-progress"><span style="width:${Math.round(100 * (status.completed || 0) / status.total)}%"></span></div>` : ""}
-    ${statusAction}
-  </div>` : "";
-
-  const legacyBlock = (b) => {
-    const cls = { boss: "g-boss", step: "g-step", subhead: "g-sub", note: "g-note", label: "g-row", li: "g-li" }[b.type] || "g-p";
-    return `<div class="${cls}">${esc(b.text)}</div>`;
-  };
-  const sourceHTML = `<div class="source-notice"><strong>Fonte original</strong><span>Conteúdo importado sem reescrita. Sempre disponível para conferência.</span></div>
-    ${secs.map((s) => `<section class="g-section"><p class="g-title">${esc(s.num)}. ${esc(s.title)}</p>${(s.blocks || []).map(legacyBlock).join("")}</section>`).join("")}`;
-
-  const icon = { objective: "→", checklist: "✓", warning: "!", missable: "◆", achievement: "🏆", challenge: "⚔", table: "▦", comparison: "⇄", image: "▧", route: "↝", graph: "◇", note: "i", spoiler: "◉", resource: "＋", checkpoint: "◷", text: "·" };
-  const visibleTypes = new Set(["objective", "checklist", "warning", "missable", "achievement", "challenge", "checkpoint"]);
-  const blockVisible = (block) => {
-    if (mode === "compact" && !visibleTypes.has(block.type)) return false;
-    const hay = `${block.title || ""} ${block.text || ""} ${(block.items || []).map((i) => i.text).join(" ")}`.toLocaleLowerCase("pt-BR");
+  const icons = { objective: "→", checklist: "✓", warning: "!", missable: "◆", achievement: "♜", challenge: "⚔", table: "▦", comparison: "⇄", image: "▧", route: "↝", graph: "◇", note: "i", spoiler: "◉", resource: "＋", checkpoint: "◷", text: "·" };
+  const visible = (block) => {
+    const hay = `${block.title || ""} ${block.text || ""} ${(block.items || []).map((item) => item.text).join(" ")}`.toLocaleLowerCase("pt-BR");
     if (query && !hay.includes(query)) return false;
     if (filter === "pending" && completed.has(block.id)) return false;
     if (filter === "favorites" && !favorites.has(block.id)) return false;
-    if (filter !== "all" && !["pending", "favorites"].includes(filter) && block.type !== filter) return false;
+    if (!["all", "pending", "favorites"].includes(filter) && block.type !== filter) return false;
     return true;
   };
+  const blocks = (chapter.blocks || []).filter(visible);
   const renderBlock = (block) => {
     const done = completed.has(block.id), favorite = favorites.has(block.id);
     const hiddenSpoiler = block.type === "spoiler" && !revealed.has(block.id);
     const visual = mediaById.get(block.visual_id);
     const items = (block.items || []).length ? `<ul>${block.items.map((item) => `<li>${esc(item.text)}</li>`).join("")}</ul>` : "";
     const table = (block.rows || []).length ? `<div class="smart-table">${block.rows.map((row) => `<div>${row.map((cell) => `<span>${esc(cell)}</span>`).join("")}</div>`).join("")}</div>` : "";
-    const refs = (block.source_refs || []).length ? `<span class="smart-source">Fonte ${block.source_refs.map((r) => r.page ? `p.${r.page}` : `§${r.section}`).join(", ")}</span>` : "";
-    return `<article class="smart-block type-${block.type} ${done ? "done" : ""}" id="guide-${esc(block.id)}" data-guide-block="${esc(block.id)}">
-      <button class="smart-check" data-guide-action="complete" data-value="${!done}" aria-label="${done ? "Marcar pendente" : "Concluir"}">${done ? "✓" : icon[block.type] || "·"}</button>
-      <div class="smart-content">
-        <div class="smart-block-head"><span class="smart-type">${esc(block.type)}</span>${block.estimated_minutes ? `<span>◷ ${block.estimated_minutes} min</span>` : ""}${refs}</div>
+    return `<article class="smart-block type-${esc(block.type)} ${done ? "done" : ""}" id="guide-${esc(block.id)}" data-guide-block="${esc(block.id)}">
+      <button class="smart-check" data-guide-action="complete" data-value="${!done}" aria-label="${done ? "Marcar pendente" : "Concluir"}">${done ? "✓" : icons[block.type] || "·"}</button>
+      <div class="smart-content"><div class="smart-block-head"><span class="smart-type">${esc(block.type)}</span>${block.estimated_minutes ? `<span>◷ ${block.estimated_minutes} min</span>` : ""}</div>
         ${block.title ? `<h4>${esc(block.title)}</h4>` : ""}
-        ${hiddenSpoiler ? `<button class="spoiler-cover" data-guide-action="reveal" data-value="true">Revelar spoiler</button>` : `<p>${esc(block.text)}</p>${items}${table}${visual ? `<figure><img src="${esc(visual.url)}" alt="${esc(visual.title || "Visual do guia")}"><figcaption>${esc(visual.attribution || visual.source_name || "")}</figcaption></figure>` : ""}`}
-        ${notes[block.id] ? `<div class="smart-note">Sua nota: ${esc(notes[block.id])}</div>` : ""}
-      </div>
+        ${hiddenSpoiler ? `<button class="spoiler-cover" data-guide-action="reveal" data-value="true">Revelar spoiler</button>` : `<p>${esc(block.text)}</p>${items}${table}${visual ? `<figure><img src="${esc(visual.url)}" alt="${esc(visual.title || "Imagem do guia")}"><figcaption>${esc(visual.attribution || visual.source_name || "")}</figcaption></figure>` : ""}`}
+        ${notes[block.id] ? `<div class="smart-note">Sua nota: ${esc(notes[block.id])}</div>` : ""}</div>
       <div class="smart-actions"><button data-guide-action="favorite" data-value="${!favorite}" title="Favoritar">${favorite ? "★" : "☆"}</button><button data-guide-note="${esc(block.id)}" title="Nota">＋</button></div>
     </article>`;
   };
-  const chaptersHTML = (doc.chapters || []).map((chapter, index) => {
-    const blocks = (chapter.blocks || []).filter(blockVisible);
-    if (!blocks.length) return "";
-    const done = (chapter.blocks || []).filter((b) => completed.has(b.id)).length;
-    return `<section class="smart-chapter"><header><span>${String(index + 1).padStart(2, "0")}</span><div><h3>${esc(chapter.title)}</h3><p>${esc(chapter.objective || "")}</p></div><b>${done}/${(chapter.blocks || []).length}</b></header>${blocks.map(renderBlock).join("")}</section>`;
-  }).join("");
-
-  const suggestions = (doc.visual_suggestions || []).filter((v) => v.status !== "rejected");
-  const visualHTML = mode === "full" && (suggestions.length || media.length) ? `<section class="visual-workbench">
-    <div><p class="list-title">RECURSOS VISUAIS</p><h3>Imagens e mapas com origem</h3></div>
-    ${suggestions.map((v) => `<button class="visual-suggestion" ${(["route","graph"].includes(v.type) && (v.nodes || []).length) ? `data-diagram-id="${esc(v.id)}"` : `data-media-query="${esc(v.query)}"`}><span>${icon[v.type] || "▧"}</span><b>${esc(v.title)}</b><small>${esc(v.reason)}</small><i>${(["route","graph"].includes(v.type) && (v.nodes || []).length) ? "Gerar diagrama →" : "Revisar busca →"}</i></button>`).join("")}
-    ${media.length ? `<div class="guide-gallery">${media.map((m) => `<figure><img src="${esc(m.url)}" alt=""><figcaption>${esc(m.title)} · ${esc(m.license || m.source_name)}</figcaption></figure>`).join("")}</div>` : ""}
-  </section>` : "";
-  const revisions = bundle.revisions || [];
-  const blockLookup = new Map((doc.chapters || []).flatMap((chapter) => (chapter.blocks || []).map((block) => [block.id, block.title || block.text || chapter.title])));
-  const revisionHTML = revisions.length ? `<details class="revision-panel"><summary>Histórico de versões (${revisions.length})</summary>${revisions.map((r, i) => `<div><span>${new Date((r.created_at || 0) * 1000).toLocaleString("pt-BR")} · ${esc(r.provider || "local")}</span>${i ? `<button data-restore-revision="${esc(r.revision_id)}">Restaurar</button>` : `<b>ATUAL</b>`}</div>`).join("")}</details>` : "";
-  const completionHistory = (progress.history || []).slice(-12).reverse();
-  const completionHTML = completionHistory.length ? `<details class="revision-panel"><summary>Histórico da jornada (${progress.history.length})</summary>${completionHistory.map((h) => `<div><span>${new Date((h.at || 0) * 1000).toLocaleString("pt-BR")} · ${esc(blockLookup.get(h.block_id) || "Etapa")}</span><b>${esc(h.action === "completed" ? "CONCLUÍDO" : h.action)}</b></div>`).join("")}</details>` : "";
-  const portabilityHTML = S.mode === "demo" ? "" : `<div class="guide-portability"><div><b>Pacote portátil</b><span>Fonte, revisões, atribuições, mídia e progresso opcional.</span></div><button id="guide-pack-export">Exportar</button><button id="guide-pack-import">Importar</button></div>`;
-  let sessionUsed = 0;
-  const sessionBlocks = (doc.chapters || []).flatMap((chapter) => (chapter.blocks || []).map((block) => ({ ...block, chapter: chapter.title })))
-    .filter((block) => !completed.has(block.id) && visibleTypes.has(block.type))
-    .filter((block) => { const minutes = block.estimated_minutes || 5; if (sessionUsed + minutes > (progress.session_minutes || 30)) return false; sessionUsed += minutes; return true; })
-    .slice(0, 6);
-  const sessionHTML = mode !== "source" && sessionBlocks.length ? `<aside class="session-plan"><div><span>SESSÃO DE ${progress.session_minutes || 30} MIN</span><b>${sessionBlocks.length} ações · ~${sessionUsed} min</b></div>${sessionBlocks.map((b) => `<button data-jump-block="${esc(b.id)}"><small>${esc(b.chapter)}</small><strong>${esc(b.title || b.text)}</strong></button>`).join("")}</aside>` : "";
-
-  return `<div class="list-wrap guide-wrap ${S.guideDensity === "compact" ? "density-compact" : ""}">
-    <div class="guide-console-head">
-      <div><p class="list-title">GUIA INTELIGENTE</p><h2>${esc(doc.title || "Guia estruturado")}</h2><p>${esc(doc.summary || "A fonte original está preservada e disponível a qualquer momento.")}</p></div>
-      <div class="guide-actions"><button class="guide-action ai" id="smart-generate" ${["running","queued"].includes(status.phase) ? "disabled" : ""}>✦ ${doc.provider && doc.provider !== "local" ? "Atualizar com IA" : "Organizar com IA"}</button>${importBtn}</div>
-    </div>
-    ${statusHTML}
-    ${sessionHTML}${mode === "source" ? sourceHTML : (chaptersHTML || `<div class="guide-no-results">Nenhum bloco corresponde aos filtros.</div>`)}
-    ${visualHTML}${revisionHTML}${completionHTML}${portabilityHTML}
+  const done = (chapter.blocks || []).filter((block) => completed.has(block.id)).length;
+  const pct = (chapter.blocks || []).length ? Math.round(done / chapter.blocks.length * 100) : 0;
+  return `<div class="list-wrap guide-wrap journey-reader ${S.guideDensity === "compact" ? "density-compact" : ""}">
+    <header class="journey-reader-head"><div><span>CAPÍTULO ${S.guideChapter + 1} DE ${chapters.length}</span><h2>${esc(chapter.title)}</h2><p>${esc(chapter.objective || doc.summary || "")}</p></div><div class="journey-reader-progress"><b>${pct}%</b><span><i style="width:${pct}%"></i></span><small>${done}/${(chapter.blocks || []).length} passos</small></div></header>
+    <section class="smart-chapter focused">${blocks.map(renderBlock).join("") || `<div class="guide-no-results">Nenhum passo corresponde aos filtros.</div>`}</section>
+    <footer class="journey-reader-nav"><button id="guide-chapter-prev" ${S.guideChapter <= 0 ? "disabled" : ""}>← Capítulo anterior</button><button id="journey-reader-sources">Gerenciar fontes</button><button id="guide-chapter-next" ${S.guideChapter >= chapters.length - 1 ? "disabled" : ""}>Próximo capítulo →</button></footer>
   </div>`;
 }
 
@@ -1484,7 +1735,7 @@ async function dicasIa(kind) {
   if (!slug) return;
   if (!S.aiReady) {
     toast("Configure uma chave de IA para continuar.");
-    return enterSettings("ai", { slug, tab: "tips" });
+    return enterSettings("ai", { slug, tab: "journey" });
   }
   try {
     const res = await backend.startGameTipsAI(slug, kind);
@@ -1505,11 +1756,11 @@ async function gerarSmartGuide() {
   if (!slug || S.mode === "demo") return;
   if (!S.smartGuideConsent) {
     toast("Revise e confirme o uso da IA primeiro.");
-    return enterSettings("experience", { slug, tab: "tips" });
+    return enterSettings("experience", { slug, tab: "journey" });
   }
   if (!S.aiReady) {
     toast("Configure uma chave de IA para continuar.");
-    return enterSettings("ai", { slug, tab: "tips" });
+    return enterSettings("ai", { slug, tab: "journey" });
   }
   const res = await backend.startSmartGuide(slug, true).catch((e) => ({ ok: false, error: String(e) }));
   if (!res?.ok) return toast(res?.error || res?.message || "Não foi possível iniciar.", true);
@@ -1544,13 +1795,24 @@ async function atualizarGuia(action, blockId, value) {
   await renderDashboard({ force: true });
 }
 
-function openGuideMedia(query = "") {
-  S.GM = { query, source: "openverse", results: [], busy: false, error: "" };
+function openGuideMedia(query = "", context = null) {
+  const localMedia = S.dashboardGame?.smart_guide?.media || [];
+  S.GM = { query, context, source: context ? "web" : "openverse", results: context ? localMedia.map((item) => ({ ...item, thumbnail: item.url, _local: true })) : [], busy: false, error: "" };
   renderGuideMedia();
   if (query) searchGuideMedia();
 }
 
 function closeGuideMedia() { document.getElementById("guide-media-modal")?.remove(); S.GM = null; }
+
+async function finishGuideMedia(media) {
+  const context = S.GM?.context;
+  if (context && media?.id) {
+    const linked = await backend.setGuideSystemMedia(S.activeSlug, context.systemId, context.nodeId, media.id)
+      .catch((error) => ({ ok: false, error: String(error) }));
+    if (!linked?.ok) return toast(linked?.error || "A imagem foi salva, mas não pôde ser associada.", true);
+  }
+  closeGuideMedia(); toast(context ? "Imagem associada ao nó." : "Imagem salva com atribuição."); await renderDashboard({ force: true });
+}
 
 function renderGuideMedia() {
   let modal = document.getElementById("guide-media-modal");
@@ -1558,15 +1820,15 @@ function renderGuideMedia() {
   const G = S.GM;
   modal.innerHTML = `<div class="gf-panel media-panel" role="dialog" aria-modal="true" aria-label="Recursos visuais do guia">
     <div class="gf-head"><div><div class="gf-title">REVISAR RECURSO VISUAL</div><div class="gf-sub">Nada é anexado sem sua aprovação.</div></div><button class="gf-close" id="gm-x">✕</button></div>
-    <div class="gf-body"><div class="cv-sources"><button class="cv-src ${G.source === "openverse" ? "on" : ""}" data-gm-source="openverse">Openverse</button><button class="cv-src ${G.source === "wikimedia" ? "on" : ""}" data-gm-source="wikimedia">Wikimedia</button><button class="cv-src" id="gm-broad">Busca ampla ↗</button></div>
+    <div class="gf-body"><div class="cv-sources">${G.context ? `<button class="cv-src ${G.source === "web" ? "on" : ""}" data-gm-source="web">Web / Google</button><button class="cv-src ${G.source === "library" ? "on" : ""}" data-gm-source="library">Biblioteca local</button>` : ""}<button class="cv-src ${G.source === "openverse" ? "on" : ""}" data-gm-source="openverse">Openverse</button><button class="cv-src ${G.source === "wikimedia" ? "on" : ""}" data-gm-source="wikimedia">Wikimedia</button><button class="cv-src" id="gm-broad">Busca ampla ↗</button></div>
       <div class="search-box"><span>⌕</span><input id="gm-q" value="${esc(G.query)}" placeholder="O que ajudaria a explicar esta etapa?"><button class="cv-go" id="gm-go">Buscar</button></div>
       <div class="media-manual"><input id="gm-url" placeholder="Cole aqui a URL direta encontrada na busca ampla"><label><input id="gm-rights" type="checkbox"> Confirmo que posso usar esta imagem</label><button id="gm-url-save">Revisar e salvar URL</button></div>
       <label class="media-local"><span>＋ Adicionar imagem local</span><input id="gm-file" type="file" accept="image/*"></label>
       ${G.busy ? `<div class="status-msg">Buscando mídia com licença identificável…</div>` : ""}${G.error ? `<div class="gf-error">${esc(G.error)}</div>` : ""}
-      <div class="media-results">${G.results.map((m, i) => `<article><img src="${esc(m.thumbnail)}" alt=""><div><b>${esc(m.title)}</b><span>${esc(m.creator || "Autor desconhecido")}</span><small>${esc(m.license || "Licença não informada")}</small><button data-gm-approve="${i}">Aprovar e salvar</button></div></article>`).join("")}</div>
+      <div class="media-results">${G.results.map((m, i) => `<article><img src="${esc(m.thumbnail || m.thumb || m.url)}" alt=""><div><b>${esc(m.title || "Imagem encontrada")}</b><span>${esc(m.creator || m.host || m.source_name || "Origem externa")}</span><small>${esc(m.license || (m.width ? `${m.width}×${m.height || "?"}` : "Licença não informada"))}</small><button data-gm-approve="${i}">${m._local ? "Usar esta imagem" : "Aprovar e salvar"}</button></div></article>`).join("")}</div>
     </div></div>`;
   $("#gm-x").onclick = closeGuideMedia;
-  modal.querySelectorAll("[data-gm-source]").forEach((b) => b.onclick = () => { G.source = b.dataset.gmSource; renderGuideMedia(); searchGuideMedia(); });
+  modal.querySelectorAll("[data-gm-source]").forEach((b) => b.onclick = () => { G.source = b.dataset.gmSource; if (G.source === "library") G.results = (S.dashboardGame?.smart_guide?.media || []).map((item) => ({ ...item, thumbnail: item.url, _local: true })); renderGuideMedia(); if (G.source !== "library") searchGuideMedia(); });
   $("#gm-go").onclick = () => { G.query = ($("#gm-q")?.value || "").trim(); searchGuideMedia(); };
   $("#gm-q").onkeydown = (e) => { if (e.key === "Enter") { G.query = e.currentTarget.value.trim(); searchGuideMedia(); } };
   $("#gm-broad").onclick = () => backend.broadMediaSearch(G.query || ($("#gm-q")?.value || ""));
@@ -1575,28 +1837,36 @@ function renderGuideMedia() {
     if (!url || !confirmed) return toast("Cole a URL e confirme o direito de uso.", true);
     const res = await backend.approveGuideMedia(S.activeSlug, { source:"manual", url, title:"Imagem da busca ampla", creator:"", license:"Uso confirmado pelo usuário", provider:"Busca ampla", landing_url:url }, true);
     if (!res?.ok) return toast(res?.error || "Falha ao salvar URL.", true);
-    closeGuideMedia(); toast("Imagem salva com confirmação de uso."); await renderDashboard({ force: true });
+    await finishGuideMedia(res.media);
   };
   $("#gm-file").onchange = async (e) => {
     const file = e.target.files?.[0]; if (!file) return;
     const data = await fileToBase64(file);
     const res = await backend.addGuideMedia(S.activeSlug, data, file.name, file.name);
     if (!res?.ok) return toast(res?.error || "Falha ao anexar.", true);
-    closeGuideMedia(); toast("Imagem local adicionada."); await renderDashboard({ force: true });
+    await finishGuideMedia(res.media);
   };
   modal.querySelectorAll("[data-gm-approve]").forEach((b) => b.onclick = async () => {
     const candidate = G.results[Number(b.dataset.gmApprove)];
+    if (candidate?._local) return finishGuideMedia(candidate);
     b.disabled = true; b.textContent = "Salvando…";
-    const res = await backend.approveGuideMedia(S.activeSlug, candidate, false);
+    const web = G.source === "web";
+    const confirmed = web ? window.confirm("Confirme que você possui direito de usar esta imagem. Ela só será salva localmente após sua aprovação.") : false;
+    if (web && !confirmed) { b.disabled = false; b.textContent = "Aprovar e salvar"; return; }
+    const reviewed = web ? { ...candidate, source: "manual", thumbnail: candidate.thumb, landing_url: candidate.source_page || candidate.source || candidate.url, license: "Uso confirmado pelo usuário", provider: candidate.provider || "Busca web" } : candidate;
+    const res = await backend.approveGuideMedia(S.activeSlug, reviewed, confirmed);
     if (!res?.ok) { b.disabled = false; b.textContent = "Aprovar e salvar"; return toast(res?.error || "Falha ao salvar.", true); }
-    closeGuideMedia(); toast("Imagem salva com atribuição."); await renderDashboard({ force: true });
+    await finishGuideMedia(res.media);
   });
 }
 
 async function searchGuideMedia() {
   const G = S.GM; if (!G || !G.query) return;
+  if (G.source === "library") return;
   G.busy = true; G.error = ""; renderGuideMedia();
-  const res = await backend.searchGuideMedia(G.query, G.source).catch((e) => ({ ok: false, error: String(e) }));
+  const res = await (G.source === "web" && G.context
+    ? backend.searchGuideSystemMedia(S.activeSlug, G.context.systemId, G.context.nodeId, G.query, 0)
+    : backend.searchGuideMedia(G.query, G.source)).catch((e) => ({ ok: false, error: String(e) }));
   if (!S.GM) return;
   G.busy = false; G.results = res?.results || []; G.error = res?.ok ? "" : (res?.error || "Falha na busca."); renderGuideMedia();
 }
@@ -1625,7 +1895,201 @@ async function acompanharDicasIa() {
   }
 }
 
+function openGuideSystemEditor(system = null, sourceId = "") {
+  const clone = system ? JSON.parse(JSON.stringify(system)) : {
+    id: "", title: "Novo sistema visual", description: "", group_label: "Grupo",
+    layout: "layered", origin: "manual", status: "approved", source_id: sourceId, source_refs: [],
+    nodes: [
+      { id: "node-a", label: "Origem", subtitle: "", stage: "", group: "", tags: [], attributes: {}, media_query: "", spoiler: false, source_refs: [] },
+      { id: "node-b", label: "Destino", subtitle: "", stage: "", group: "", tags: [], attributes: {}, media_query: "", spoiler: false, source_refs: [] },
+    ],
+    edges: [{ id: "", from: "node-a", to: "node-b", label: "", path_kind: "normal", requirements: [], missable: false, spoiler: false, source_refs: [] }],
+  };
+  clone.origin = "manual"; clone.status = "approved";
+  S.GSE = clone;
+  renderGuideSystemEditor();
+}
+
+function closeAtlasSourceWizard() { document.getElementById("atlas-source-wizard")?.remove(); }
+
+function openAtlasSourceWizard(replaceSystem = null) {
+  closeAtlasSourceWizard();
+  const modal = document.createElement("div");
+  modal.id = "atlas-source-wizard"; modal.className = "modal-bg";
+  modal.innerHTML = `<div class="atlas-source-wizard" role="dialog" aria-modal="true" aria-label="Nova fonte exclusiva do Atlas">
+    <header><div><span>ATLAS / ${replaceSystem ? "TROCAR FONTE" : "NOVO SISTEMA"}</span><h2>${replaceSystem ? "Escolha a nova fonte exclusiva" : "Qual estrutura deseja mapear?"}</h2><p>A fonte anterior continuará no histórico de revisões.</p></div><button id="atlas-source-close">×</button></header>
+    <label>Nome do sistema<input id="atlas-source-title" value="${esc(replaceSystem?.title || "")}" placeholder="Ex.: Árvore de habilidades, crafting, relacionamentos"></label>
+    <div class="atlas-source-options"><button id="atlas-source-pdf"><span>▤</span><b>Importar PDF</b><small>Analisa texto, relações e requisitos deste arquivo.</small></button><button id="atlas-source-gamefaqs"><span>◎</span><b>Usar GameFAQs</b><small>Cole o endereço direto de um guia.</small></button></div>
+    <div class="atlas-source-url" id="atlas-source-url-row" hidden><input id="atlas-source-url" placeholder="https://gamefaqs.gamespot.com/..."><button id="atlas-source-url-submit">Analisar guia</button></div>
+    <p class="atlas-source-foot">A IA não poderá inventar relações ausentes. Sem IA configurada, a fonte será anexada ao editor manual.</p>
+  </div>`;
+  document.body.appendChild(modal);
+  const title = () => ($("#atlas-source-title", modal)?.value || "").trim();
+  $("#atlas-source-close", modal).onclick = closeAtlasSourceWizard;
+  $("#atlas-source-pdf", modal).onclick = () => {
+    if (!title()) return toast("Informe o nome do sistema.", true);
+    const input = document.createElement("input"); input.type = "file"; input.accept = ".pdf,application/pdf";
+    input.onchange = async () => {
+      const file = input.files?.[0]; if (!file) return;
+      const data = await fileToBase64(file); closeAtlasSourceWizard();
+      const payload = { kind: "pdf", title: title(), data, filename: file.name };
+      const result = replaceSystem ? await backend.replaceGuideSystemSource(S.activeSlug, replaceSystem.id, payload).catch((error) => ({ ok: false, error: String(error) })) : await backend.createGuideSystemPdf(S.activeSlug, title(), data, file.name).catch((error) => ({ ok: false, error: String(error) }));
+      await finishAtlasSourceImport(result, title());
+    };
+    input.click();
+  };
+  $("#atlas-source-gamefaqs", modal).onclick = () => { $("#atlas-source-url-row", modal).hidden = false; $("#atlas-source-url", modal).focus(); };
+  $("#atlas-source-url-submit", modal).onclick = async () => {
+    const url = ($("#atlas-source-url", modal)?.value || "").trim();
+    if (!title() || !url) return toast("Informe o nome e o endereço do guia.", true);
+    const systemTitle = title(); closeAtlasSourceWizard();
+    const payload = { kind: "gamefaqs", title: systemTitle, url };
+    const result = replaceSystem ? await backend.replaceGuideSystemSource(S.activeSlug, replaceSystem.id, payload).catch((error) => ({ ok: false, error: String(error) })) : await backend.createGuideSystemGameFaqs(S.activeSlug, systemTitle, url).catch((error) => ({ ok: false, error: String(error) }));
+    await finishAtlasSourceImport(result, systemTitle);
+  };
+}
+
+async function finishAtlasSourceImport(result, title) {
+  if (!result?.ok) return toast(result?.error || "Não foi possível importar a fonte do Atlas.", true);
+  const sourceId = result.source?.id || result.source_id;
+  if (["awaiting_configuration", "awaiting_consent"].includes(result.phase)) {
+    toast(result.message || "Fonte anexada. Complete o sistema manualmente.");
+    return openGuideSystemEditor(null, sourceId);
+  }
+  toast("Fonte anexada. A IA está montando a prévia do sistema.");
+  // Dashboard polling displays persisted job state; no loop tied to mutable activeSlug.
+  await renderDashboard({ force: true });
+}
+
+async function viewAtlasSource(systemId) {
+  const result = await backend.guideSystemSource(S.activeSlug, systemId).catch((error) => ({ ok: false, error: String(error) }));
+  if (!result?.ok) return toast(result?.error || "Fonte não encontrada.", true);
+  const source = result.source || {};
+  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="atlas-source-view"><div class="gf-panel atlas-source-view"><h3>Fonte exclusiva do Atlas</h3><p><b>${esc(source.title || "Fonte do sistema")}</b></p><dl><div><dt>Tipo</dt><dd>${esc(source.kind || "legacy")}</dd></div><div><dt>Arquivo</dt><dd>${esc(source.filename || "—")}</dd></div><div><dt>URL</dt><dd>${esc(source.url || "—")}</dd></div></dl><p>Esta fonte não participa da consolidação da Jornada.</p><button class="btn-primary" id="atlas-source-view-close">Fechar</button></div></div>`);
+  $("#atlas-source-view-close").onclick = () => $("#atlas-source-view")?.remove();
+}
+
+function closeGuideSystemEditor() { document.getElementById("guide-system-editor")?.remove(); S.GSE = null; }
+
+function syncGuideSystemEditor() {
+  const E = S.GSE; if (!E) return;
+  E.title = $("#gse-title")?.value || E.title;
+  E.description = $("#gse-description")?.value || "";
+  E.group_label = $("#gse-group-label")?.value || "Grupo";
+  E.layout = $("#gse-layout")?.value || "layered";
+  document.querySelectorAll("[data-gse-node]").forEach((row) => {
+    const node = E.nodes[Number(row.dataset.gseNode)]; if (!node) return;
+    node.label = row.querySelector("[data-node-label]")?.value || "";
+    node.stage = row.querySelector("[data-node-stage]")?.value || "";
+    node.group = row.querySelector("[data-node-group]")?.value || "";
+    node.subtitle = row.querySelector("[data-node-subtitle]")?.value || "";
+    node.media_query = row.querySelector("[data-node-media-query]")?.value || "";
+    node.tags = (row.querySelector("[data-node-tags]")?.value || "").split(",").map((item) => item.trim()).filter(Boolean);
+    node.spoiler = !!row.querySelector("[data-node-spoiler]")?.checked;
+  });
+  document.querySelectorAll("[data-gse-edge]").forEach((row) => {
+    const edge = E.edges[Number(row.dataset.gseEdge)]; if (!edge) return;
+    edge.from = row.querySelector("[data-edge-from]")?.value || "";
+    edge.to = row.querySelector("[data-edge-to]")?.value || "";
+    edge.label = row.querySelector("[data-edge-label]")?.value || "";
+    edge.path_kind = row.querySelector("[data-edge-kind]")?.value || "normal";
+    edge.missable = !!row.querySelector("[data-edge-missable]")?.checked;
+    const texts = (row.querySelector("[data-edge-requirement]")?.value || "").split("\n").map((item) => item.trim()).filter(Boolean);
+    const previous = edge.requirements || [];
+    edge.requirements = texts.map((text, index) => ({ ...(previous[index] || {}), id: previous[index]?.id || "", text, source_refs: previous[index]?.source_refs || edge.source_refs || [] }));
+  });
+}
+
+function renderGuideSystemEditor() {
+  let modal = document.getElementById("guide-system-editor");
+  if (!modal) { modal = document.createElement("div"); modal.id = "guide-system-editor"; modal.className = "modal-bg"; document.body.appendChild(modal); }
+  const E = S.GSE, options = (selected) => E.nodes.map((node) => `<option value="${esc(node.id)}" ${node.id === selected ? "selected" : ""}>${esc(node.label || "Sem nome")}</option>`).join("");
+  modal.innerHTML = `<div class="system-editor-panel" role="dialog" aria-modal="true" aria-label="Editor de sistema visual">
+    <header><div><span>EDITOR GENÉRICO</span><h2>${E.id ? "Editar sistema visual" : "Criar sistema visual"}</h2></div><button id="gse-close">×</button></header>
+    <div class="system-editor-scroll"><section class="system-editor-basics"><label>Título<input id="gse-title" value="${esc(E.title)}"></label><label>Rótulo dos grupos<input id="gse-group-label" value="${esc(E.group_label)}"></label><label>Layout<select id="gse-layout"><option value="layered" ${E.layout === "layered" ? "selected" : ""}>Em camadas</option><option value="vertical" ${E.layout === "vertical" ? "selected" : ""}>Vertical</option><option value="radial" ${E.layout === "radial" ? "selected" : ""}>Radial</option></select></label><label class="wide">Descrição<textarea id="gse-description">${esc(E.description)}</textarea></label></section>
+    <section><div class="system-editor-title"><div><span>01</span><h3>Nós</h3><p>Entidades, estados, classes, receitas ou etapas.</p></div><button id="gse-add-node">＋ Adicionar nó</button></div><div class="system-editor-list">${E.nodes.map((node, index) => `<article data-gse-node="${index}"><div class="row-index">${index + 1}</div><div class="node-fields"><input data-node-label value="${esc(node.label)}" placeholder="Nome"><input data-node-stage value="${esc(node.stage)}" placeholder="Estágio"><input data-node-group value="${esc(node.group)}" placeholder="Grupo"><input data-node-tags value="${esc((node.tags || []).join(", "))}" placeholder="Tags separadas por vírgula"><input class="wide" data-node-subtitle value="${esc(node.subtitle)}" placeholder="Descrição curta"><input class="wide" data-node-media-query value="${esc(node.media_query || "")}" placeholder="Consulta sugerida para imagem"><label><input data-node-spoiler type="checkbox" ${node.spoiler ? "checked" : ""}> spoiler</label></div><button data-remove-node="${index}" title="Remover">×</button></article>`).join("")}</div></section>
+    <section><div class="system-editor-title"><div><span>02</span><h3>Caminhos e condições</h3><p>Relações documentadas entre os nós.</p></div><button id="gse-add-edge">＋ Adicionar caminho</button></div><div class="system-editor-list">${E.edges.map((edge, index) => `<article data-gse-edge="${index}"><div class="row-index">${index + 1}</div><div class="edge-fields"><select data-edge-from>${options(edge.from)}</select><span>→</span><select data-edge-to>${options(edge.to)}</select><input data-edge-label value="${esc(edge.label)}" placeholder="Rótulo do caminho"><select data-edge-kind><option value="normal" ${edge.path_kind === "normal" ? "selected" : ""}>Normal</option><option value="alternative" ${edge.path_kind === "alternative" ? "selected" : ""}>Alternativo</option><option value="optional" ${edge.path_kind === "optional" ? "selected" : ""}>Opcional</option></select><textarea class="wide" data-edge-requirement placeholder="Um requisito documentado por linha">${esc((edge.requirements || []).map((item) => item.text).join("\n"))}</textarea><label><input data-edge-missable type="checkbox" ${edge.missable ? "checked" : ""}> perdível</label></div><button data-remove-edge="${index}" title="Remover">×</button></article>`).join("")}</div></section></div>
+    <footer><p>A fonte original não será modificada. Esta edição cria uma nova revisão atômica.</p><button id="gse-cancel">Cancelar</button><button class="primary" id="gse-save">Publicar nova revisão</button></footer>
+  </div>`;
+  $("#gse-close").onclick = closeGuideSystemEditor; $("#gse-cancel").onclick = closeGuideSystemEditor;
+  $("#gse-add-node").onclick = () => { syncGuideSystemEditor(); E.nodes.push({ id: `manual-${Date.now()}`, label: "Novo nó", subtitle: "", stage: "", group: "", tags: [], attributes: {}, media_query: "", spoiler: false, source_refs: [] }); renderGuideSystemEditor(); };
+  $("#gse-add-edge").onclick = () => { syncGuideSystemEditor(); if (E.nodes.length < 2) return toast("Adicione ao menos dois nós.", true); E.edges.push({ id: "", from: E.nodes[0].id, to: E.nodes[1].id, label: "", path_kind: "normal", requirements: [], missable: false, spoiler: false, source_refs: [] }); renderGuideSystemEditor(); };
+  modal.querySelectorAll("[data-remove-node]").forEach((button) => button.onclick = () => { syncGuideSystemEditor(); const removed = E.nodes.splice(Number(button.dataset.removeNode), 1)[0]; E.edges = E.edges.filter((edge) => edge.from !== removed.id && edge.to !== removed.id); renderGuideSystemEditor(); });
+  modal.querySelectorAll("[data-remove-edge]").forEach((button) => button.onclick = () => { syncGuideSystemEditor(); E.edges.splice(Number(button.dataset.removeEdge), 1); renderGuideSystemEditor(); });
+  $("#gse-save").onclick = async () => {
+    syncGuideSystemEditor(); const button = $("#gse-save"); button.disabled = true; button.textContent = "Validando…";
+    const result = E._draftSource ? await appCall("approve_atlas_job", S.activeSlug, E._draftSource, E)
+      : await backend.saveGuideSystem(S.activeSlug, E).catch((error) => ({ ok: false, error: String(error) }));
+    if (!result?.ok) { button.disabled = false; button.textContent = "Publicar nova revisão"; return toast(result?.error || "Sistema inválido.", true); }
+    S.guideAtlas.draftSource = ""; S.guideAtlas.systemId = result.system?.id || E.id; closeGuideSystemEditor(); toast("Sistema visual publicado em uma nova revisão."); await renderDashboard({ force: true });
+  };
+}
+
+function bindGuideAtlas(game) {
+  if (S.tab !== "atlas" || !game) return;
+  const systems = atlasSystems(game);
+  const system = systems.find((item) => item.id === S.guideAtlas.systemId) || systems.find((item) => item.status !== "rejected");
+  const selected = system?.nodes?.find((node) => node.id === S.guideAtlas.nodeId);
+  const rerender = () => renderDashboard({ force: true });
+  $("#atlas-path")?.addEventListener("change", async event => { const r = await appCall("set_guide_system_path", game.slug, system.id, event.target.value); if (!r.ok) toast(r.error,true); await rerender(); });
+  root.querySelectorAll("[data-atlas-review-job]").forEach((b) => b.onclick = () => { S.guideAtlas.draftSource = b.dataset.atlasReviewJob; S.guideAtlas.systemId = ""; rerender(); });
+  root.querySelectorAll("[data-atlas-manual-job]").forEach((b) => b.onclick = () => openGuideSystemEditor(null, b.dataset.atlasManualJob));
+  for (const [attr, method] of [["atlasCancelJob", "cancel_atlas_job"], ["atlasRetryJob", "retry_atlas_job"]]) {
+    root.querySelectorAll(attr === "atlasCancelJob" ? "[data-atlas-cancel-job]" : "[data-atlas-retry-job]").forEach((b) => b.onclick = async () => {
+      b.disabled = true; const r = await appCall(method, game.slug, b.dataset[attr]);
+      if (!r.ok) { b.disabled = false; toast(r.error, true); } else await rerender();
+    });
+  }
+  $("#atlas-back-published")?.addEventListener("click", () => { S.guideAtlas.draftSource = ""; rerender(); });
+  $("#atlas-list-toggle")?.addEventListener("click", () => { S.guideAtlas.list = !S.guideAtlas.list; rerender(); });
+  $("#atlas-system")?.addEventListener("change", (event) => { S.guideAtlas.systemId = event.target.value; S.guideAtlas.nodeId = ""; S.guideAtlas.group = "all"; S.guideAtlas.tag = "all"; rerender(); });
+  $("#atlas-group")?.addEventListener("change", (event) => { S.guideAtlas.group = event.target.value; rerender(); });
+  $("#atlas-tag")?.addEventListener("change", (event) => { S.guideAtlas.tag = event.target.value; rerender(); });
+  $("#atlas-availability")?.addEventListener("change", (event) => { S.guideAtlas.availability = event.target.value; rerender(); });
+  $("#atlas-spoilers")?.addEventListener("change", (event) => { S.guideAtlas.spoilers = event.target.checked; rerender(); });
+  root.querySelectorAll("[data-atlas-node]").forEach((button) => {
+    button.onclick = () => { S.guideAtlas.nodeId = button.dataset.atlasNode; rerender(); };
+    button.onkeydown = (event) => {
+      const current = button.dataset.atlasNode;
+      const edge = event.key === "ArrowRight" ? system?.edges?.find((item) => item.from === current)
+        : event.key === "ArrowLeft" ? system?.edges?.find((item) => item.to === current) : null;
+      const target = edge ? (event.key === "ArrowRight" ? edge.to : edge.from) : "";
+      if (target) { event.preventDefault(); S.guideAtlas.nodeId = target; rerender().then(() => root.querySelector(`[data-atlas-node="${target}"]`)?.focus()); }
+    };
+  });
+  root.querySelectorAll("[data-atlas-zoom]").forEach((button) => button.onclick = () => {
+    const action = button.dataset.atlasZoom;
+    if (action === "fit") {
+      const view = $("#atlas-viewport"), world = view?.querySelector(".atlas-world");
+      S.guideAtlas.zoom = Math.max(.1, Math.min(1.6, (view.clientWidth - 32) / world.offsetWidth, (view.clientHeight - 32) / world.offsetHeight));
+      S.guideAtlas.panX = (view.clientWidth - world.offsetWidth * S.guideAtlas.zoom) / 2;
+      S.guideAtlas.panY = (view.clientHeight - world.offsetHeight * S.guideAtlas.zoom) / 2;
+    }
+    else S.guideAtlas.zoom = Math.max(.1, Math.min(1.6, S.guideAtlas.zoom + (action === "in" ? .12 : -.12)));
+    rerender();
+  });
+  const viewport = $("#atlas-viewport");
+  if (viewport) {
+    let start = null, origin = null;
+    viewport.onmousedown = (event) => { if (event.target.closest("button,input,select,label")) return; start = [event.clientX, event.clientY]; origin = [S.guideAtlas.panX, S.guideAtlas.panY]; viewport.classList.add("panning"); };
+    window.onmousemove = (event) => { if (!start) return; S.guideAtlas.panX = origin[0] + event.clientX - start[0]; S.guideAtlas.panY = origin[1] + event.clientY - start[1]; viewport.closest(".atlas-shell")?.style.setProperty("--atlas-x", `${S.guideAtlas.panX}px`); viewport.closest(".atlas-shell")?.style.setProperty("--atlas-y", `${S.guideAtlas.panY}px`); };
+    window.onmouseup = () => { start = null; viewport.classList.remove("panning"); };
+    viewport.onwheel = (event) => { event.preventDefault(); S.guideAtlas.zoom = Math.max(.1, Math.min(1.6, S.guideAtlas.zoom + (event.deltaY < 0 ? .08 : -.08))); viewport.closest(".atlas-shell")?.style.setProperty("--atlas-zoom", S.guideAtlas.zoom); };
+  }
+  $("#atlas-create")?.addEventListener("click", () => openAtlasSourceWizard());
+  root.querySelectorAll("#atlas-edit").forEach((button) => button.onclick = () => openGuideSystemEditor(system));
+  $("#atlas-approve")?.addEventListener("click", async () => { const result = system._draftSource ? await appCall("approve_atlas_job", game.slug, system._draftSource) : await backend.saveGuideSystem(game.slug, { ...system, status: "approved" }); if (!result?.ok) return toast(result?.error || "Falha ao aprovar.", true); S.guideAtlas.draftSource = ""; toast("Sistema aprovado."); await rerender(); });
+  $("#atlas-reject")?.addEventListener("click", async () => { const result = system._draftSource ? await appCall("cancel_atlas_job", game.slug, system._draftSource) : await backend.saveGuideSystem(game.slug, { ...system, status: "rejected" }); if (!result?.ok) return toast(result?.error || "Falha ao rejeitar.", true); S.guideAtlas.draftSource = ""; S.guideAtlas.systemId = ""; toast("Sugestão rejeitada; a fonte permanece intacta."); await rerender(); });
+  $("#atlas-goal")?.addEventListener("click", async () => { if (!selected || system._draftSource) return; const current = game.smart_guide?.system_state?.goals?.[system.id]; const result = await backend.setGuideSystemGoal(S.activeSlug, system.id, current === selected.id ? "" : selected.id); if (!result?.ok) return toast(result?.error || "Falha ao fixar objetivo.", true); toast(current === selected.id ? "Objetivo removido." : "Objetivo enviado ao overlay."); await rerender(); });
+  root.querySelectorAll("[data-atlas-requirement]").forEach((input) => input.onchange = async () => { const result = await backend.updateGuideRequirement(S.activeSlug, system.id, input.dataset.edge, input.dataset.atlasRequirement, input.checked); if (!result?.ok) { input.checked = !input.checked; return toast(result?.error || "Falha ao salvar requisito.", true); } await rerender(); });
+  $("#atlas-media")?.addEventListener("click", () => selected && openGuideMedia(selected.media_query || `${game.title} ${selected.label}`, { systemId: system.id, nodeId: selected.id }));
+  $("#atlas-replace-source")?.addEventListener("click", () => openAtlasSourceWizard(system));
+  $("[data-atlas-source]")?.addEventListener("click", () => viewAtlasSource(system.id));
+  if (system?._draftSource) root.querySelectorAll('#atlas-goal,#atlas-image,#atlas-path,[data-atlas-requirement]').forEach(el => {el.disabled=true;el.title='Aprove o sistema antes de alterar progresso ou imagens.';});
+}
+
 function bindSidebar() {
+  bindGuideAtlas(S.dashboardGame);
   $("#hall-entry")?.addEventListener("click", enterHall);
   $("#library-open-hall")?.addEventListener("click", enterHall);
   root.querySelectorAll(".tile").forEach((b) => {
@@ -1653,7 +2117,7 @@ function bindSidebar() {
     if (empty) empty.textContent = query ? "Nenhum jogo encontrado." : "Nenhum jogo ainda.";
   });
   root.querySelectorAll(".ptab").forEach((b) => {
-    b.onclick = () => { S.tab = b.dataset.tab; renderDashboard(); };
+    b.onclick = () => { S.tab = b.dataset.tab; if (S.tab === "journey") S.guideReader = false; renderDashboard(); };
   });
   root.querySelectorAll("[data-ach-filter]").forEach((b) => {
     b.onclick = () => {
@@ -1662,12 +2126,12 @@ function bindSidebar() {
     };
   });
   $("[data-open-achievements]")?.addEventListener("click", () => {
-    S.tab = "walk";
+    S.tab = "achievements";
     renderDashboard({ force: true });
   });
   $("#smart-generate")?.addEventListener("click", gerarSmartGuide);
-  $("#guide-consent")?.addEventListener("click", () => enterSettings("experience", { slug: S.activeSlug, tab: "tips" }));
-  $("#guide-config-ai")?.addEventListener("click", () => enterSettings("ai", { slug: S.activeSlug, tab: "tips" }));
+  $("#guide-consent")?.addEventListener("click", () => enterSettings("experience", { slug: S.activeSlug, tab: "journey" }));
+  $("#guide-config-ai")?.addEventListener("click", () => enterSettings("ai", { slug: S.activeSlug, tab: "journey" }));
   $("#guide-retry")?.addEventListener("click", gerarSmartGuide);
   root.querySelectorAll("[data-guide-mode]").forEach((b) => b.onclick = () => { S.guideMode = b.dataset.guideMode; renderDashboard({ force: true }); });
   $("#guide-search")?.addEventListener("input", (e) => {
@@ -1697,10 +2161,23 @@ function bindSidebar() {
   $("#guide-pack-export")?.addEventListener("click", exportGuidePack);
   $("#guide-pack-import")?.addEventListener("click", importGuidePack);
   root.querySelectorAll("[data-jump-guide]").forEach((b) => b.onclick = () => {
-    S.tab = "tips"; S.guideMode = "compact"; renderDashboard({ force: true }).then(() => {
+    S.tab = "journey"; S.guideReader = true;
+    const id = b.dataset.jumpGuide;
+    const chapters = S.dashboardGame?.smart_guide?.current?.chapters || [];
+    const index = chapters.findIndex((chapter) => (chapter.blocks || []).some((block) => block.id === id));
+    if (index >= 0) S.guideChapter = index;
+    renderDashboard({ force: true }).then(() => {
       const id = b.dataset.jumpGuide; (id ? document.getElementById(`guide-${id}`) : $(".guide-console-head"))?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
   });
+  $("#guide-reader-open")?.addEventListener("click", () => { S.guideReader = true; S.guideChapter = Math.max(0, S.guideChapter || 0); renderDashboard({ force: true }); });
+  $("#guide-reader-close")?.addEventListener("click", () => { S.guideReader = false; renderDashboard({ force: true }); });
+  $("#guide-chapter-prev")?.addEventListener("click", () => { S.guideChapter = Math.max(0, S.guideChapter - 1); S.guideQuery = ""; renderDashboard({ force: true }); });
+  $("#guide-chapter-next")?.addEventListener("click", () => { S.guideChapter += 1; S.guideQuery = ""; renderDashboard({ force: true }); });
+  const openSources = () => enterSettings("library", { slug: S.activeSlug, tab: "journey" });
+  $("#journey-sources")?.addEventListener("click", openSources);
+  $("#journey-sources-empty")?.addEventListener("click", openSources);
+  $("#journey-reader-sources")?.addEventListener("click", openSources);
   const gimport = $("#guide-import");
   if (gimport) gimport.onclick = attachGuide;
   const gfaqs = $("#guide-gamefaqs");
@@ -1735,13 +2212,14 @@ function bindSidebar() {
 async function enterSettings(section = "", returnTo = null) {
   S.view = "settings";
   stopPolling();
-  const [estado, ia, sources, compact, overlay, update] = await Promise.all([
+  const [estado, ia, sources, compact, overlay, update, guideSources] = await Promise.all([
     backend.appState().catch(() => ({})),
     backend.getAiConfig().catch(() => ({ ok: false })),
     backend.getSourcesConfig().catch(() => ({ ok: false })),
     backend.getCompactConfig().catch(() => null),
     backend.overlayStatus().catch((e) => ({ ok: false, error: String(e) })),
     backend.updateStatus().catch((e) => ({ ok: false, error: String(e) })),
+    S.activeSlug ? backend.walkthroughSources(S.activeSlug).catch((e) => ({ ok: false, error: String(e), sources: [] })) : Promise.resolve({ ok: true, sources: [], merge: { phase: "idle" } }),
   ]);
   S.SET = {
     estado,
@@ -1750,6 +2228,7 @@ async function enterSettings(section = "", returnTo = null) {
     compact: compact && compact.ok ? compact : { width: 300, height: 232, last: 2, next: 0 },
     overlay,
     update,
+    guideSources: { slug: S.activeSlug || "", ...(guideSources || { sources: [], merge: { phase: "idle" } }) },
     returnTo,
     section: section || readSettingsSection(),
     drafts: {},
@@ -1761,6 +2240,7 @@ async function enterSettings(section = "", returnTo = null) {
     S.SET.originals[id] = cloneSettings(S.SET.drafts[id]);
   });
   renderSettings();
+  if (S.SET.section === "library" && S.SET.guideSources?.merge?.phase === "running") pollWalkthroughMerge();
 }
 
 async function exportGuidePack() {
@@ -1800,7 +2280,7 @@ async function leaveSettings(force = false) {
   const back = S.SET && S.SET.returnTo;
   if (back) {
     S.activeSlug = back.slug || S.activeSlug;
-    S.tab = back.tab || "tips";
+    S.tab = back.tab || "journey";
   }
   await enterDashboard();
 }
@@ -1886,6 +2366,89 @@ function settingsPanelFrame(id, body) {
   </section>`;
 }
 
+function guideSourcesSettingsHTML() {
+  const state = S.SET.guideSources || { slug: S.activeSlug || "", sources: [], merge: { phase: "idle" } };
+  const sources = state.sources || [];
+  const merge = state.merge || { phase: "idle" };
+  const selected = sources.filter((source) => source.enabled !== false);
+  const characters = selected.reduce((sum, source) => sum + Number(source.character_count || 0), 0);
+  const conflicts = Array.isArray(merge.conflicts) ? merge.conflicts : [];
+  const unresolved = conflicts.filter((conflict) => conflict.blocking && !conflict.resolution).length;
+  const sourceCards = sources.map((source) => `<article class="guide-source-card ${source.enabled === false ? "off" : ""}">
+    <label class="guide-source-enabled"><input type="checkbox" data-guide-source-toggle="${esc(source.id)}" ${source.enabled === false ? "" : "checked"}><span></span></label>
+    <div class="guide-source-icon">${source.kind === "pdf" ? "▤" : source.kind === "gamefaqs" ? "◎" : source.kind === "legacy" ? "↺" : "≡"}</div>
+    <div class="guide-source-copy"><b>${esc(source.title)}</b><span>${esc(source.kind || "guia")} · ${source.section_count || 0} seções · ${Number(source.character_count || 0).toLocaleString("pt-BR")} caracteres</span><small>${source.enabled === false ? "Fora da próxima consolidação" : "Incluída na próxima consolidação"}</small></div>
+    <div class="guide-source-actions"><button data-guide-source-view="${esc(source.id)}">Visualizar</button><button data-guide-source-rename="${esc(source.id)}">Renomear</button><button data-guide-source-export="${esc(source.id)}">Exportar</button><button class="danger" data-guide-source-remove="${esc(source.id)}">Remover</button></div>
+  </article>`).join("");
+  const conflictHTML = conflicts.length ? `<div class="guide-merge-conflicts"><h4>Divergências para revisar</h4>${conflicts.map((conflict) => `<article class="guide-conflict ${conflict.blocking ? "blocking" : ""}"><div><span>${conflict.blocking ? "DECISÃO OBRIGATÓRIA" : "DIFERENÇA DESCRITIVA"}</span><h5>${esc(conflict.subject || "Divergência")}</h5><p>${esc(conflict.recommendation || "Compare as alternativas das fontes.")}</p></div><div class="guide-conflict-options">${(conflict.alternatives || []).map((choice) => `<button class="${conflict.resolution === choice.id ? "selected" : ""}" data-guide-conflict="${esc(conflict.id)}" data-guide-choice="${esc(choice.id)}"><b>${esc(choice.label || choice.text || choice.id)}</b><small>${esc(choice.source_title || choice.source_id || "Fonte")}</small></button>`).join("")}</div></article>`).join("")}</div>` : "";
+  const phaseText = { idle: "Nenhuma consolidação em andamento.", running: merge.message || "Consolidando as fontes…", awaiting_configuration: merge.message || "Aguardando configuração da IA.", awaiting_consent: merge.message || "Aguardando consentimento para uso da IA.", awaiting_review: merge.message || "Prévia pronta para revisão.", published: "Walkthrough consolidado publicado.", error: merge.error || "Falha na consolidação." }[merge.phase] || merge.message || "";
+  return `<div class="settings-card guide-sources-card"><div class="guide-sources-head"><div><h3>Fontes dos guias</h3><p class="set-hint">Combine até dez fontes. O conteúdo original permanece separado e só muda a Jornada quando você publicar uma nova consolidação.</p></div><span>${sources.length}/10</span></div>
+    ${sourceCards || `<div class="guide-sources-empty"><b>Nenhuma fonte adicionada</b><span>Importe um PDF, GameFAQs ou texto para começar.</span></div>`}
+    <div class="guide-source-add"><button id="guide-source-add-pdf">＋ PDF</button><button id="guide-source-add-gamefaqs">◎ GameFAQs</button><button id="guide-source-add-text">≡ Colar texto</button></div>
+    <div class="guide-merge-box ${merge.phase === "error" ? "error" : ""}"><div><span>WALKTHROUGH CONSOLIDADO</span><b>${selected.length} fonte(s) · ~${characters.toLocaleString("pt-BR")} caracteres</b><small>${esc(phaseText)}</small></div>${merge.phase === "running" ? `<i class="guide-merge-spinner">✦</i>` : `<button id="guide-merge-start" ${selected.length ? "" : "disabled"}>Criar walkthrough completo</button>`}</div>
+    ${conflictHTML}
+    ${merge.phase === "awaiting_review" ? `<div class="guide-merge-publish"><div><b>${unresolved ? `${unresolved} conflito(s) importante(s) pendente(s)` : "Prévia validada e pronta"}</b><span>A versão atual continua ativa até a publicação.</span></div><button id="guide-merge-publish" ${unresolved ? "disabled" : ""}>Publicar na Jornada</button></div>` : ""}
+  </div>`;
+}
+
+async function refreshGuideSources(slug = S.activeSlug) {
+  if (!slug || !S.SET) return;
+  const result = await backend.walkthroughSources(slug).catch((error) => ({ ok: false, error: String(error), sources: [] }));
+  S.SET.guideSources = { slug, ...(result || {}) };
+  if (S.SET.section === "library") renderSettings();
+}
+
+function openGuideSourceDialog(kind) {
+  $("#guide-source-dialog")?.remove();
+  const game = S.library.find((item) => item.slug === S.activeSlug) || S.dashboardGame || {};
+  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="guide-source-dialog"><div class="gf-panel guide-source-dialog"><h3>${kind === "gamefaqs" ? "Adicionar GameFAQs" : "Adicionar texto"}</h3><p>Fonte para a Jornada de <b>${esc(game.title || "jogo atual")}</b>.</p><label>Título<input id="guide-source-dialog-title" placeholder="Nome que identifica esta fonte"></label>${kind === "gamefaqs" ? `<label>URL direta do guia<input id="guide-source-dialog-value" placeholder="https://gamefaqs.gamespot.com/..."></label>` : `<label>Conteúdo<textarea id="guide-source-dialog-value" placeholder="Cole o guia completo aqui"></textarea></label>`}<div class="settings-pending-actions"><button class="btn-primary" id="guide-source-dialog-save">Adicionar fonte</button><button class="btn-ghost" id="guide-source-dialog-close">Cancelar</button></div></div></div>`);
+  $("#guide-source-dialog-close").onclick = () => $("#guide-source-dialog")?.remove();
+  $("#guide-source-dialog-save").onclick = async () => {
+    const title = ($("#guide-source-dialog-title")?.value || "").trim();
+    const value = ($("#guide-source-dialog-value")?.value || "").trim();
+    if (!value) return toast("Informe o conteúdo da fonte.", true);
+    const button = $("#guide-source-dialog-save"); button.disabled = true; button.textContent = "Importando…";
+    const result = kind === "gamefaqs" ? await backend.addWalkthroughGameFaqs(S.activeSlug, value).catch((error) => ({ ok: false, error: String(error) })) : await backend.addWalkthroughText(S.activeSlug, title || "Texto colado", value).catch((error) => ({ ok: false, error: String(error) }));
+    if (!result?.ok) { button.disabled = false; button.textContent = "Adicionar fonte"; return toast(result?.error || "Falha ao importar.", true); }
+    $("#guide-source-dialog")?.remove(); toast(result.duplicate ? "Esta fonte já estava na coleção." : "Fonte adicionada."); await refreshGuideSources();
+  };
+}
+
+function confirmWalkthroughMerge() {
+  const state = S.SET.guideSources || {};
+  const selected = (state.sources || []).filter((source) => source.enabled !== false);
+  const characters = selected.reduce((sum, source) => sum + Number(source.character_count || 0), 0);
+  $("#guide-merge-confirm")?.remove();
+  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="guide-merge-confirm"><div class="gf-panel guide-merge-confirm"><h3>Criar walkthrough completo?</h3><p>A IA processará <b>${selected.length} fonte(s)</b>, aproximadamente <b>${characters.toLocaleString("pt-BR")} caracteres</b>. Seu provedor poderá cobrar pelo processamento.</p><p>A versão atual continuará ativa até você revisar conflitos e publicar.</p><div class="settings-pending-actions"><button class="btn-primary" id="guide-merge-confirm-start">Iniciar consolidação</button><button class="btn-ghost" id="guide-merge-confirm-close">Cancelar</button></div></div></div>`);
+  $("#guide-merge-confirm-close").onclick = () => $("#guide-merge-confirm")?.remove();
+  $("#guide-merge-confirm-start").onclick = async () => {
+    const button = $("#guide-merge-confirm-start"); button.disabled = true; button.textContent = "Iniciando…";
+    const result = await backend.startWalkthroughMerge(S.activeSlug, selected.map((source) => source.id)).catch((error) => ({ ok: false, error: String(error) }));
+    $("#guide-merge-confirm")?.remove();
+    if (!result?.ok && !["awaiting_configuration", "awaiting_consent"].includes(result?.phase)) return toast(result?.error || "Falha ao iniciar.", true);
+    toast(result?.message || "Consolidação iniciada."); await refreshGuideSources(); pollWalkthroughMerge();
+  };
+}
+
+async function pollWalkthroughMerge() {
+  while (S.view === "settings" && S.SET?.section === "library" && S.activeSlug) {
+    const result = await backend.walkthroughMergeStatus(S.activeSlug).catch((error) => ({ ok: false, phase: "error", error: String(error) }));
+    if (S.SET?.guideSources) S.SET.guideSources.merge = result;
+    renderSettings();
+    if (result.phase !== "running") return;
+    await esperar(900);
+  }
+}
+
+async function viewWalkthroughSource(sourceId) {
+  const result = await backend.walkthroughSource(S.activeSlug, sourceId).catch((error) => ({ ok: false, error: String(error) }));
+  if (!result?.ok) return toast(result?.error || "Fonte não encontrada.", true);
+  const source = result.source || {};
+  const text = source.text || (source.sections || []).map((section) => `${section.title || ""}\n${(section.blocks || []).map((block) => block.text || "").join("\n")}`).join("\n\n");
+  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="guide-source-view"><div class="gf-panel guide-source-view"><h3>${esc(source.title)}</h3><p>${esc(source.kind)} · conteúdo original preservado</p><pre>${esc(text.slice(0, 100000))}</pre><button class="btn-primary" id="guide-source-view-close">Fechar</button></div></div>`);
+  $("#guide-source-view-close").onclick = () => $("#guide-source-view")?.remove();
+}
+
 function renderSettings() {
   $("#btn-library").hidden = true; closeLibraryDrawer();
   const id = S.SET.section || "account";
@@ -1897,12 +2460,12 @@ function renderSettings() {
   const ovState = ov.detected ? `${esc(ov.process || "processo desconhecido")} · ${esc(ov.title || "sem título")}` : (ov.error ? esc(ov.error) : "Nenhum emulador detectado agora");
   const upText = up.update_available ? `Versão ${esc(up.latest_version)} disponível` : (up.phase === "error" ? esc(up.error || "Falha ao consultar") : "Você está na versão atual");
   const field = (key, value, type = "text", extra = "") => `<input class="set-field" data-draft-field="${key}" type="${type}" value="${esc(value ?? "")}" ${extra} />`;
-  let panel = id === "account" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Conta conectada</h3><div class="set-row"><div><div class="set-txt">RetroAchievements</div><div class="set-sub">${estado.username ? esc(estado.username) : "não conectada"}</div></div><button class="btn-ghost" id="set-reconnect">Trocar conta</button></div></div>
+  let panel = id === "account" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Conta conectada</h3><div class="set-row"><div><div class="set-txt">RetroAchievements</div><div class="set-sub" data-private>${estado.username ? esc(estado.username) : "não conectada"}</div></div><button class="btn-ghost" id="set-reconnect">Trocar conta</button></div></div>
     <div class="settings-card"><h3>Atualizações</h3><div class="set-row"><div><div class="set-txt">DigiTracker ${esc(estado.version || S.version)}</div><div class="set-sub">${upText}</div></div><button class="btn-ghost" id="set-update-check">Procurar agora</button></div>${settingsToggle("auto_check_updates", draft.auto_check_updates, "Procurar atualizações ao iniciar", "Apenas releases estáveis; a instalação sempre pede confirmação")}</div>`)
   : id === "experience" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Experiência DigiTracker Console</h3><p class="set-hint">Combina a apresentação cinematográfica da PSN, a navegação do Steam Deck e a identidade do DigiTracker. O Guia Inteligente nunca apaga sua fonte importada.</p>${settingsToggle("smart_guide_auto", draft.smart_guide_auto, "Organizar guias automaticamente", "Depois de cada importação, cria uma revisão compacta e validada")}${settingsToggle("smart_guide_consent", draft.smart_guide_consent, "Permitir envio do guia à IA", "O provedor configurado pode cobrar pelo processamento. Imagens pesquisadas continuam exigindo aprovação")}${settingsToggle("reduced_motion", draft.reduced_motion, "Reduzir animações", "Remove transições de profundidade e movimentos não essenciais")}</div><div class="settings-card"><div class="experience-grid"><div><label class="set-label">Densidade</label><select class="set-field" data-draft-field="guide_density"><option value="comfortable" ${draft.guide_density === "comfortable" ? "selected" : ""}>Confortável adaptável</option><option value="compact" ${draft.guide_density === "compact" ? "selected" : ""}>Compacta</option></select></div><div><label class="set-label">Escala da interface: <b id="settings-scale-label">${draft.ui_scale}%</b></label><input class="set-range" data-draft-field="ui_scale" type="range" min="80" max="140" step="5" value="${draft.ui_scale}"></div></div></div>`)
   : id === "ai" ? settingsPanelFrame(id, ia ? `<div class="settings-card"><h3>Provedor ativo</h3><div class="ai-providers">${ia.providers.map((p) => `<button class="ai-prov ${p.id === draft.provider ? "on" : ""}" data-settings-provider="${esc(p.id)}"><span class="ai-prov-name">${esc(p.label)}</span>${p.has_key ? `<span class="ai-prov-ok">✓ chave salva</span>` : ""}</button>`).join("")}</div></div><div class="settings-card"><label class="set-label">Chave da API${(ia.providers.find((p) => p.id === draft.provider) || {}).has_key ? " (salva — deixe em branco para manter)" : ""}</label>${field("api_key", "", "password", `placeholder="${((ia.providers.find((p) => p.id === draft.provider) || {}).has_key) ? "••••••••••••••••" : "cole a chave aqui"}" autocomplete="off"`)}<button class="btn-ghost settings-inline-action ${draft.clear_key ? "selected" : ""}" data-ai-clear>${draft.clear_key ? "Chave será removida" : "Remover chave salva"}</button><label class="set-label">Modelo</label>${field("model", draft.model, "text", "autocomplete=off")}${(ia.providers.find((p) => p.id === draft.provider) || {}).needs_base_url ? `<label class="set-label">Endpoint (OpenRouter, Ollama, LM Studio…)</label>${field("base_url", draft.base_url, "text", "autocomplete=off")}` : ""}<p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.</p></div>` : `<div class="settings-card"><h3>Inteligência artificial</h3><p class="set-hint">Indisponível no modo demonstração.</p></div>`)
   : id === "images" ? settingsPanelFrame(id, `<p class="set-hint settings-intro">Configure as fontes opcionais de capas e fundos. As credenciais só serão enviadas quando você salvar esta sessão.</p>${[["steamgriddb","SteamGridDB","Capas da comunidade.",ready.steamgriddb],["rawg","RAWG","Fundos e screenshots para jogos retrô.",ready.rawg],["igdb","IGDB","Capas de qualidade via Twitch.",ready.igdb]].map(([key,label,sub,has]) => `<div class="src-cfg settings-card"><h3>${label} ${has ? "✓" : ""}</h3><p class="set-hint">${sub}</p>${field(`${key}.key1`, "", key === "igdb" ? "text" : "password", `placeholder="${has ? "•••••••• (salva — em branco mantém)" : (key === "igdb" ? "Twitch Client ID" : "chave da API")}" autocomplete="off"`)}${key === "igdb" ? field(`${key}.key2`, "", "password", `placeholder="${has ? "•••• (segredo salvo — em branco mantém)" : "Twitch Client Secret"}" autocomplete="off"`) : ""}<button class="btn-ghost settings-inline-action ${draft[key].clear ? "selected" : ""}" data-source-clear="${key}">${draft[key].clear ? "Fonte será removida" : "Remover credencial salva"}</button></div>`).join("")}`)
-  : id === "library" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Entrada de jogos</h3>${settingsToggle("auto_import", draft.auto_import, "Importar jogos novos automaticamente", "Verifica a cada 5 minutos e traz os jogos em que você começou a jogar")}</div>`)
+  : id === "library" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Entrada de jogos</h3>${settingsToggle("auto_import", draft.auto_import, "Importar jogos novos automaticamente", "Verifica a cada 5 minutos e traz os jogos em que você começou a jogar")}</div>${guideSourcesSettingsHTML()}`)
   : id === "overlay" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Comportamento</h3>${settingsToggle("auto_overlay", draft.auto_overlay, "Grudar no emulador", "Vira overlay e acompanha a janela quando um emulador abre")}${settingsToggle("overlay_exit_fullscreen", draft.overlay_exit_fullscreen, "Sair do fullscreen exclusivo", "Manda Alt+Enter para o emulador quando autorizado")}${settingsToggle("overlay_second_screen", draft.overlay_second_screen, "Usar o segundo monitor", "Leva o overlay para a tela que o jogo não ocupa")}${settingsToggle("overlay_fit_emulator", draft.overlay_fit_emulator, "Ajustar ao tamanho do emulador", "Mantém o overlay proporcional à janela do emulador")}</div><div class="overlay-diag settings-card ${ov.detected ? "ok" : ""}"><h3>Diagnóstico de detecção</h3><div class="set-sub">${ovState}</div><div class="overlay-diag-grid"><span>Área interna</span><code>${esc(ovRect)}</code><span>Overlay</span><code>${esc((ov.overlay_size || []).join(" × ") || "—")}</code><span>Posição</span><code>${esc((ov.dock || []).join(", ") || "—")}</code><span>Modo nativo</span><code>${esc(ov.native_input_mode || "—")}</code><span>Hotkey</span><code>${esc(ov.hotkey || "—")}${ov.hotkey_error ? ` · ${esc(ov.hotkey_error)}` : ""}</code></div><button class="btn-ghost" id="overlay-test">Testar detecção agora</button></div>`)
   : settingsPanelFrame(id, `<div class="settings-card"><h3>HUD passivo</h3><p class="set-hint">Durante a gameplay, os HUDs passam cliques e não capturam teclado, mouse ou controle. Use a hotkey de edição para arrastar, redimensionar ou trocar o visual.</p><div class="set-grid2"><div><label class="set-label">Visual ao abrir</label><select class="set-field" data-draft-field="compact_view"><option value="minimal" ${draft.compact_view === "minimal" ? "selected" : ""}>Resumo mínimo</option><option value="expanded" ${draft.compact_view === "expanded" ? "selected" : ""}>Troféus</option><option value="both" ${draft.compact_view === "both" ? "selected" : ""}>Resumo + troféus</option></select></div><div><label class="set-label">Tamanho</label><select class="set-field" data-draft-field="compact_size_mode"><option value="auto" ${draft.compact_size_mode === "auto" ? "selected" : ""}>Adaptar ao emulador</option><option value="manual" ${draft.compact_size_mode === "manual" ? "selected" : ""}>Manual</option></select></div><div><label class="set-label">HUD mínimo · largura</label>${field("compact_width", draft.compact_width, "number", "min=260 max=380")}</div><div><label class="set-label">HUD mínimo · altura</label>${field("compact_height", draft.compact_height, "number", "min=90 max=130")}</div><div><label class="set-label">HUD de troféus · largura</label>${field("compact_expanded_width", draft.compact_expanded_width, "number", "min=340 max=560")}</div><div><label class="set-label">HUD de troféus · altura</label>${field("compact_expanded_height", draft.compact_expanded_height, "number", "min=220 max=480")}</div><div><label class="set-label">Canto</label><select class="set-field" data-draft-field="compact_corner"><option value="auto" ${draft.compact_corner === "auto" ? "selected" : ""}>Automático (preferir superior direito)</option><option value="top-right" ${draft.compact_corner === "top-right" ? "selected" : ""}>Superior direito</option><option value="bottom-right" ${draft.compact_corner === "bottom-right" ? "selected" : ""}>Inferior direito</option><option value="top-left" ${draft.compact_corner === "top-left" ? "selected" : ""}>Superior esquerdo</option><option value="bottom-left" ${draft.compact_corner === "bottom-left" ? "selected" : ""}>Inferior esquerdo</option></select></div></div></div><div class="settings-card"><h3>Fundo do modo compacto</h3><p class="set-hint">O painel é sempre opaco. A arte escolhida aparece dentro do HUD com uma máscara escura para manter o texto legível.</p><div class="set-grid2"><div><label class="set-label">Arte usada no HUD</label><select class="set-field" data-draft-field="compact_background_mode"><option value="background" ${draft.compact_background_mode === "background" ? "selected" : ""}>Fundo do jogo (recomendado)</option><option value="cover" ${draft.compact_background_mode === "cover" ? "selected" : ""}>Capa do jogo</option><option value="title" ${draft.compact_background_mode === "title" ? "selected" : ""}>Arte de título</option><option value="solid" ${draft.compact_background_mode === "solid" ? "selected" : ""}>Cor sólida</option></select></div><div class="settings-art-action"><label class="set-label">Fundo do jogo atual</label><button class="btn-ghost" id="compact-art-picker" ${S.activeSlug ? "" : "disabled"}>Escolher imagem…</button></div></div></div><div class="settings-card"><h3>Hotkeys e recuperação</h3><div class="set-grid2"><div><label class="set-label">Mostrar / ocultar</label>${field("compact_hotkey", draft.compact_hotkey, "text", "placeholder=ctrl+alt+g autocomplete=off")}</div><div><label class="set-label">Editar por 15 segundos</label>${field("compact_edit_hotkey", draft.compact_edit_hotkey, "text", "placeholder=ctrl+alt+e autocomplete=off")}</div><div>${settingsToggle("compact_auto_expand", draft.compact_auto_expand, "Mostrar troféus ao obter conquista", "Desligado por padrão para preservar a imersão")}</div><div><label class="set-label">Recolher automaticamente (segundos)</label>${field("compact_auto_collapse_seconds", draft.compact_auto_collapse_seconds, "number", "min=0 max=60")}</div></div></div><div class="settings-card"><h3>Conquistas responsivas</h3><p class="set-hint">O HUD calcula automaticamente quantas linhas completas cabem. São exibidas no máximo três conquistas recentes e o espaço restante recebe as próximas.</p><div class="set-grid2"><div><label class="set-label">Máximo de obtidas recentes</label>${field("compact_last", draft.compact_last, "number", "min=0 max=3")}</div></div></div>`);
 
@@ -1943,6 +2506,61 @@ function renderSettings() {
   root.querySelectorAll("[data-settings-provider]").forEach((b) => b.addEventListener("click", () => { S.SET.drafts.ai.provider = b.dataset.settingsProvider; S.SET.drafts.ai.model = ""; S.SET.drafts.ai.base_url = ""; markSettingsDirty(); renderSettings(); }));
   $("[data-ai-clear]")?.addEventListener("click", () => { S.SET.drafts.ai.clear_key = !S.SET.drafts.ai.clear_key; renderSettings(); });
   root.querySelectorAll("[data-source-clear]").forEach((b) => b.addEventListener("click", () => { const key = b.dataset.sourceClear; S.SET.drafts.images[key].clear = !S.SET.drafts.images[key].clear; renderSettings(); }));
+  if (id === "library") bindGuideSourceSettings();
+}
+
+function bindGuideSourceSettings() {
+  $("#guide-source-add-pdf")?.addEventListener("click", () => {
+    const input = document.createElement("input"); input.type = "file"; input.accept = ".pdf,application/pdf";
+    input.onchange = async () => {
+      const file = input.files?.[0]; if (!file) return;
+      const data = await fileToBase64(file);
+      const result = await backend.addWalkthroughPdf(S.activeSlug, data, file.name).catch((error) => ({ ok: false, error: String(error) }));
+      if (!result?.ok) return toast(result?.error || "Falha ao importar o PDF.", true);
+      toast(result.duplicate ? "Este PDF já estava na coleção." : "PDF adicionado às fontes."); await refreshGuideSources();
+    };
+    input.click();
+  });
+  $("#guide-source-add-gamefaqs")?.addEventListener("click", () => openGuideSourceDialog("gamefaqs"));
+  $("#guide-source-add-text")?.addEventListener("click", () => openGuideSourceDialog("text"));
+  root.querySelectorAll("[data-guide-source-toggle]").forEach((input) => input.onchange = async () => {
+    const result = await backend.updateWalkthroughSource(S.activeSlug, input.dataset.guideSourceToggle, null, input.checked).catch((error) => ({ ok: false, error: String(error) }));
+    if (!result?.ok) { input.checked = !input.checked; return toast(result?.error || "Falha ao atualizar a fonte.", true); }
+    S.SET.guideSources.sources = result.sources || []; renderSettings();
+  });
+  root.querySelectorAll("[data-guide-source-view]").forEach((button) => button.onclick = () => viewWalkthroughSource(button.dataset.guideSourceView));
+  root.querySelectorAll("[data-guide-source-rename]").forEach((button) => button.onclick = async () => {
+    const source = (S.SET.guideSources.sources || []).find((item) => item.id === button.dataset.guideSourceRename);
+    const title = window.prompt("Novo nome da fonte:", source?.title || "");
+    if (title === null || !title.trim()) return;
+    const result = await backend.updateWalkthroughSource(S.activeSlug, button.dataset.guideSourceRename, title.trim(), null).catch((error) => ({ ok: false, error: String(error) }));
+    if (!result?.ok) return toast(result?.error || "Falha ao renomear.", true);
+    S.SET.guideSources.sources = result.sources || []; renderSettings();
+  });
+  root.querySelectorAll("[data-guide-source-export]").forEach((button) => button.onclick = async () => {
+    const result = await backend.walkthroughSource(S.activeSlug, button.dataset.guideSourceExport).catch((error) => ({ ok: false, error: String(error) }));
+    if (!result?.ok) return toast(result?.error || "Falha ao exportar.", true);
+    const source = result.source || {}; const blob = new Blob([JSON.stringify(source, null, 2)], { type: "application/json" });
+    const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${source.title || "fonte-guia"}.json`; link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  });
+  root.querySelectorAll("[data-guide-source-remove]").forEach((button) => button.onclick = async () => {
+    if (!window.confirm("Remover esta fonte? O walkthrough já publicado não será alterado.")) return;
+    const result = await backend.removeWalkthroughSource(S.activeSlug, button.dataset.guideSourceRemove).catch((error) => ({ ok: false, error: String(error) }));
+    if (!result?.ok) return toast(result?.error || "Falha ao remover.", true);
+    S.SET.guideSources.sources = result.sources || []; renderSettings();
+  });
+  $("#guide-merge-start")?.addEventListener("click", confirmWalkthroughMerge);
+  root.querySelectorAll("[data-guide-conflict]").forEach((button) => button.onclick = async () => {
+    const result = await backend.resolveWalkthroughConflict(S.activeSlug, button.dataset.guideConflict, button.dataset.guideChoice).catch((error) => ({ ok: false, error: String(error) }));
+    if (!result?.ok) return toast(result?.error || "Falha ao resolver o conflito.", true);
+    S.SET.guideSources.merge.conflicts = result.conflicts || []; renderSettings();
+  });
+  $("#guide-merge-publish")?.addEventListener("click", async () => {
+    const button = $("#guide-merge-publish"); button.disabled = true; button.textContent = "Publicando…";
+    const result = await backend.publishWalkthroughMerge(S.activeSlug).catch((error) => ({ ok: false, error: String(error) }));
+    if (!result?.ok) { button.disabled = false; button.textContent = "Publicar na Jornada"; return toast(result?.error || "Falha ao publicar.", true); }
+    toast("Walkthrough consolidado publicado na Jornada."); await refreshGuideSources();
+  });
 }
 
 function setDraftValue(path, value) {
@@ -2526,6 +3144,7 @@ function renderCoverPicker() {
 
     <div class="gf-foot">
       <button class="btn-ghost" id="cv-clear">↺ Remover ${esc(cvRoleLabel().toLowerCase())}</button>
+      <button class="btn-ghost" id="cv-undo">↶ Desfazer</button>
       <div class="cv-palette"><label title="Cor primária do jogo"><input type="color" id="cv-primary" value="${esc(V.palette?.primary || "#2F9DFF")}"></label><label title="Cor secundária"><input type="color" id="cv-secondary" value="${esc(V.palette?.secondary || V.palette?.primary || "#66D7FF")}"></label><button class="btn-ghost" id="cv-palette-save">Salvar cores</button><button class="btn-ghost" id="cv-palette-auto">Extrair da arte</button></div>
     </div>
   </div>`;
@@ -2533,6 +3152,11 @@ function renderCoverPicker() {
   $("#cv-x").onclick = closeCoverPicker;
   $("#cv-settings")?.addEventListener("click", () => { closeCoverPicker(); enterSettings(); });
   $("#cv-clear")?.addEventListener("click", cvLimpar);
+  $("#cv-undo")?.addEventListener("click", async () => {
+    const result = await appCall("undo_game_art", V.slug);
+    if (!result.ok) return toast(result.error, true);
+    V.palette = result.palette; renderCoverPicker(); toast("Arte e paleta anteriores restauradas.");
+  });
   $("#cv-palette-save")?.addEventListener("click", async () => {
     const res = await backend.setGamePalette(V.slug, $("#cv-primary").value, $("#cv-secondary").value).catch((e) => ({ ok: false, error: String(e) }));
     if (!res?.ok) return toast(res?.error || "Não foi possível salvar as cores.", true);
@@ -2637,11 +3261,12 @@ async function cvTrocarJogo(gameId) {
   renderCoverPicker();
 }
 
-async function cvAplicar(url, candidate = null) {
+async function cvAplicar(url, candidate = null, approved = false) {
   const V = S.CV;
   if (!V) return;
   url = (url || "").trim();
   if (!url) return toast("Cole uma URL de imagem.", true);
+  if (!approved && typeof xpCompareArt === "function" && S.mode !== "demo") return xpCompareArt(V, url, candidate);
   const role = V.role;
   V.busy = true; V.error = ""; renderCoverPicker();
   if (candidate) candidate = { ...candidate, query: candidate.query || V.query };
@@ -3418,7 +4043,7 @@ function closeLibraryDrawer() {
 /* ─────────────────────────  ATALHOS DE TECLADO  ─────────────────────────
    O rodapé anuncia essas teclas, então elas precisam existir. Também é a
    navegação por teclado que o app não tinha. */
-const ABAS = ["overview", "walk", "tips"];
+const ABAS = ["journey", "achievements", "atlas"];
 
 function visibleFocusables() {
   return [...document.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled]), summary, [tabindex]:not([tabindex='-1'])")]
@@ -3449,7 +4074,8 @@ function spatialMove(direction) {
 
 function cyclePanelTab(dir) {
   if (S.view !== "dashboard" || S.compact) return;
-  if (S.tab === "mastery") S.tab = "walk";
+  if (["mastery", "walk"].includes(S.tab)) S.tab = "achievements";
+  if (["overview", "tips"].includes(S.tab)) S.tab = "journey";
   const i = Math.max(0, ABAS.indexOf(S.tab));
   S.tab = ABAS[(i + dir + ABAS.length) % ABAS.length];
   renderDashboard({ force: true }).then(() => $(".ptab.active")?.focus());
@@ -3464,7 +4090,7 @@ function bindAtalhos() {
     if (S.compact && S.compactPassive) return;
     // não sequestra digitação em campos de texto
     const alvo = e.target;
-    if (alvo && (alvo.tagName === "INPUT" || alvo.tagName === "TEXTAREA" || alvo.isContentEditable)) {
+    if (alvo && (alvo.tagName === "INPUT" || alvo.tagName === "TEXTAREA" || alvo.tagName === "SELECT" || alvo.isContentEditable)) {
       if (e.key === "Escape") alvo.blur();
       return;
     }
@@ -3485,7 +4111,7 @@ function bindAtalhos() {
 
     if (e.key === "c" || e.key === "C") { e.preventDefault(); return toggleCompacto(); }
 
-    if (S.view !== "dashboard") return;
+    if (!["dashboard", "experience", "hall", "settings"].includes(S.view)) return;
 
     if (["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight"].includes(e.key)) {
       e.preventDefault(); return spatialMove(e.key.replace("Arrow", "").toLowerCase());
@@ -3514,7 +4140,7 @@ function startGamepadNavigation() {
       stopGamepadNavigation();
       return;
     }
-    const pad = [...(navigator.getGamepads?.() || [])].find(Boolean);
+    const pad = document.hasFocus() && !document.hidden ? [...(navigator.getGamepads?.() || [])].find(Boolean) : null;
     if (pad) {
       const pressed = (i) => !!pad.buttons[i]?.pressed;
       pulse("up", pressed(12) || pad.axes[1] < -.65, () => spatialMove("up"));
@@ -3733,11 +4359,36 @@ const DEMO = [
           { id: "demo-b4", type: "challenge", title: "Blossomon", text: "Mantenha distância máxima e use ataques Shot para evitar contato.", items: [], rows: [], source_refs: [{section:2,block:5,page:0}], estimated_minutes: 8 },
           { id: "demo-b5", type: "missable", title: "Condição de sessão", text: "Algumas conquistas citadas pela fonte exigem uma sessão solo.", items: [], rows: [], source_refs: [{section:3,block:2,page:0}], estimated_minutes: 0 },
         ]},
-      ], visual_suggestions: [{id:"demo-v1",type:"route",chapter_id:"demo-c2",title:"Mapa esquemático de Goblin Pass",reason:"A sequência de pontes e a conversão ao sul ficam mais claras visualmente.",query:"Goblin Pass Digimon World 4 map"}] },
+      ], visual_suggestions: [{id:"demo-v1",type:"route",chapter_id:"demo-c2",title:"Mapa esquemático de Goblin Pass",reason:"A sequência de pontes e a conversão ao sul ficam mais claras visualmente.",query:"Goblin Pass Digimon World 4 map"}], systems: [{
+        id:"sys_demo", title:"Linhas de progressão documentadas", description:"Exemplo demonstrativo: caminhos, condições e alternativas extraídos de uma fonte revisada.", group_label:"Linha", layout:"layered", origin:"manual", status:"approved", source_refs:[{section:2,block:3,page:0}],
+        nodes:[
+          {id:"node_veemon",label:"Veemon",subtitle:"Ponto inicial",stage:"INÍCIO",group:"Coragem",tags:["base"],attributes:{Afinidade:"Neutro"},media_query:"Veemon artwork",spoiler:false,source_refs:[{section:1,block:1,page:0}]},
+          {id:"node_agumon",label:"Agumon",subtitle:"Rota alternativa",stage:"INÍCIO",group:"Coragem",tags:["base"],attributes:{Afinidade:"Fogo"},media_query:"Agumon artwork",spoiler:false,source_refs:[{section:1,block:1,page:0}]},
+          {id:"node_greymon",label:"Greymon",subtitle:"Forma intermediária",stage:"ESTÁGIO II",group:"Coragem",tags:["ataque"],attributes:{Elemento:"Fogo"},media_query:"Greymon artwork",spoiler:false,source_refs:[{section:2,block:3,page:0}]},
+          {id:"node_garurumon",label:"Garurumon",subtitle:"Caminho veloz",stage:"ESTÁGIO II",group:"Amizade",tags:["velocidade"],attributes:{Elemento:"Gelo"},media_query:"Garurumon artwork",spoiler:false,source_refs:[{section:2,block:3,page:0}]},
+          {id:"node_metal",label:"MetalGreymon",subtitle:"Objetivo selecionado",stage:"ESTÁGIO III",group:"Coragem",tags:["máquina","ataque"],attributes:{Nível:"35",Técnica:"15"},media_query:"MetalGreymon artwork",spoiler:false,source_refs:[{section:2,block:5,page:0}]},
+          {id:"node_were",label:"WereGarurumon",subtitle:"Rota alternativa",stage:"ESTÁGIO III",group:"Amizade",tags:["velocidade"],attributes:{Nível:"35"},media_query:"WereGarurumon artwork",spoiler:false,source_refs:[{section:2,block:5,page:0}]},
+          {id:"node_final",label:"Forma final",subtitle:"Conteúdo com spoiler",stage:"FINAL",group:"Coragem",tags:["final"],attributes:{Nível:"50"},media_query:"final form artwork",spoiler:true,source_refs:[{section:3,block:2,page:0}]},
+        ],
+        edges:[
+          {id:"edge_1",from:"node_veemon",to:"node_greymon",label:"Caminho principal",path_kind:"normal",requirements:[{id:"req_level",text:"Alcançar o nível 15",source_refs:[{section:2,block:3,page:0}]}],missable:false,spoiler:false,source_refs:[{section:2,block:3,page:0}]},
+          {id:"edge_2",from:"node_agumon",to:"node_greymon",label:"Alternativa",path_kind:"alternative",requirements:[{id:"req_item",text:"Obter o item documentado",source_refs:[{section:2,block:3,page:0}]}],missable:false,spoiler:false,source_refs:[{section:2,block:3,page:0}]},
+          {id:"edge_3",from:"node_veemon",to:"node_garurumon",label:"Rota de velocidade",path_kind:"alternative",requirements:[],missable:false,spoiler:false,source_refs:[{section:2,block:3,page:0}]},
+          {id:"edge_4",from:"node_greymon",to:"node_metal",label:"Progressão",path_kind:"normal",requirements:[{id:"req_tech",text:"Técnica 15 ou superior",source_refs:[{section:2,block:5,page:0}]},{id:"req_boss",text:"Concluir o desafio da área",source_refs:[{section:2,block:5,page:0}]}],missable:false,spoiler:false,source_refs:[{section:2,block:5,page:0}]},
+          {id:"edge_5",from:"node_garurumon",to:"node_were",label:"Progressão",path_kind:"normal",requirements:[{id:"req_speed",text:"Atributo de velocidade documentado",source_refs:[{section:2,block:5,page:0}]}],missable:true,spoiler:false,source_refs:[{section:2,block:5,page:0}]},
+          {id:"edge_6",from:"node_metal",to:"node_final",label:"Etapa final",path_kind:"optional",requirements:[{id:"req_final",text:"Cumprir a condição final da fonte",source_refs:[{section:3,block:2,page:0}]}],missable:true,spoiler:true,source_refs:[{section:3,block:2,page:0}]},
+        ],
+      }] },
       progress: { completed: ["demo-b1"], favorites: ["demo-b5"], revealed_spoilers: [], notes: {"demo-b3":"Fazer o farm antes do chefe."}, checkpoint: "demo-b1", history: [], session_minutes: 30 },
       effective_progress: { completed: ["demo-b1"], favorites: ["demo-b5"], revealed_spoilers: [], notes: {"demo-b3":"Fazer o farm antes do chefe."}, checkpoint: "demo-b1", history: [], session_minutes: 30 },
       next_objective: { chapter_id:"demo-c1", chapter:"Preparação antes da rota", block_id:"demo-b2", type:"checklist", title:"Preparação rápida", text:"Escolha uma arma de ataque à distância." },
-      revisions: [{revision_id:"demo-r1",created_at:1770000000,provider:"local",model:"structured-fallback"}], media: [],
+      system_state: {active_system:"sys_demo",goals:{sys_demo:"node_metal"},completed_requirements:["req_level"],node_media:{"sys_demo:node_veemon":"media_cover","sys_demo:node_greymon":"media_hero","sys_demo:node_metal":"media_card"},preferences:{}},
+      system_objective: {system_id:"sys_demo",system_title:"Linhas de progressão documentadas",node_id:"node_metal",title:"MetalGreymon",next_requirement:{id:"req_tech",text:"Técnica 15 ou superior"},requirements_total:2,requirements_completed:0},
+      revisions: [{revision_id:"demo-r1",created_at:1770000000,provider:"local",model:"structured-fallback"}], media: [
+        {id:"media_cover",url:"/ui/assets/demo-digital-dungeon-cover.png",title:"Arte demonstrativa",license:"Demonstração local"},
+        {id:"media_hero",url:"/ui/assets/demo-digital-world-hero.png",title:"Arte demonstrativa",license:"Demonstração local"},
+        {id:"media_card",url:"/ui/assets/demo-digital-card-cover.png",title:"Arte demonstrativa",license:"Demonstração local"},
+      ],
     },
   },
   {

@@ -837,7 +837,7 @@ class TestAtualizacoes:
         return engine.Api()
 
     def test_versao_aparece_no_estado(self, api):
-        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.9.0"
+        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.10.0"
 
     def test_verificacao_automatica_ligada_por_padrao(self, api):
         assert api.get_app_state()["auto_check_updates"] is True
@@ -1170,8 +1170,11 @@ class TestBootstrapWindow:
 
         engine.main()
 
-        assert len(captured["windows"]) == 3
-        main, summary, details = captured["windows"]
+        assert len(captured["windows"]) == 4
+        main, notification, summary, details = captured["windows"]
+        assert notification["kwargs"]["hidden"] is True
+        assert notification["kwargs"]["focus"] is False
+        assert notification["kwargs"]["js_api"] is not main["kwargs"]["js_api"]
         assert main["kwargs"].get("transparent", False) is False
         assert main["kwargs"]["background_color"] == "#050c18"
         assert summary["kwargs"]["hidden"] is True
@@ -1237,3 +1240,36 @@ class TestGuiaInteligenteApi:
         prefs = api.set_experience_preferences(consent=True, density="compact", ui_scale=125)
         assert prefs["smart_guide_consent"] is True
         assert prefs["guide_density"] == "compact" and prefs["ui_scale"] == 125
+
+    def test_cria_atlas_fixa_objetivo_e_marca_requisito(self, api):
+        api.get_smart_guide("jogo")
+        system = {
+            "title": "Sistema genérico", "description": "Relações da fonte",
+            "group_label": "Grupo", "layout": "layered", "origin": "manual",
+            "status": "approved", "source_refs": [],
+            "nodes": [
+                {"id": "a", "label": "Origem", "subtitle": "", "stage": "I",
+                 "group": "", "tags": [], "attributes": {}, "media_query": "",
+                 "spoiler": False, "source_refs": []},
+                {"id": "b", "label": "Destino", "subtitle": "", "stage": "II",
+                 "group": "", "tags": [], "attributes": {}, "media_query": "",
+                 "spoiler": False, "source_refs": []},
+            ],
+            "edges": [{"id": "", "from": "a", "to": "b", "label": "Avançar",
+                       "path_kind": "normal", "requirements": [
+                           {"id": "", "text": "Condição", "source_refs": []}],
+                       "missable": False, "spoiler": False, "source_refs": []}],
+        }
+        saved = api.save_guide_system("jogo", system)
+        assert saved["ok"] is True and len(saved["approved"]) == 1
+        normalized = saved["system"]
+        node, edge = normalized["nodes"][1], normalized["edges"][0]
+        goal = api.set_guide_system_goal("jogo", normalized["id"], node["id"])
+        assert goal["objective"]["title"] == "Destino"
+        requirement = edge["requirements"][0]
+        updated = api.update_guide_requirement(
+            "jogo", normalized["id"], edge["id"], requirement["id"], True,
+        )
+        assert requirement["id"] in updated["state"]["completed_requirements"]
+        preview = api.preview_guide_systems("jogo", saved["revision"]["revision_id"])
+        assert preview["ok"] is True and preview["systems"][0]["title"] == "Sistema genérico"

@@ -13,13 +13,19 @@ import json
 import os
 import re
 import time
+import threading
+import unicodedata
 import uuid
 import zipfile
 from copy import deepcopy
+from functools import wraps
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 MAX_REVISIONS = 10
+MAX_WALKTHROUGH_SOURCES = 10
+MAX_SYSTEM_NODES = 80
+MAX_SYSTEM_EDGES = 160
 BLOCK_TYPES = {
     "text", "objective", "checklist", "warning", "missable", "achievement",
     "challenge", "table", "comparison", "image", "route", "graph", "note",
@@ -29,6 +35,14 @@ BLOCK_TYPES = {
 
 class SmartGuideError(ValueError):
     pass
+
+
+def _serialized(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._write_lock:
+            return method(self, *args, **kwargs)
+    return guarded
 
 
 def _now() -> int:
@@ -58,6 +72,19 @@ def _atomic_json(path: Path, value: object) -> None:
             pass
 
 
+def _atomic_bytes(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_bytes(value)
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _read_json(path: Path, default):
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -68,6 +95,211 @@ def _read_json(path: Path, default):
 
 def _clean_text(value: object, limit: int = 50_000) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _source_refs(value: object, limit: int = 20) -> list[dict]:
+    refs = []
+    for ref in value if isinstance(value, list) else []:
+        if not isinstance(ref, dict):
+            continue
+        try:
+            item = {
+                "section": max(0, _safe_int(ref.get("section"))),
+                "block": max(0, _safe_int(ref.get("block"))),
+                "page": max(0, _safe_int(ref.get("page"))),
+            }
+            source_id = _clean_text(ref.get("source_id"), 100)
+            if source_id:
+                item["source_id"] = source_id
+            refs.append(item)
+        except (TypeError, ValueError):
+            continue
+    return refs[:limit]
+
+
+def _has_source(refs: list[dict]) -> bool:
+    return any(int(ref.get("section") or 0) > 0 and int(ref.get("block") or 0) > 0
+               for ref in refs)
+
+
+def _stable_system_id(prefix: str, provided: object, *parts: object) -> str:
+    value = _clean_text(provided, 80)
+    if re.fullmatch(rf"{prefix}_[a-f0-9]{{12}}", value):
+        return value
+    normalized = []
+    for part in parts:
+        if isinstance(part, (dict, list, tuple)):
+            normalized.append(json.dumps(part, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        else:
+            text = unicodedata.normalize("NFKD", str(part or "").casefold())
+            normalized.append(re.sub(r"[^a-z0-9]+", " ", text.encode("ascii", "ignore").decode()).strip())
+    return _stable_id(prefix, *normalized)
+
+
+def _migrated_systems(document: dict) -> list[dict]:
+    """Promove grafos v1 para sugestões do Atlas sem tocar no arquivo antigo."""
+    systems = document.get("systems")
+    if isinstance(systems, list):
+        return systems
+    output = []
+    for suggestion in document.get("visual_suggestions") or []:
+        if not isinstance(suggestion, dict) or suggestion.get("type") not in {"graph", "route"}:
+            continue
+        nodes = suggestion.get("nodes") or []
+        edges = suggestion.get("edges") or []
+        if len(nodes) < 2 or not edges:
+            continue
+        refs = _source_refs(suggestion.get("source_refs"))
+        output.append({
+            "id": suggestion.get("id"), "title": suggestion.get("title") or "Sistema visual",
+            "description": suggestion.get("reason") or "Convertido de uma sugestão visual anterior.",
+            "group_label": "Grupo", "layout": "layered", "origin": "migrated",
+            "status": "suggested", "source_id": "legacy-main", "source_refs": refs,
+            "nodes": [{
+                "id": node.get("id"), "label": node.get("label"), "subtitle": "",
+                "stage": "", "group": "", "tags": [], "attributes": {},
+                "media_query": suggestion.get("query") or node.get("label") or "",
+                "spoiler": False, "source_refs": refs,
+            } for node in nodes if isinstance(node, dict)],
+            "edges": [{
+                "id": "", "from": edge.get("from"), "to": edge.get("to"),
+                "label": edge.get("label") or "", "path_kind": "normal",
+                "requirements": [], "missable": False, "spoiler": False,
+                "source_refs": refs,
+            } for edge in edges if isinstance(edge, dict)],
+        })
+    return output
+
+
+def _validate_systems(document: dict) -> list[dict]:
+    clean_systems = []
+    system_ids = set()
+    for si, raw_system in enumerate(_migrated_systems(document)[:100]):
+        if not isinstance(raw_system, dict):
+            continue
+        title = _clean_text(raw_system.get("title") or f"Sistema {si + 1}", 500)
+        system_refs = _source_refs(raw_system.get("source_refs"))
+        origin = str(raw_system.get("origin") or "manual").lower()
+        origin = origin if origin in {"ai", "manual", "migrated"} else "manual"
+        status = str(raw_system.get("status") or ("suggested" if origin in {"ai", "migrated"} else "approved")).lower()
+        status = status if status in {"suggested", "approved", "rejected"} else "suggested"
+        if origin == "ai" and not _has_source(system_refs):
+            raise SmartGuideError(f"Sistema visual sem referência de origem: {title}")
+        system_id = _stable_system_id("sys", raw_system.get("id"), title, system_refs)
+        if system_id in system_ids:
+            raise SmartGuideError(f"Sistema visual duplicado: {title}")
+        system_ids.add(system_id)
+        raw_nodes = raw_system.get("nodes") or []
+        raw_edges = raw_system.get("edges") or []
+        if len(raw_nodes) > MAX_SYSTEM_NODES:
+            raise SmartGuideError(f"{title} excede o limite de {MAX_SYSTEM_NODES} nós.")
+        if len(raw_edges) > MAX_SYSTEM_EDGES:
+            raise SmartGuideError(f"{title} excede o limite de {MAX_SYSTEM_EDGES} relações.")
+        nodes, raw_to_stable, seen_raw = [], {}, set()
+        for ni, raw_node in enumerate(raw_nodes):
+            if not isinstance(raw_node, dict):
+                continue
+            label = _clean_text(raw_node.get("label"), 300)
+            if not label:
+                continue
+            raw_id = _clean_text(raw_node.get("id"), 80) or f"node-{ni}"
+            if raw_id in seen_raw:
+                raise SmartGuideError(f"Nó duplicado em {title}: {raw_id}")
+            seen_raw.add(raw_id)
+            refs = _source_refs(raw_node.get("source_refs")) or system_refs
+            if origin == "ai" and not _has_source(refs):
+                raise SmartGuideError(f"Nó sem referência de origem: {label}")
+            node_id = _stable_system_id(
+                "node", raw_node.get("id"), system_id, label,
+                _clean_text(raw_node.get("stage"), 100), _clean_text(raw_node.get("group"), 100), refs,
+            )
+            if node_id in {node["id"] for node in nodes}:
+                raise SmartGuideError(f"Nó visual duplicado em {title}: {label}")
+            raw_to_stable[raw_id] = node_id
+            raw_attributes = raw_node.get("attributes")
+            if isinstance(raw_attributes, list):
+                attributes = {
+                    _clean_text(item.get("key"), 80): _clean_text(item.get("value"), 300)
+                    for item in raw_attributes[:20] if isinstance(item, dict) and _clean_text(item.get("key"), 80)
+                }
+            else:
+                attributes = raw_attributes if isinstance(raw_attributes, dict) else {}
+            nodes.append({
+                "id": node_id, "label": label,
+                "subtitle": _clean_text(raw_node.get("subtitle"), 500),
+                "stage": _clean_text(raw_node.get("stage"), 100),
+                "group": _clean_text(raw_node.get("group"), 150),
+                "tags": [_clean_text(tag, 80) for tag in (raw_node.get("tags") or []) if _clean_text(tag, 80)][:20],
+                "attributes": {_clean_text(key, 80): _clean_text(value, 300)
+                               for key, value in list(attributes.items())[:20] if _clean_text(key, 80)},
+                "media_query": _clean_text(raw_node.get("media_query"), 500),
+                "spoiler": bool(raw_node.get("spoiler", False)),
+                "source_refs": refs,
+            })
+        if len(nodes) < 2:
+            continue
+        edges, edge_ids = [], set()
+        for ei, raw_edge in enumerate(raw_edges):
+            if not isinstance(raw_edge, dict):
+                continue
+            raw_from = _clean_text(raw_edge.get("from"), 80)
+            raw_to = _clean_text(raw_edge.get("to"), 80)
+            from_id = raw_to_stable.get(raw_from, raw_from if raw_from in raw_to_stable.values() else "")
+            to_id = raw_to_stable.get(raw_to, raw_to if raw_to in raw_to_stable.values() else "")
+            if not from_id or not to_id:
+                raise SmartGuideError(f"Relação aponta para nó inexistente em {title}.")
+            refs = _source_refs(raw_edge.get("source_refs")) or system_refs
+            if origin == "ai" and not _has_source(refs):
+                raise SmartGuideError(f"Relação sem referência de origem em {title}.")
+            edge_id = _stable_system_id("edge", raw_edge.get("id"), system_id, from_id, to_id, refs)
+            if edge_id in edge_ids:
+                raise SmartGuideError(f"Relação duplicada em {title}.")
+            edge_ids.add(edge_id)
+            requirements = []
+            for ri, raw_req in enumerate(raw_edge.get("requirements") or []):
+                if not isinstance(raw_req, dict):
+                    raw_req = {"text": raw_req}
+                text = _clean_text(raw_req.get("text") or raw_req.get("label"), 1_000)
+                if not text:
+                    continue
+                req_refs = _source_refs(raw_req.get("source_refs")) or refs
+                if origin == "ai" and not _has_source(req_refs):
+                    raise SmartGuideError(f"Requisito sem referência de origem: {text}")
+                requirements.append({
+                    "id": _stable_system_id("req", raw_req.get("id"), edge_id, ri, text, req_refs),
+                    "text": text, "source_refs": req_refs,
+                })
+            edges.append({
+                "id": edge_id, "from": from_id, "to": to_id,
+                "label": _clean_text(raw_edge.get("label"), 300),
+                "path_kind": (_clean_text(raw_edge.get("path_kind"), 40)
+                              if _clean_text(raw_edge.get("path_kind"), 40) in {"normal", "alternative", "optional"}
+                              else "normal"),
+                "requirements": requirements[:30],
+                "missable": bool(raw_edge.get("missable", False)),
+                "spoiler": bool(raw_edge.get("spoiler", False)),
+                "source_refs": refs,
+            })
+        if not edges:
+            continue
+        clean_systems.append({
+            "id": system_id, "title": title,
+            "description": _clean_text(raw_system.get("description"), 2_000),
+            "group_label": _clean_text(raw_system.get("group_label") or "Grupo", 100),
+            "layout": (raw_system.get("layout") if raw_system.get("layout") in {"layered", "vertical", "radial"} else "layered"),
+            "origin": origin, "status": status,
+            "source_id": _clean_text(raw_system.get("source_id"), 100) or "legacy-main",
+            "source_refs": system_refs,
+            "nodes": nodes, "edges": edges,
+        })
+    return clean_systems
 
 
 def validate_document(document: dict) -> dict:
@@ -83,6 +315,9 @@ def validate_document(document: dict) -> dict:
         "summary": _clean_text(document.get("summary"), 2_000),
         "chapters": [],
         "visual_suggestions": [],
+        "systems": [],
+        "source_ids": sorted({_clean_text(item, 100) for item in
+                              (document.get("source_ids") or []) if _clean_text(item, 100)}),
     }
     seen_ids: set[str] = set()
     for ci, chapter in enumerate(chapters[:300]):
@@ -103,15 +338,7 @@ def validate_document(document: dict) -> dict:
             if block_id in seen_ids:
                 block_id = _stable_id("b", ci, bi, title, len(seen_ids))
             seen_ids.add(block_id)
-            refs = []
-            for ref in block.get("source_refs") or []:
-                if not isinstance(ref, dict):
-                    continue
-                refs.append({
-                    "section": max(0, int(ref.get("section") or 0)),
-                    "block": max(0, int(ref.get("block") or 0)),
-                    "page": max(0, int(ref.get("page") or 0)),
-                })
+            refs = _source_refs(block.get("source_refs"))
             items = []
             for item in block.get("items") or []:
                 text = _clean_text(item.get("text") if isinstance(item, dict) else item, 2_000)
@@ -131,6 +358,7 @@ def validate_document(document: dict) -> dict:
                 "source_refs": refs[:20],
                 "visual_id": _clean_text(block.get("visual_id"), 100),
                 "estimated_minutes": max(0, min(24 * 60, int(block.get("estimated_minutes") or 0))),
+                "achievement_id": max(0, _safe_int(block.get("achievement_id"))),
             })
         if clean_blocks:
             clean["chapters"].append({
@@ -164,7 +392,34 @@ def validate_document(document: dict) -> dict:
                       for edge in (suggestion.get("edges") or []) if isinstance(edge, dict)][:60],
             "status": "suggested",
         })
+    clean["systems"] = _validate_systems(document)
     return clean
+
+
+def validate_system_references(document: dict, sections: list) -> dict:
+    """Recusa referências de IA fora da fonte que foi realmente enviada."""
+    for system in document.get("systems") or []:
+        if system.get("origin") != "ai":
+            continue
+        groups = [system.get("source_refs") or []]
+        groups.extend(node.get("source_refs") or [] for node in system.get("nodes") or [])
+        for edge in system.get("edges") or []:
+            groups.append(edge.get("source_refs") or [])
+            groups.extend(req.get("source_refs") or [] for req in edge.get("requirements") or [])
+        for refs in groups:
+            for ref in refs:
+                section_index = int(ref.get("section") or 0) - 1
+                block_index = int(ref.get("block") or 0) - 1
+                if section_index < 0 or section_index >= len(sections or []):
+                    raise SmartGuideError(
+                        f"Referência de sistema fora da fonte: seção {section_index + 1}."
+                    )
+                blocks = (sections[section_index] or {}).get("blocks") or []
+                if block_index < 0 or block_index >= len(blocks):
+                    raise SmartGuideError(
+                        f"Referência de sistema fora da fonte: bloco {block_index + 1} da seção {section_index + 1}."
+                    )
+    return document
 
 
 def from_legacy_sections(title: str, sections: list) -> dict:
@@ -220,9 +475,18 @@ def default_progress() -> dict:
     }
 
 
+def default_system_state() -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION, "active_system": "", "goals": {},
+        "completed_requirements": [], "node_media": {}, "preferences": {},
+        "updated_at": 0,
+    }
+
+
 class SmartGuideStore:
     def __init__(self, root: Path):
         self.root = Path(root)
+        self._write_lock = threading.RLock()
 
     @staticmethod
     def _slug(slug: str) -> str:
@@ -235,7 +499,11 @@ class SmartGuideStore:
         return self.root / self._slug(slug)
 
     def _path(self, slug: str, name: str) -> Path:
-        return self.directory(slug) / name
+        base = self.directory(slug).resolve()
+        path = (base / name).resolve()
+        if not path.is_relative_to(base):
+            raise SmartGuideError("Caminho fora do armazenamento do guia.")
+        return path
 
     def set_status(self, slug: str, phase: str, **extra) -> dict:
         status = {"phase": phase, "updated_at": _now(), **extra}
@@ -260,15 +528,340 @@ class SmartGuideStore:
         current = self.current(slug)
         if not current or current.get("source_hash") != source_hash:
             fallback = from_legacy_sections(title, sections)
+            fallback["systems"] = deepcopy(current.get("systems") or [])
             self.publish(slug, fallback, source_hash, "local", "structured-fallback")
             self.set_status(slug, "ready", message="Versão compacta local criada; IA pode aprimorá-la.")
         return source
 
+    def _source_index(self, slug: str) -> list[dict]:
+        value = _read_json(self._path(slug, "walkthrough_sources/index.json"), [])
+        return [item for item in value if isinstance(item, dict)]
+
+    def walkthrough_sources(self, slug: str, include_sections: bool = False) -> list[dict]:
+        """Fontes independentes usadas para consolidar a Jornada.
+
+        O source.json legado é promovido como legacy-main somente quando ainda
+        não existe uma coleção. Assim a migração não substitui nem duplica uma
+        fonte importada pelo usuário.
+        """
+        index = self._source_index(slug)
+        if not index and not self._path(slug, "walkthrough_sources/index.json").exists():
+            legacy = self.source(slug)
+            if legacy.get("sections"):
+                item = self.add_walkthrough_source(
+                    slug, legacy.get("title") or "Guia importado", "legacy",
+                    legacy.get("sections") or [], legacy.get("metadata") or {},
+                    source_id="legacy-main",
+                )
+                index = [item]
+        output = []
+        for summary in index:
+            data = _read_json(self._path(slug, f"walkthrough_sources/{summary.get('id')}.json"), summary)
+            if not include_sections:
+                data.pop("sections", None)
+                data.pop("text", None)
+            output.append(data)
+        return output
+
+    def add_walkthrough_source(self, slug: str, title: str, kind: str,
+                               sections: list, metadata: dict | None = None,
+                               raw: bytes | None = None, text: str = "",
+                               source_id: str = "") -> dict:
+        sections = deepcopy(sections or [])
+        if not sections:
+            raise SmartGuideError("A fonte não contém conteúdo utilizável.")
+        kind = str(kind or "text").lower()
+        if kind not in {"pdf", "gamefaqs", "text", "legacy"}:
+            raise SmartGuideError("Tipo de fonte não permitido.")
+        digest = hashlib.sha256(raw if raw is not None else
+                                json.dumps(sections, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        index = self._source_index(slug)
+        duplicate = next((item for item in index if item.get("hash") == digest), None)
+        if duplicate:
+            return {**duplicate, "duplicate": True}
+        if len(index) >= MAX_WALKTHROUGH_SOURCES:
+            raise SmartGuideError(f"Cada jogo aceita até {MAX_WALKTHROUGH_SOURCES} fontes de walkthrough.")
+        sid = _clean_text(source_id, 100) or _stable_id("src", digest)
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", sid):
+            raise SmartGuideError("Identificador de fonte inválido.")
+        captured = _now()
+        data = {
+            "schema_version": SCHEMA_VERSION, "id": sid,
+            "title": _clean_text(title or "Guia sem título", 500), "kind": kind,
+            "hash": digest, "captured_at": captured, "enabled": True,
+            "language": _clean_text((metadata or {}).get("language") or "", 40),
+            "url": _clean_text((metadata or {}).get("url") or "", 2_000),
+            "filename": _clean_text((metadata or {}).get("filename") or "", 500),
+            "metadata": deepcopy(metadata or {}), "sections": sections,
+            "text": str(text or "")[:5_000_000],
+            "section_count": len(sections),
+            "character_count": sum(len(str(block.get("text") or ""))
+                                   for section in sections
+                                   for block in (section.get("blocks") or [])),
+        }
+        if raw is not None:
+            if len(raw) > 50 * 1024 * 1024:
+                raise SmartGuideError("O arquivo excede o limite de 50 MB.")
+            suffix = ".pdf" if kind == "pdf" else ".bin"
+            raw_name = f"walkthrough_sources/files/{sid}{suffix}"
+            _atomic_bytes(self._path(slug, raw_name), raw)
+            data["raw_file"] = raw_name
+        _atomic_json(self._path(slug, f"walkthrough_sources/{sid}.json"), data)
+        summary = {key: data.get(key) for key in (
+            "schema_version", "id", "title", "kind", "hash", "captured_at",
+            "enabled", "language", "url", "filename", "raw_file",
+            "section_count", "character_count",
+        )}
+        index.append(summary)
+        _atomic_json(self._path(slug, "walkthrough_sources/index.json"), index)
+        return summary
+
+    def update_walkthrough_source(self, slug: str, source_id: str, **changes) -> dict:
+        source_id = _clean_text(source_id, 100)
+        index = self._source_index(slug)
+        summary = next((item for item in index if item.get("id") == source_id), None)
+        if not summary:
+            raise SmartGuideError("Fonte não encontrada.")
+        data_path = self._path(slug, f"walkthrough_sources/{source_id}.json")
+        data = _read_json(data_path, summary)
+        if "title" in changes:
+            data["title"] = _clean_text(changes["title"], 500) or data.get("title")
+        if "enabled" in changes:
+            data["enabled"] = bool(changes["enabled"])
+        _atomic_json(data_path, data)
+        for key in ("title", "enabled"):
+            summary[key] = data.get(key)
+        _atomic_json(self._path(slug, "walkthrough_sources/index.json"), index)
+        return summary
+
+    def remove_walkthrough_source(self, slug: str, source_id: str) -> dict:
+        source_id = _clean_text(source_id, 100)
+        index = self._source_index(slug)
+        removed = next((item for item in index if item.get("id") == source_id), None)
+        if not removed:
+            raise SmartGuideError("Fonte não encontrada.")
+        _atomic_json(self._path(slug, "walkthrough_sources/index.json"),
+                     [item for item in index if item.get("id") != source_id])
+        for path in [self._path(slug, f"walkthrough_sources/{source_id}.json"),
+                     self._path(slug, removed.get("raw_file") or "")]:
+            try:
+                if path.is_file():
+                    path.unlink()
+            except OSError:
+                pass
+        return {"removed": source_id}
+
+    def set_merge_status(self, slug: str, phase: str, **extra) -> dict:
+        value = {"schema_version": SCHEMA_VERSION, "phase": phase,
+                 "updated_at": _now(), **extra}
+        _atomic_json(self._path(slug, "merge_status.json"), value)
+        return value
+
+    def merge_status(self, slug: str) -> dict:
+        return _read_json(self._path(slug, "merge_status.json"),
+                          {"phase": "idle", "updated_at": 0})
+
+    def save_merge_preview(self, slug: str, document: dict, source_ids: list[str],
+                           conflicts: list[dict]) -> dict:
+        clean = validate_document({**document, "source_ids": source_ids})
+        preview = {"schema_version": SCHEMA_VERSION, "document": clean,
+                   "source_ids": list(source_ids), "conflicts": deepcopy(conflicts),
+                   "created_at": _now()}
+        _atomic_json(self._path(slug, "merge_preview.json"), preview)
+        return preview
+
+    def merge_preview(self, slug: str) -> dict:
+        return _read_json(self._path(slug, "merge_preview.json"), {})
+
+    def resolve_merge_conflict(self, slug: str, conflict_id: str, choice: str) -> dict:
+        preview = self.merge_preview(slug)
+        conflict = next((item for item in preview.get("conflicts") or []
+                         if item.get("id") == conflict_id), None)
+        if not conflict:
+            raise SmartGuideError("Conflito não encontrado.")
+        choices = {item.get("id") for item in conflict.get("alternatives") or []}
+        if choice not in choices:
+            raise SmartGuideError("Alternativa de conflito inválida.")
+        conflict["resolution"] = choice
+        selected = next((item for item in conflict.get("alternatives") or []
+                         if item.get("id") == choice), {})
+        block_id = _clean_text(conflict.get("block_id"), 100)
+        if block_id and selected.get("text"):
+            for chapter in (preview.get("document") or {}).get("chapters") or []:
+                block = next((item for item in chapter.get("blocks") or []
+                              if item.get("id") == block_id), None)
+                if not block:
+                    continue
+                block["text"] = _clean_text(selected.get("text"), 10_000)
+                selected_source = _clean_text(selected.get("source_id"), 100)
+                source_refs = [ref for ref in block.get("source_refs") or []
+                               if ref.get("source_id") == selected_source]
+                if source_refs:
+                    block["source_refs"] = source_refs
+                break
+        _atomic_json(self._path(slug, "merge_preview.json"), preview)
+        return preview
+
+    @_serialized
+    def publish_merge_preview(self, slug: str, provider: str, model: str) -> dict:
+        preview = self.merge_preview(slug)
+        if not preview.get("document"):
+            raise SmartGuideError("Nenhuma consolidação pronta para publicar.")
+        blocking = [item for item in preview.get("conflicts") or []
+                    if item.get("blocking") and not item.get("resolution")]
+        if blocking:
+            raise SmartGuideError("Resolva os conflitos importantes antes de publicar.")
+        source_hash = _json_hash(preview.get("source_ids") or [])
+        document = deepcopy(preview["document"])
+        document["systems"] = deepcopy(self.current(slug).get("systems") or [])
+        revision = self.publish(slug, document, source_hash, provider, model)
+        self.set_merge_status(slug, "published", revision_id=revision["revision_id"],
+                              message="Walkthrough consolidado publicado.")
+        return revision
+
+    def add_system_source(self, slug: str, title: str, kind: str, sections: list,
+                          metadata: dict | None = None, raw: bytes | None = None,
+                          text: str = "") -> dict:
+        """Registra a fonte exclusiva de um futuro sistema do Atlas."""
+        sections = deepcopy(sections or [])
+        if not sections:
+            raise SmartGuideError("A fonte do Atlas não contém conteúdo utilizável.")
+        kind = str(kind or "text").lower()
+        if kind not in {"pdf", "gamefaqs", "legacy"}:
+            raise SmartGuideError("O Atlas aceita PDF ou GameFAQs.")
+        raw_for_hash = raw if raw is not None else json.dumps(
+            sections, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        digest = hashlib.sha256(raw_for_hash).hexdigest()
+        source_id = _stable_id("atlas_src", digest, title)
+        path = self._path(slug, f"system_sources/{source_id}.json")
+        existing = _read_json(path, {})
+        if existing:
+            existing.pop("sections", None)
+            existing.pop("text", None)
+            return {**existing, "duplicate": True}
+        value = {
+            "schema_version": SCHEMA_VERSION, "id": source_id,
+            "title": _clean_text(title or "Fonte do Atlas", 500), "kind": kind,
+            "hash": digest, "captured_at": _now(), "url": _clean_text(
+                (metadata or {}).get("url") or "", 2_000),
+            "filename": _clean_text((metadata or {}).get("filename") or "", 500),
+            "metadata": deepcopy(metadata or {}), "sections": sections,
+            "text": str(text or "")[:5_000_000], "system_id": "",
+        }
+        if raw is not None:
+            if len(raw) > 50 * 1024 * 1024:
+                raise SmartGuideError("O arquivo excede o limite de 50 MB.")
+            raw_name = f"system_sources/files/{source_id}.pdf"
+            _atomic_bytes(self._path(slug, raw_name), raw)
+            value["raw_file"] = raw_name
+        _atomic_json(path, value)
+        return {key: value.get(key) for key in (
+            "schema_version", "id", "title", "kind", "hash", "captured_at",
+            "url", "filename", "raw_file", "system_id",
+        )}
+
+    def system_source(self, slug: str, source_id: str, include_sections: bool = False) -> dict:
+        source_id = _clean_text(source_id, 100)
+        value = _read_json(self._path(slug, f"system_sources/{source_id}.json"), {})
+        if not include_sections:
+            value.pop("sections", None)
+            value.pop("text", None)
+        return value
+
+    @_serialized
+    def update_system_source(self, slug: str, source_id: str, **changes) -> dict:
+        source_id = _clean_text(source_id, 100)
+        path = self._path(slug, f"system_sources/{source_id}.json")
+        value = _read_json(path, {})
+        if not value:
+            raise SmartGuideError("Fonte exclusiva do Atlas não encontrada.")
+        for key in ("status", "error", "system_id", "replace_system_id", "job_id"):
+            if key in changes:
+                value[key] = _clean_text(changes[key], 2_000 if key == "error" else 100)
+        _atomic_json(path, value)
+        return self.system_source(slug, source_id)
+
+    def atlas_draft(self, slug: str, source_id: str) -> dict:
+        return _read_json(self._path(slug, f"atlas_drafts/{source_id}.json"), {})
+
+    @_serialized
+    def save_atlas_draft(self, slug: str, source_id: str, system: dict, job_id: str) -> dict:
+        source = self.system_source(slug, source_id, include_sections=True)
+        if not source or source.get("job_id") != job_id or source.get("status") != "running":
+            raise SmartGuideError("Análise cancelada ou substituída.")
+        candidate = deepcopy(system)
+        candidate.update(source_id=source_id, origin="ai", status="suggested")
+        normalized = _validate_systems({"systems": [candidate]})
+        if len(normalized) != 1:
+            raise SmartGuideError("A fonte precisa documentar ao menos dois nós e uma relação.")
+        validate_system_references({"systems": normalized}, source.get("sections") or [])
+        draft = {"system": normalized[0], "source_id": source_id, "job_id": job_id,
+                 "created_at": _now(), "base_revision": self.current(slug).get("revision_id", "")}
+        _atomic_json(self._path(slug, f"atlas_drafts/{source_id}.json"), draft)
+        self.update_system_source(slug, source_id, status="suggested", error="")
+        return draft
+
+    @_serialized
+    def approve_atlas_draft(self, slug: str, source_id: str, candidate: dict | None = None) -> dict:
+        source = self.system_source(slug, source_id, include_sections=True)
+        draft = self.atlas_draft(slug, source_id)
+        if source.get("status") != "suggested" or not draft:
+            raise SmartGuideError("Não há prévia pronta para aprovação.")
+        system = deepcopy(candidate or draft["system"])
+        system.update(source_id=source_id, status="approved")
+        if source.get("replace_system_id"):
+            system["id"] = source["replace_system_id"]
+        validate_system_references({"systems": [system]}, source.get("sections") or [])
+        result = self.save_system(slug, system)
+        self.update_system_source(slug, source_id, status="published", system_id=result["system"]["id"])
+        self.link_system_source(slug, source_id, result["system"]["id"])
+        return result
+
+    def system_sources(self, slug: str) -> list[dict]:
+        folder = self._path(slug, "system_sources")
+        output = []
+        for path in sorted(folder.glob("*.json")) if folder.exists() else []:
+            value = _read_json(path, {})
+            if value:
+                value.pop("sections", None)
+                value.pop("text", None)
+                output.append(value)
+        return output
+
+    def link_system_source(self, slug: str, source_id: str, system_id: str) -> dict:
+        source_id = _clean_text(source_id, 100)
+        path = self._path(slug, f"system_sources/{source_id}.json")
+        value = _read_json(path, {})
+        if not value:
+            raise SmartGuideError("Fonte exclusiva do Atlas não encontrada.")
+        value["system_id"] = _clean_text(system_id, 100)
+        _atomic_json(path, value)
+        return self.system_source(slug, source_id)
+
     def source(self, slug: str) -> dict:
         return _read_json(self._path(slug, "source.json"), {})
 
+    @staticmethod
+    def _migrate_document(value: dict) -> dict:
+        """Entrega schema v2 em memória preservando metadados da revisão.
+
+        A migração é deliberadamente somente-leitura: documentos v1 continuam
+        intactos no disco até que uma nova revisão seja publicada.
+        """
+        if not isinstance(value, dict) or not value:
+            return {}
+        clean = validate_document(value)
+        for key in (
+            "revision_id", "created_at", "source_hash", "provider", "model",
+            "restored_from",
+        ):
+            if key in value:
+                clean[key] = value.get(key)
+        return clean
+
     def current(self, slug: str) -> dict:
-        return _read_json(self._path(slug, "current.json"), {})
+        value = _read_json(self._path(slug, "current.json"), {})
+        return self._migrate_document(value)
 
     def progress(self, slug: str) -> dict:
         value = _read_json(self._path(slug, "progress.json"), default_progress())
@@ -276,6 +869,30 @@ class SmartGuideStore:
         if isinstance(value, dict):
             base.update(value)
         return base
+
+    def system_state(self, slug: str) -> dict:
+        value = _read_json(self._path(slug, "systems_state.json"), default_system_state())
+        base = default_system_state()
+        if isinstance(value, dict):
+            base.update(value)
+        base["goals"] = dict(base.get("goals") or {})
+        base["completed_requirements"] = sorted({
+            _clean_text(item, 100) for item in (base.get("completed_requirements") or [])
+            if _clean_text(item, 100)
+        })
+        base["node_media"] = {
+            _clean_text(key, 100): _clean_text(media_id, 100)
+            for key, media_id in dict(base.get("node_media") or {}).items()
+            if _clean_text(key, 100) and _clean_text(media_id, 100)
+        }
+        base["preferences"] = dict(base.get("preferences") or {})
+        return base
+
+    def _save_system_state(self, slug: str, state: dict) -> dict:
+        state = {**default_system_state(), **dict(state or {})}
+        state["updated_at"] = _now()
+        _atomic_json(self._path(slug, "systems_state.json"), state)
+        return state
 
     def revisions(self, slug: str) -> list[dict]:
         folder = self._path(slug, "revisions")
@@ -288,6 +905,14 @@ class SmartGuideStore:
                 )})
         return values[:MAX_REVISIONS]
 
+    def revision(self, slug: str, revision_id: str) -> dict:
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "", str(revision_id or ""))
+        if not safe:
+            return self.current(slug)
+        value = _read_json(self._path(slug, f"revisions/{safe}.json"), {})
+        return self._migrate_document(value)
+
+    @_serialized
     def publish(self, slug: str, document: dict, source_hash: str,
                 provider: str, model: str, restored_from: str = "") -> dict:
         clean = validate_document(document)
@@ -311,7 +936,7 @@ class SmartGuideStore:
 
     def restore(self, slug: str, revision_id: str) -> dict:
         safe = re.sub(r"[^a-zA-Z0-9_-]", "", str(revision_id or ""))
-        revision = _read_json(self._path(slug, f"revisions/{safe}.json"), {})
+        revision = self.revision(slug, safe)
         if not revision:
             raise SmartGuideError("Revisão não encontrada.")
         return self.publish(
@@ -319,6 +944,150 @@ class SmartGuideStore:
             revision.get("provider", "restored"), revision.get("model", ""), safe,
         )
 
+    @_serialized
+    def save_system(self, slug: str, system: dict) -> dict:
+        current = self.current(slug)
+        if not current:
+            raise SmartGuideError("Este jogo ainda não possui Guia Inteligente.")
+        candidate = deepcopy(system) if isinstance(system, dict) else {}
+        candidate["origin"] = candidate.get("origin") if candidate.get("origin") in {"ai", "migrated"} else "manual"
+        candidate["status"] = candidate.get("status") if candidate.get("status") in {"suggested", "approved", "rejected"} else "approved"
+        # Valida o sistema isoladamente e usa seu id normalizado para substituir
+        # a versão anterior sem duplicá-la.
+        probe = {**current, "systems": [candidate]}
+        normalized = validate_document(probe).get("systems") or []
+        if not normalized:
+            raise SmartGuideError("O sistema visual precisa de ao menos dois nós e uma relação.")
+        saved = normalized[0]
+        systems = [item for item in (current.get("systems") or []) if item.get("id") != saved["id"]]
+        systems.append(saved)
+        revision = self.publish(
+            slug, {**current, "systems": systems}, current.get("source_hash", ""),
+            current.get("provider", "manual"), current.get("model", ""),
+        )
+        return {"revision": revision, "system": saved}
+
+    def delete_system(self, slug: str, system_id: str) -> dict:
+        current = self.current(slug)
+        system_id = _clean_text(system_id, 100)
+        removed = next((item for item in (current.get("systems") or []) if item.get("id") == system_id), None)
+        systems = [item for item in (current.get("systems") or []) if item.get("id") != system_id]
+        if len(systems) == len(current.get("systems") or []):
+            raise SmartGuideError("Sistema visual não encontrado.")
+        revision = self.publish(
+            slug, {**current, "systems": systems}, current.get("source_hash", ""),
+            current.get("provider", "manual"), current.get("model", ""),
+        )
+        state = self.system_state(slug)
+        state["goals"].pop(system_id, None)
+        if state.get("active_system") == system_id:
+            state["active_system"] = ""
+        removed_requirements = {
+            requirement.get("id") for edge in (removed or {}).get("edges") or []
+            for requirement in edge.get("requirements") or []
+        }
+        state["completed_requirements"] = [
+            item for item in state.get("completed_requirements") or []
+            if item not in removed_requirements
+        ]
+        state["node_media"] = {
+            key: value for key, value in (state.get("node_media") or {}).items()
+            if not key.startswith(f"{system_id}:")
+        }
+        state["preferences"].pop(system_id, None)
+        self._save_system_state(slug, state)
+        return revision
+
+    @_serialized
+    def set_system_goal(self, slug: str, system_id: str, node_id: str) -> dict:
+        current = self.current(slug)
+        system = next((item for item in current.get("systems") or [] if item.get("id") == system_id), None)
+        if not system:
+            raise SmartGuideError("Sistema visual não encontrado.")
+        node_id = _clean_text(node_id, 100)
+        if node_id and node_id not in {item.get("id") for item in system.get("nodes") or []}:
+            raise SmartGuideError("Nó do sistema não encontrado.")
+        state = self.system_state(slug)
+        state["active_system"] = system_id if node_id else ""
+        if node_id:
+            state["goals"][system_id] = node_id
+        else:
+            state["goals"].pop(system_id, None)
+        return self._save_system_state(slug, state)
+
+    @_serialized
+    def set_system_path(self, slug: str, system_id: str, edge_id: str) -> dict:
+        system = next((s for s in self.current(slug).get("systems", []) if s["id"] == system_id), None)
+        if not system or edge_id not in {e["id"] for e in system["edges"]}:
+            raise SmartGuideError("Caminho não encontrado.")
+        state = self.system_state(slug)
+        state.setdefault("preferences", {}).setdefault(system_id, {})["edge_id"] = edge_id
+        return self._save_system_state(slug, state)
+
+    @_serialized
+    def update_requirement(self, slug: str, system_id: str, edge_id: str,
+                           requirement_id: str, completed: bool) -> dict:
+        current = self.current(slug)
+        system = next((item for item in current.get("systems") or [] if item.get("id") == system_id), None)
+        edge = next((item for item in (system or {}).get("edges") or [] if item.get("id") == edge_id), None)
+        requirement = next((item for item in (edge or {}).get("requirements") or []
+                            if item.get("id") == requirement_id), None)
+        if not requirement:
+            raise SmartGuideError("Requisito visual não encontrado.")
+        state = self.system_state(slug)
+        items = set(state.get("completed_requirements") or [])
+        if completed:
+            items.add(requirement_id)
+        else:
+            items.discard(requirement_id)
+        state["completed_requirements"] = sorted(items)
+        return self._save_system_state(slug, state)
+
+    def set_system_media(self, slug: str, system_id: str, node_id: str,
+                         media_id: str) -> dict:
+        current = self.current(slug)
+        system = next((item for item in current.get("systems") or [] if item.get("id") == system_id), None)
+        if not system or node_id not in {item.get("id") for item in system.get("nodes") or []}:
+            raise SmartGuideError("Nó do sistema não encontrado.")
+        state = self.system_state(slug)
+        key = f"{system_id}:{node_id}"
+        media_id = _clean_text(media_id, 100)
+        if media_id:
+            state["node_media"][key] = media_id
+        else:
+            state["node_media"].pop(key, None)
+        return self._save_system_state(slug, state)
+
+    @staticmethod
+    def system_objective(document: dict, state: dict) -> dict:
+        system_id = state.get("active_system") or ""
+        system = next((item for item in document.get("systems") or [] if item.get("id") == system_id), None)
+        if not system:
+            return {}
+        node_id = (state.get("goals") or {}).get(system_id) or ""
+        node = next((item for item in system.get("nodes") or [] if item.get("id") == node_id), None)
+        if not node:
+            return {}
+        completed = set(state.get("completed_requirements") or [])
+        incoming = [edge for edge in system.get("edges") or [] if edge.get("to") == node_id]
+        # Incoming edges are alternative paths, not one giant AND condition.
+        chosen = state.get("preferences", {}).get(system_id, {}).get("edge_id")
+        edge = next((item for item in incoming if item.get("id") == chosen), None)
+        if edge is None and incoming:
+            edge = min(incoming, key=lambda item: sum(
+                req.get("id") not in completed for req in item.get("requirements") or []))
+        requirements = (edge or {}).get("requirements") or []
+        pending = next((req for req in requirements if req.get("id") not in completed), None)
+        return {
+            "system_id": system_id, "system_title": system.get("title", ""),
+            "node_id": node_id, "title": node.get("label", ""),
+            "edge_id": (edge or {}).get("id", ""), "alternative_paths": len(incoming),
+            "subtitle": node.get("subtitle", ""), "next_requirement": pending or {},
+            "requirements_total": len(requirements),
+            "requirements_completed": sum(1 for req in requirements if req.get("id") in completed),
+        }
+
+    @_serialized
     def update_progress(self, slug: str, action: str, block_id: str = "", value=None) -> dict:
         progress = self.progress(slug)
         block_id = _clean_text(block_id, 100)
@@ -380,11 +1149,14 @@ class SmartGuideStore:
     def bundle(self, slug: str) -> dict:
         current = self.current(slug)
         progress = self.progress(slug)
+        system_state = self.system_state(slug)
         return {
             "ok": True, "source": self.source(slug), "current": current,
             "progress": progress, "status": self.status(slug),
             "revisions": self.revisions(slug),
             "next_objective": self.next_objective(current, progress) if current else {},
+            "system_state": system_state,
+            "system_objective": self.system_objective(current, system_state) if current else {},
         }
 
     def export_pack(self, slug: str, include_progress: bool = True,
@@ -393,11 +1165,11 @@ class SmartGuideStore:
         directory = self.directory(slug)
         if not directory.exists():
             raise SmartGuideError("Este jogo ainda não possui Guia Inteligente.")
-        manifest = {"format": "digitracker-guide-pack", "version": 1, "slug": self._slug(slug)}
+        manifest = {"format": "digitracker-guide-pack", "version": 2, "slug": self._slug(slug)}
         with zipfile.ZipFile(memory, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
             for path in directory.rglob("*"):
-                if not path.is_file() or (not include_progress and path.name == "progress.json"):
+                if not path.is_file() or (not include_progress and path.name in {"progress.json", "systems_state.json"}):
                     continue
                 archive.write(path, path.relative_to(directory).as_posix())
             media_dir = Path(media_dir) if media_dir else None

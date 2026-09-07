@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
 import webbrowser
 import zipfile
 from functools import lru_cache
@@ -50,6 +51,8 @@ import smart_guide
 import steamgriddb
 import updater
 import web_image_search
+from experience_api import ExperienceApi
+from data_tools import DataToolsApi
 from ra_api import RAClient, RAError, RARateLimited, fmt_date
 from version import APP_VERSION
 
@@ -430,7 +433,7 @@ def annotate_pdf_pages(sections: list, raw: bytes) -> list:
 # ---------------------------------------------------------------------------- #
 # API exposta ao frontend (pywebview js_api)
 # ---------------------------------------------------------------------------- #
-class Api:
+class Api(ExperienceApi, DataToolsApi):
     def __init__(self):
         self._window = None
         self._overlay_windows: dict[str, object] = {}
@@ -473,7 +476,7 @@ class Api:
         self._auto_collapse_timer = None
         self._art_status: dict[str, dict] = {}
         self._art_lock = threading.Lock()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._tips_ai_lock = threading.Lock()
         self._tips_ai_status = {
             "ok": True, "phase": "idle", "operation": "",
@@ -482,6 +485,9 @@ class Api:
         self._smart_ai_lock = threading.Lock()
         self._smart_ai_status: dict[str, dict] = {}
         self._smart_ai_queue: list[str] = []
+        self._merge_ai_status: dict[str, dict] = {}
+        self._atlas_ai_status: dict[str, dict] = {}
+        self._atlas_job_lock = threading.RLock()
         self._updates = updater.UpdateManager(APP_VERSION, sys.executable)
         self._guides = smart_guide.SmartGuideStore(GUIDES_DIR)
         self._guide_media = guide_media.GuideMediaLibrary(GUIDES_DIR, GUIDE_MEDIA_DIR)
@@ -490,10 +496,18 @@ class Api:
         for d in (GAMES_DIR, CACHE_DIR, BADGES_DIR, ICONS_DIR, ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
 
+        for game_path in GAMES_DIR.glob("*.json"):
+            for source in self._guides.system_sources(game_path.stem):
+                if source.get("status") == "running":
+                    self._guides.update_system_source(
+                        game_path.stem, source["id"], status="interrupted",
+                        error="O aplicativo encerrou durante a análise. Tente novamente.")
+
         secrets = load_secrets()
         if secrets and secrets.get("username") and secrets.get("api_key"):
             self._client = RAClient(secrets["username"], secrets["api_key"], CACHE_DIR)
             self._platforms.register(platform_providers.RetroAchievementsProvider(self._client))
+        self._init_experience(SETTINGS_PATH, DATA_DIR, UI_DIR)
 
     # ------------------------ status / configuração ------------------------- #
     def _platform_progress(self, game_id: int) -> dict:
@@ -543,6 +557,8 @@ class Api:
             if slug and slug not in self.state:
                 return {"ok": False, "error": "Jogo não encontrado."}
             self._active_slug = slug
+        if slug and hasattr(self, "_experience"):
+            self._experience.game_preference(self._experience_account(), slug, {"opened": True})
         self._notify_overlay_surfaces()
         return {"ok": True, "slug": slug}
 
@@ -702,6 +718,11 @@ class Api:
             json.dumps({"username": username, "api_key": api_key}, indent=2),
             encoding="utf-8",
         )
+        if hasattr(self, "_companion_service"):
+            self._companion_service.stop()
+            with self._companion_ai_lock:
+                self._companion_ai.clear()
+                self._companion_generation += 1
         self._client = client
         self._platforms.register(platform_providers.RetroAchievementsProvider(client))
         self._kick_sync()
@@ -739,6 +760,7 @@ class Api:
             )
         summaries.sort(key=lambda s: s["title"].lower())
         for summary in summaries:
+            summary["preferences"] = self._experience.game_preference(self._experience_account(), summary["slug"])
             self._schedule_art_enrichment(summary["slug"])
         return summaries
 
@@ -1274,6 +1296,7 @@ class Api:
                     "desc": a["desc"],
                     "badge": a["badge"],
                     "points": a.get("points", 0),
+                    "achievement_type": a.get("achievement_type", ""),
                 }
                 for a in ach_list
             },
@@ -1334,6 +1357,7 @@ class Api:
                     "desc": a["desc"],
                     "badge": a["badge"],
                     "points": a.get("points", 0),   # usado p/ casar com o PDF do guia
+                    "achievement_type": a.get("achievement_type", ""),
                 }
                 for a in ach_list
             },
@@ -1789,17 +1813,26 @@ class Api:
         return self.start_smart_guide(slug, force=True)
 
     def _resume_pending_smart_guides(self) -> None:
-        if not (self.settings.get("smart_guide_auto", True)
-                and self.settings.get("smart_guide_consent", False) and self._ai_key()):
+        if not (self.settings.get("smart_guide_consent", False) and self._ai_key()):
             return
         for path in GAMES_DIR.glob("*.json"):
             game = load_game_file(path)
-            if game and game.get("guide"):
+            if not game:
+                continue
+            slug = game["slug"]
+            if self.settings.get("smart_guide_auto", True) and game.get("guide"):
                 status = self._guides.status(game["slug"])
                 current = self._guides.current(game["slug"])
                 if status.get("phase") in {"awaiting_configuration", "awaiting_consent", "ready", "idle"} \
                         and current.get("provider") in ("", "local"):
-                    self._maybe_schedule_smart_guide(game["slug"])
+                    self._maybe_schedule_smart_guide(slug)
+            merge = self._guides.merge_status(slug)
+            if merge.get("phase") in {"awaiting_configuration", "awaiting_consent"}:
+                self.start_walkthrough_merge(slug, merge.get("source_ids") or [])
+            for source in self._guides.system_sources(slug):
+                if source.get("status") in {"awaiting_configuration", "awaiting_consent"}:
+                    self._queue_atlas_source(slug, source, source.get("title") or "Sistema visual",
+                                             source.get("replace_system_id") or "")
 
     def get_smart_guide(self, slug: str) -> dict:
         game = load_game_file(GAMES_DIR / f"{slug}.json")
@@ -1814,13 +1847,19 @@ class Api:
         with self._lock:
             state = self.state.get(slug) or {}
             earned_names = [a.get("name", "") for a in state.get("achievements", []) if a.get("earned")]
+            earned_ids = {int(a.get("id") or 0) for a in state.get("achievements", [])
+                          if a.get("earned")}
         external_completed = []
         normalized = [_normalize_text(name) for name in earned_names if name]
         current = bundle.get("current") or {}
         for chapter in current.get("chapters") or []:
             for block in chapter.get("blocks") or []:
                 haystack = _normalize_text(f"{block.get('title', '')} {block.get('text', '')}")
-                if block.get("type") == "achievement" and any(name and name in haystack for name in normalized):
+                achievement_id = int(block.get("achievement_id") or 0)
+                exact_id = achievement_id > 0 and achievement_id in earned_ids
+                legacy_name = achievement_id <= 0 and any(
+                    name and name in haystack for name in normalized)
+                if block.get("type") == "achievement" and (exact_id or legacy_name):
                     external_completed.append(block.get("id"))
         if external_completed:
             effective = dict(bundle.get("progress") or {})
@@ -1830,7 +1869,561 @@ class Api:
         else:
             bundle["effective_progress"] = bundle.get("progress") or {}
         bundle["external_completed"] = external_completed
+        bundle["walkthrough_sources"] = self._guides.walkthrough_sources(slug)
+        bundle["merge_status"] = self.get_walkthrough_merge_status(slug)
+        bundle["atlas_jobs"] = self._guides.system_sources(slug)
+        bundle["atlas_drafts"] = [self._guides.atlas_draft(slug, item["id"])
+                                  for item in bundle["atlas_jobs"]
+                                  if item.get("status") == "suggested"]
         return bundle
+
+    # ---------------- fontes múltiplas / consolidação da Jornada ---------- #
+    def list_walkthrough_sources(self, slug: str) -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado.", "sources": []}
+        try:
+            return {"ok": True, "sources": self._guides.walkthrough_sources(slug),
+                    "merge": self.get_walkthrough_merge_status(slug)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc), "sources": []}
+
+    def get_walkthrough_source(self, slug: str, source_id: str) -> dict:
+        try:
+            source = next((item for item in self._guides.walkthrough_sources(
+                slug, include_sections=True) if item.get("id") == source_id), None)
+            if not source:
+                return {"ok": False, "error": "Fonte não encontrada."}
+            return {"ok": True, "source": source}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @staticmethod
+    def _decode_upload(data: str, limit: int = 50 * 1024 * 1024) -> bytes:
+        try:
+            raw = base64.b64decode((data or "").split(",", 1)[-1], validate=True)
+        except ValueError as exc:
+            raise smart_guide.SmartGuideError("Arquivo codificado inválido.") from exc
+        if not raw or len(raw) > limit:
+            raise smart_guide.SmartGuideError("Arquivo vazio ou maior que 50 MB.")
+        return raw
+
+    def add_walkthrough_pdf(self, slug: str, data: str, filename: str = "") -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        try:
+            raw = self._decode_upload(data)
+            ok, error, sections = self._read_guide_sections(data)
+            if not ok:
+                return {"ok": False, "error": error}
+            source = self._guides.add_walkthrough_source(
+                slug, filename or "Guia em PDF", "pdf", sections,
+                {"filename": filename}, raw=raw,
+            )
+            return {"ok": True, "source": source, "duplicate": bool(source.get("duplicate")),
+                    "sources": self._guides.walkthrough_sources(slug)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def add_walkthrough_gamefaqs(self, slug: str, url: str) -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        try:
+            session = gamefaqs.create_session()
+            faq = gamefaqs.fetch_faq(session, url)
+            parsed = guide_parser.parse_freeform(faq.get("text") or "")
+            source = self._guides.add_walkthrough_source(
+                slug, faq.get("title") or "GameFAQs", "gamefaqs",
+                parsed.get("sections") or [],
+                {"filename": faq.get("title") or "", "url": url},
+                text=faq.get("text") or "",
+            )
+            return {"ok": True, "source": source, "duplicate": bool(source.get("duplicate")),
+                    "sources": self._guides.walkthrough_sources(slug)}
+        except (gamefaqs.GameFAQsError, smart_guide.SmartGuideError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "error": f"Falha ao importar o GameFAQs: {exc}"}
+
+    def add_walkthrough_text(self, slug: str, title: str, text: str) -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        text = str(text or "").strip()
+        if not text:
+            return {"ok": False, "error": "Cole algum conteúdo do guia."}
+        try:
+            parsed = guide_parser.parse_freeform(text)
+            source = self._guides.add_walkthrough_source(
+                slug, title or "Texto colado", "text", parsed.get("sections") or [],
+                {"filename": title or "Texto colado"}, text=text,
+            )
+            return {"ok": True, "source": source, "duplicate": bool(source.get("duplicate")),
+                    "sources": self._guides.walkthrough_sources(slug)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def update_walkthrough_source(self, slug: str, source_id: str,
+                                  title: str | None = None,
+                                  enabled: bool | None = None) -> dict:
+        try:
+            changes = {}
+            if title is not None:
+                changes["title"] = title
+            if enabled is not None:
+                changes["enabled"] = bool(enabled)
+            source = self._guides.update_walkthrough_source(slug, source_id, **changes)
+            return {"ok": True, "source": source,
+                    "sources": self._guides.walkthrough_sources(slug)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def remove_walkthrough_source(self, slug: str, source_id: str) -> dict:
+        try:
+            result = self._guides.remove_walkthrough_source(slug, source_id)
+            return {"ok": True, **result, "sources": self._guides.walkthrough_sources(slug)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def start_walkthrough_merge(self, slug: str, source_ids: list | None = None) -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        sources = self._guides.walkthrough_sources(slug, include_sections=True)
+        requested = {str(item) for item in (source_ids or [])}
+        selected = [source for source in sources
+                    if (not requested and source.get("enabled", True)) or source.get("id") in requested]
+        if not selected:
+            return {"ok": False, "error": "Selecione ao menos uma fonte."}
+        selected_ids = [source["id"] for source in selected]
+        if not self.settings.get("smart_guide_consent", False):
+            status = self._guides.set_merge_status(
+                slug, "awaiting_consent", error="",
+                message="Confirme o envio à IA nas Configurações.",
+                source_ids=selected_ids)
+            return {"ok": False, **status}
+        config = self._ai_config()
+        if not config.get("api_key"):
+            status = self._guides.set_merge_status(
+                slug, "awaiting_configuration", error="",
+                message="Configure um provedor de IA para consolidar os guias.",
+                source_ids=selected_ids)
+            return {"ok": False, **status}
+        with self._smart_ai_lock:
+            running = self._merge_ai_status.get(slug) or {}
+            if running.get("phase") == "running":
+                return {"ok": False, **running, "error": "A consolidação já está em andamento."}
+            task = {"ok": True, "slug": slug, "phase": "running", "completed": 0,
+                    "total": 0, "source_ids": [s["id"] for s in selected],
+                    "message": "Preparando as fontes…", "error": ""}
+            self._merge_ai_status[slug] = task
+        self._guides.set_merge_status(slug, "running", **{k: v for k, v in task.items()
+                                      if k not in {"phase", "slug"}})
+        threading.Thread(target=self._walkthrough_merge_worker,
+                         args=(slug, selected), daemon=True).start()
+        return dict(task)
+
+    def _walkthrough_merge_worker(self, slug: str, sources: list[dict]) -> None:
+        def progress(completed: int, total: int) -> None:
+            with self._smart_ai_lock:
+                task = self._merge_ai_status.setdefault(slug, {})
+                task.update({"completed": completed, "total": total,
+                             "message": ("Comparando as fontes…" if completed >= total
+                                         else f"Organizando lote {completed + 1} de {total}…")})
+                snapshot = dict(task)
+            self._guides.set_merge_status(slug, "running", **{k: v for k, v in snapshot.items()
+                                          if k not in {"phase", "slug"}})
+        game = load_game_file(GAMES_DIR / f"{slug}.json") or {}
+        config = self._ai_config()
+        try:
+            document, conflicts = guide_ai.generate_merged_guide(
+                sources, game, config, progress=progress)
+            preview = self._guides.save_merge_preview(
+                slug, document, [source["id"] for source in sources], conflicts)
+            blocking = sum(1 for item in conflicts if item.get("blocking"))
+            status = self._guides.set_merge_status(
+                slug, "awaiting_review", ok=True, error="",
+                message=(f"Prévia pronta · {blocking} conflito(s) importante(s)." if blocking
+                         else "Prévia pronta para publicar."),
+                conflicts=len(conflicts), blocking=blocking,
+                source_ids=preview["source_ids"])
+        except Exception as exc:
+            status = self._guides.set_merge_status(
+                slug, "error", ok=False, message="", error=str(exc))
+        with self._smart_ai_lock:
+            self._merge_ai_status[slug] = {"slug": slug, **status}
+        self._refresh_smart_bundle(slug)
+
+    def get_walkthrough_merge_status(self, slug: str) -> dict:
+        with self._smart_ai_lock:
+            live = dict(self._merge_ai_status.get(slug) or {})
+        status = live or self._guides.merge_status(slug)
+        if status.get("phase") == "awaiting_review":
+            preview = self._guides.merge_preview(slug)
+            status = {**status, "conflicts": preview.get("conflicts") or [],
+                      "preview": preview.get("document") or {}}
+        return {"ok": status.get("phase") != "error", **status}
+
+    def resolve_walkthrough_conflict(self, slug: str, conflict_id: str,
+                                     choice: str) -> dict:
+        try:
+            preview = self._guides.resolve_merge_conflict(slug, conflict_id, choice)
+            unresolved = sum(1 for item in preview.get("conflicts") or []
+                             if item.get("blocking") and not item.get("resolution"))
+            return {"ok": True, "conflicts": preview.get("conflicts") or [],
+                    "unresolved": unresolved}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def publish_walkthrough_merge(self, slug: str) -> dict:
+        try:
+            config = self._ai_config()
+            revision = self._guides.publish_merge_preview(
+                slug, config.get("provider") or "ai", config.get("model") or "")
+            self._refresh_smart_bundle(slug)
+            return {"ok": True, "revision": revision}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _guide_systems_payload(self, slug: str, document: dict | None = None) -> dict:
+        current = document if isinstance(document, dict) else self._guides.current(slug)
+        state = self._guides.system_state(slug)
+        media = self._guide_media.list(slug)
+        media_by_id = {item.get("id"): item for item in media}
+        systems = []
+        for raw_system in current.get("systems") or []:
+            system = copy.deepcopy(raw_system)
+            for node in system.get("nodes") or []:
+                media_id = (state.get("node_media") or {}).get(
+                    f"{system.get('id')}:{node.get('id')}", ""
+                )
+                node["media_id"] = media_id
+                node["media"] = media_by_id.get(media_id) or {}
+                node["is_goal"] = (state.get("goals") or {}).get(system.get("id")) == node.get("id")
+            systems.append(system)
+        return {
+            "ok": True, "systems": systems,
+            "approved": [item for item in systems if item.get("status") == "approved"],
+            "suggested": [item for item in systems if item.get("status") == "suggested"],
+            "state": state, "media": media,
+            "sources": self._guides.system_sources(slug),
+            "objective": self._guides.system_objective(current, state),
+        }
+
+    def _refresh_smart_bundle(self, slug: str) -> None:
+        """Atualiza dashboard/HUD sem consultar novamente a plataforma."""
+        bundle = self.get_smart_guide(slug)
+        if not bundle.get("ok"):
+            return
+        with self._lock:
+            if slug in self.state:
+                self.state[slug]["smart_guide"] = bundle
+        self._notify_overlay_surfaces()
+
+    def get_guide_systems(self, slug: str) -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado.", "systems": []}
+        return self._guide_systems_payload(slug)
+
+    def preview_guide_systems(self, slug: str, revision_id: str = "") -> dict:
+        try:
+            document = self._guides.revision(slug, revision_id)
+            if not document:
+                return {"ok": False, "error": "Revisão não encontrada.", "systems": []}
+            result = self._guide_systems_payload(slug, document)
+            result["revision_id"] = document.get("revision_id", "")
+            return result
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc), "systems": []}
+
+    def save_guide_system(self, slug: str, system: dict) -> dict:
+        try:
+            system = system if isinstance(system, dict) else {}
+            existing_ids = {item.get("id") for item in
+                            self._guides.current(slug).get("systems") or []}
+            source_id = str(system.get("source_id") or "")
+            if not source_id and (self._guides.source(slug).get("sections") or []):
+                system = {**system, "source_id": "legacy-main"}
+                source_id = "legacy-main"
+            if not system.get("id") and not source_id:
+                return {"ok": False, "error": "Anexe um PDF ou GameFAQs exclusivo antes de criar o sistema."}
+            if source_id and source_id != "legacy-main" \
+                    and not self._guides.system_source(slug, source_id):
+                return {"ok": False, "error": "A fonte exclusiva deste sistema não foi encontrada."}
+            if system.get("id") not in existing_ids and source_id == "legacy-main" \
+                    and not (self._guides.source(slug).get("sections") or []):
+                return {"ok": False, "error": "Novos sistemas exigem uma fonte exclusiva."}
+            result = self._guides.save_system(slug, system)
+            source_id = str((result.get("system") or {}).get("source_id") or "")
+            if source_id and source_id != "legacy-main":
+                self._guides.link_system_source(
+                    slug, source_id, (result.get("system") or {}).get("id", ""))
+            self._refresh_smart_bundle(slug)
+            return {"ok": True, **result, **self._guide_systems_payload(slug)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _ensure_atlas_document(self, game: dict) -> None:
+        if self._guides.current(game["slug"]):
+            return
+        placeholder = smart_guide.from_legacy_sections(
+            f"Jornada - {game.get('title') or 'Jogo'}", [{
+                "title": "Jornada", "blocks": [{
+                    "type": "note",
+                    "text": "Adicione fontes gerais para criar o walkthrough consolidado.",
+                }],
+            }])
+        self._guides.publish(game["slug"], placeholder, "", "local", "atlas-placeholder")
+
+    def _queue_atlas_source(self, slug: str, source: dict, title: str,
+                            replace_system_id: str = "") -> dict:
+        if not (self.settings.get("smart_guide_consent", False) and self._ai_key()):
+            phase = "awaiting_configuration" if not self._ai_key() else "awaiting_consent"
+            saved = self._guides.update_system_source(
+                slug, source["id"], status=phase, error="",
+                replace_system_id=replace_system_id)
+            self._refresh_smart_bundle(slug)
+            return {"ok": True, "phase": phase, "source": saved,
+                    "message": "Fonte salva. Configure a IA ou use o editor manual."}
+        with self._atlas_job_lock:
+            current = self._guides.system_source(slug, source["id"])
+            if current.get("status") == "running":
+                return {"ok": False, "error": "Esta fonte já está sendo analisada."}
+            job_id = uuid.uuid4().hex
+            task = {"ok": True, "phase": "running", "slug": slug,
+                    "source_id": source["id"], "title": title, "job_id": job_id,
+                    "replace_system_id": replace_system_id,
+                    "message": "Analisando a fonte exclusiva do Atlas…", "error": ""}
+            self._atlas_ai_status[f"{slug}:{source['id']}"] = task
+            self._guides.update_system_source(slug, source["id"], status="running", error="",
+                                              job_id=job_id, replace_system_id=replace_system_id)
+        self._refresh_smart_bundle(slug)
+        threading.Thread(target=self._atlas_source_worker,
+                         args=(slug, source["id"], title, replace_system_id, job_id), daemon=True).start()
+        return {**task, "source": source}
+
+    def _atlas_source_worker(self, slug: str, source_id: str, title: str,
+                             replace_system_id: str = "", job_id: str = "") -> None:
+        game = load_game_file(GAMES_DIR / f"{slug}.json") or {}
+        try:
+            source = self._guides.system_source(slug, source_id, include_sections=True)
+            system = guide_ai.generate_system_from_source(
+                source, title, game, self._ai_config())
+            if replace_system_id:
+                system["id"] = replace_system_id
+            with self._atlas_job_lock:
+                draft = self._guides.save_atlas_draft(slug, source_id, system, job_id)
+            system = draft["system"]
+            saved = self._guides.system_source(slug, source_id)
+            status = {"ok": True, "phase": "suggested", "slug": slug,
+                      "source_id": source_id, "system": system, "source": saved,
+                      "message": "Sistema pronto para revisão.", "error": ""}
+        except Exception as exc:
+            with self._atlas_job_lock:
+                latest = self._guides.system_source(slug, source_id)
+                if latest.get("job_id") != job_id or latest.get("status") != "running":
+                    return  # Cancelled/retried work must never overwrite the new job.
+                self._guides.update_system_source(slug, source_id, status="error", error=str(exc))
+            status = {"ok": False, "phase": "error", "slug": slug,
+                      "source_id": source_id, "message": "", "error": str(exc)}
+        with self._smart_ai_lock:
+            self._atlas_ai_status[f"{slug}:{source_id}"] = status
+        self._refresh_smart_bundle(slug)
+
+    def get_atlas_job(self, slug: str, source_id: str) -> dict:
+        try:
+            source = self._guides.system_source(slug, source_id)
+            if not source:
+                return {"ok": False, "error": "Fonte não encontrada."}
+            return {"ok": True, "source": source, "phase": source.get("status", "idle"),
+                    "draft": self._guides.atlas_draft(slug, source_id)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def retry_atlas_job(self, slug: str, source_id: str) -> dict:
+        source = self.get_atlas_job(slug, source_id)
+        if not source.get("ok"):
+            return source
+        value = source["source"]
+        return self._queue_atlas_source(slug, value, value.get("title") or "Sistema visual",
+                                        value.get("replace_system_id") or "")
+
+    def cancel_atlas_job(self, slug: str, source_id: str) -> dict:
+        try:
+            with self._atlas_job_lock:
+                self._guides.update_system_source(slug, source_id, status="cancelled", job_id="", error="")
+            self._refresh_smart_bundle(slug)
+            return {"ok": True}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def approve_atlas_job(self, slug: str, source_id: str, system: dict | None = None) -> dict:
+        try:
+            with self._atlas_job_lock:
+                result = self._guides.approve_atlas_draft(slug, source_id, system)
+            self._refresh_smart_bundle(slug)
+            return {"ok": True, **result}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def create_guide_system_from_pdf(self, slug: str, title: str,
+                                     data: str, filename: str = "") -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        try:
+            raw = self._decode_upload(data)
+            ok, error, sections = self._read_guide_sections(data)
+            if not ok:
+                return {"ok": False, "error": error}
+            self._ensure_atlas_document(game)
+            source = self._guides.add_system_source(
+                slug, title or filename or "Sistema visual", "pdf", sections,
+                {"filename": filename}, raw=raw)
+            return self._queue_atlas_source(slug, source, title or filename or "Sistema visual")
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def create_guide_system_from_gamefaqs(self, slug: str, title: str,
+                                          url: str) -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        try:
+            session = gamefaqs.create_session()
+            faq = gamefaqs.fetch_faq(session, url)
+            parsed = guide_parser.parse_freeform(faq.get("text") or "")
+            self._ensure_atlas_document(game)
+            source = self._guides.add_system_source(
+                slug, title or faq.get("title") or "Sistema visual", "gamefaqs",
+                parsed.get("sections") or [], {"filename": faq.get("title") or "", "url": url},
+                text=faq.get("text") or "")
+            return self._queue_atlas_source(
+                slug, source, title or faq.get("title") or "Sistema visual")
+        except (gamefaqs.GameFAQsError, smart_guide.SmartGuideError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "error": f"Falha ao importar a fonte do Atlas: {exc}"}
+
+    def get_guide_system_source(self, slug: str, system_id: str) -> dict:
+        current = self._guides.current(slug)
+        system = next((item for item in current.get("systems") or []
+                       if item.get("id") == system_id), None)
+        source_id = (system or {}).get("source_id") or system_id
+        source = self._guides.system_source(slug, source_id)
+        if not source and source_id == "legacy-main":
+            legacy = self._guides.source(slug)
+            source = {"id": "legacy-main", "title": legacy.get("title", "Guia legado"),
+                      "kind": "legacy", "captured_at": legacy.get("captured_at", 0),
+                      "system_id": system_id}
+        if not source:
+            return {"ok": False, "error": "Fonte do sistema não encontrada."}
+        with self._smart_ai_lock:
+            status = dict(self._atlas_ai_status.get(f"{slug}:{source_id}") or {})
+        return {"ok": True, "source": source, "status": status}
+
+    def replace_guide_system_source(self, slug: str, system_id: str,
+                                    source: dict) -> dict:
+        """Troca a fonte exclusiva sem retirar o sistema atual até a nova
+        análise terminar. A prévia substitui o mesmo id em uma revisão única."""
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        current = self._guides.current(slug)
+        system = next((item for item in current.get("systems") or []
+                       if item.get("id") == system_id), None)
+        if not game or not system:
+            return {"ok": False, "error": "Sistema visual não encontrado."}
+        source = source if isinstance(source, dict) else {}
+        kind = str(source.get("kind") or "").lower()
+        title = str(source.get("title") or system.get("title") or "Sistema visual")
+        try:
+            if kind == "pdf":
+                data = str(source.get("data") or "")
+                raw = self._decode_upload(data)
+                ok, error, sections = self._read_guide_sections(data)
+                if not ok:
+                    return {"ok": False, "error": error}
+                saved = self._guides.add_system_source(
+                    slug, title, "pdf", sections,
+                    {"filename": source.get("filename") or ""}, raw=raw)
+            elif kind == "gamefaqs":
+                url = str(source.get("url") or "").strip()
+                session = gamefaqs.create_session()
+                faq = gamefaqs.fetch_faq(session, url)
+                parsed = guide_parser.parse_freeform(faq.get("text") or "")
+                saved = self._guides.add_system_source(
+                    slug, title, "gamefaqs", parsed.get("sections") or [],
+                    {"filename": faq.get("title") or "", "url": url},
+                    text=faq.get("text") or "")
+            else:
+                return {"ok": False, "error": "Escolha PDF ou GameFAQs."}
+            self._guides.update_system_source(
+                slug, saved["id"], replace_system_id=system_id)
+            return self._queue_atlas_source(slug, saved, title, system_id)
+        except (gamefaqs.GameFAQsError, smart_guide.SmartGuideError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "error": f"Falha ao trocar a fonte: {exc}"}
+
+    def delete_guide_system(self, slug: str, system_id: str) -> dict:
+        try:
+            revision = self._guides.delete_system(slug, system_id)
+            self._refresh_smart_bundle(slug)
+            return {"ok": True, "revision": revision, **self._guide_systems_payload(slug)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def set_guide_system_goal(self, slug: str, system_id: str, node_id: str) -> dict:
+        try:
+            state = self._guides.set_system_goal(slug, system_id, node_id)
+            self._refresh_smart_bundle(slug)
+            return {"ok": True, "state": state,
+                    "objective": self._guides.system_objective(self._guides.current(slug), state)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def update_guide_requirement(self, slug: str, system_id: str, edge_id: str,
+                                 requirement_id: str, completed: bool) -> dict:
+        try:
+            state = self._guides.update_requirement(
+                slug, system_id, edge_id, requirement_id, bool(completed),
+            )
+            self._refresh_smart_bundle(slug)
+            return {"ok": True, "state": state,
+                    "objective": self._guides.system_objective(self._guides.current(slug), state)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def search_guide_system_media(self, slug: str, system_id: str, node_id: str,
+                                  query: str = "", page: int = 0) -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        current = self._guides.current(slug)
+        system = next((item for item in current.get("systems") or [] if item.get("id") == system_id), None)
+        node = next((item for item in (system or {}).get("nodes") or [] if item.get("id") == node_id), None)
+        if not game or not node:
+            return {"ok": False, "error": "Nó do sistema não encontrado.", "results": []}
+        term = re.sub(r"\s+", " ", " ".join(filter(None, (
+            game.get("title", ""), game.get("platform", ""),
+            query or node.get("media_query") or node.get("label", ""), "artwork",
+        )))).strip()[:300]
+        result = self.search_web_images(slug, term, page, "moderate", "icon", "google")
+        result["system_id"] = system_id
+        result["node_id"] = node_id
+        result["query"] = term
+        return result
+
+    def set_guide_system_media(self, slug: str, system_id: str, node_id: str,
+                               media_id: str) -> dict:
+        try:
+            if media_id and media_id not in {item.get("id") for item in self._guide_media.list(slug)}:
+                return {"ok": False, "error": "Imagem aprovada não encontrada."}
+            state = self._guides.set_system_media(slug, system_id, node_id, media_id)
+            self._refresh_smart_bundle(slug)
+            return {"ok": True, "state": state, **self._guide_systems_payload(slug)}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
 
     def get_smart_guide_status(self, slug: str = "") -> dict:
         if slug:
@@ -1943,6 +2536,7 @@ class Api:
     def update_guide_progress(self, slug: str, action: str, block_id: str = "", value=None) -> dict:
         try:
             progress = self._guides.update_progress(slug, action, block_id, value)
+            self._refresh_smart_bundle(slug)
             return {"ok": True, "progress": progress,
                     "next_objective": self._guides.next_objective(self._guides.current(slug), progress)}
         except smart_guide.SmartGuideError as exc:
@@ -2492,6 +3086,7 @@ class Api:
                            "sha256": digest, "width": downloaded.get("width"),
                            "height": downloaded.get("height"), "mime": downloaded.get("mime")}
         art_meta["auto_status"] = "ready"
+        self._remember_art(slug, load_game_file(GAMES_DIR / f"{slug}.json") or {})
         self._persist_art(slug, game, art, art_meta)
         # A escolha manual de arte também atualiza a identidade visual, exceto
         # quando o usuário já fixou uma paleta manual para o jogo.
@@ -2607,9 +3202,10 @@ class Api:
         palette = {"primary": primary, "secondary": secondary,
                    "text": self._contrast_text(primary), "manual": True,
                    "updated_at": time.time()}
+        self._remember_art(slug, game)
         game["palette"] = palette
         game["accent"] = primary
-        path.write_text(json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8")
+        smart_guide._atomic_json(path, game)
         with self._lock:
             if slug in self.state:
                 self.state[slug]["palette"] = palette
@@ -2622,6 +3218,7 @@ class Api:
         game = load_game_file(GAMES_DIR / f"{slug}.json")
         if not game:
             return {"ok": False, "error": "Jogo não encontrado."}
+        self._remember_art(slug, game)
         roles = ["cover", "background"] if role == "both" else [role]
         art = dict(game.get("art") or {})
         art_meta = dict(game.get("art_meta") or {})
@@ -2632,10 +3229,7 @@ class Api:
             art_meta.pop(r, None)
             if r == "icon":
                 game["icon"] = game.pop("icon_original", game.get("icon", ""))
-            try:
-                (ART_DIR / slug / self._ROLE_FILE[r]).unlink(missing_ok=True)
-            except OSError:
-                pass
+            # Keep the cached image reachable by the reversible art history.
         art_meta["auto_status"] = "idle"
         art_meta["last_attempt_at"] = 0
         self._persist_art(slug, game, art, art_meta)
@@ -2647,9 +3241,7 @@ class Api:
         game["art"] = art
         if art_meta is not None:
             game["art_meta"] = art_meta
-        (GAMES_DIR / f"{slug}.json").write_text(
-            json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        smart_guide._atomic_json(GAMES_DIR / f"{slug}.json", game)
         with self._lock:
             detail = self.state.get(slug)
             if detail is not None:
@@ -2672,6 +3264,11 @@ class Api:
             self._window_op(self._window.minimize)
 
     def close(self):
+        if getattr(self, "_notifications", None):
+            self._notifications.close()
+        if hasattr(self, "_companion_service"):
+            self._companion_service.stop()
+            self._experience.session(self._experience_account(), "pause")
         try:
             self._overlay_input.close()
         except Exception:
@@ -3875,6 +4472,7 @@ class Api:
 
         score = {"available": 0, "earned": 0, "hardcore": 0,
                  "true_ratio_available": 0, "true_ratio_earned": 0}
+        metadata_changed = False
         for aid in ordered_ids:
                 m = meta.get(str(aid), {})
                 live = earned_map.get(aid, {})
@@ -3884,6 +4482,11 @@ class Api:
                 badge = m.get("badge") or live.get("badge", "")
                 points = int(live.get("points") or m.get("points") or 0)
                 true_ratio = int(live.get("true_ratio") or 0)
+                achievement_type = str(live.get("achievement_type") or
+                                       m.get("achievement_type") or "").strip().lower()
+                if achievement_type and m.get("achievement_type") != achievement_type:
+                    meta.setdefault(str(aid), {})["achievement_type"] = achievement_type
+                    metadata_changed = True
                 step_number, area = locations.get(aid, (None, "Ordem RetroAchievements"))
 
                 row = {
@@ -3905,6 +4508,8 @@ class Api:
                     "points": points,
                     "true_ratio": true_ratio,
                     "rarity": live.get("rarity"),
+                    "rarity_hardcore": live.get("rarity_hardcore"),
+                    "achievement_type": achievement_type,
                 }
                 ordered.append(row)
                 score["available"] += points
@@ -3925,7 +4530,11 @@ class Api:
 
         # Guarda várias próximas: o overlay compacto escolhe quantas mostrar
         # conforme o tamanho ajustado da janela.
-        next_ids = [r["id"] for r in ordered if not r["earned"]][:12]
+        pending_missables = [r for r in ordered
+                             if r.get("achievement_type") == "missable" and not r.get("hardcore")]
+        next_ids = [r["id"] for r in pending_missables]
+        next_ids.extend(r["id"] for r in ordered if not r["earned"] and r["id"] not in next_ids)
+        next_ids = next_ids[:12]
         # Mastery = 100% em hardcore. É o número que a RA usa para o badge
         # dourado; as obtidas só em softcore precisam ser refeitas sem savestate.
         total = len(ordered)
@@ -3976,7 +4585,7 @@ class Api:
         )
 
         smart_bundle = {}
-        if game.get("guide"):
+        if game.get("guide") or self._guides.current(slug):
             if not self._guides.source(slug):
                 self._capture_smart_source(game, {"source": "migration"})
             smart_bundle = self._guides.bundle(slug)
@@ -3985,17 +4594,27 @@ class Api:
             effective = dict(smart_bundle.get("progress") or {})
             completed = set(effective.get("completed") or [])
             earned_names = [_normalize_text(row["name"]) for row in ordered if row["earned"]]
+            earned_ids = {int(row["id"]) for row in ordered if row["earned"]}
             external = []
             for chapter in document.get("chapters") or []:
                 for block in chapter.get("blocks") or []:
                     haystack = _normalize_text(f"{block.get('title', '')} {block.get('text', '')}")
-                    if block.get("type") == "achievement" and any(name and name in haystack for name in earned_names):
+                    achievement_id = int(block.get("achievement_id") or 0)
+                    exact_id = achievement_id > 0 and achievement_id in earned_ids
+                    legacy_name = achievement_id <= 0 and any(
+                        name and name in haystack for name in earned_names)
+                    if block.get("type") == "achievement" and (exact_id or legacy_name):
                         completed.add(block.get("id"))
                         external.append(block.get("id"))
             effective["completed"] = sorted(completed)
             smart_bundle["effective_progress"] = effective
             smart_bundle["external_completed"] = external
             smart_bundle["next_objective"] = self._guides.next_objective(document, effective)
+            smart_bundle["walkthrough_sources"] = self._guides.walkthrough_sources(slug)
+            smart_bundle["merge_status"] = self.get_walkthrough_merge_status(slug)
+            smart_bundle["atlas_jobs"] = self._guides.system_sources(slug)
+            smart_bundle["atlas_drafts"] = [self._guides.atlas_draft(slug, item["id"])
+                                             for item in smart_bundle["atlas_jobs"] if item.get("status") == "suggested"]
 
         detail = {
             "slug": slug,
@@ -4020,6 +4639,7 @@ class Api:
                 "tab", self.settings.get("compact_tab", "achievements")),
             "achievements": ordered,
             "next_ids": next_ids,
+            "pending_missables": pending_missables,
             "last_earned": last_earned,
             "guide": game.get("guide", []),   # seções de dicas/tutoriais do PDF
             "smart_guide": smart_bundle,
@@ -4027,7 +4647,17 @@ class Api:
         with self._lock:
             previous = self.state.get(slug)
             self.state[slug] = detail
+        if metadata_changed:
+            try:
+                game["achievements_meta"] = meta
+                path = GAMES_DIR / f"{slug}.json"
+                temp = path.with_suffix(".json.tmp")
+                temp.write_text(json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(temp, path)
+            except OSError:
+                pass
         self._maybe_expand_for_unlock(previous, detail)
+        self._record_experience(detail)
         return detail
 
     def _maybe_expand_for_unlock(self, previous, current):
@@ -4149,6 +4779,14 @@ def main():
         background_color="#050c18",
     )
     api._window = window
+    import notifications
+    api._notifications = notifications.Notifications(api)
+    notification_window = webview.create_window(
+        "DigiTracker achievement", url=f"http://127.0.0.1:{port}/ui/notification.html",
+        js_api=api._notifications.bridge, width=360, height=112, min_size=(360, 112),
+        hidden=True, frameless=True, easy_drag=False, shadow=False, focus=False,
+        on_top=True, background_color="#071629")
+    notification_window.events.loaded += lambda: api._notifications.attach(notification_window)
 
     summary_window = webview.create_window(
         "DigiTracker summary",
@@ -4201,6 +4839,14 @@ def main():
         threading.Thread(target=api.overlay_loop, daemon=True).start()
 
     window.events.loaded += start_runtime_services
+    if hasattr(window.events, "closed"):
+        def close_background_services():
+            api.stop_companion()
+            api._notifications.close()
+            api._experience.session(api._experience_account(), "pause")
+            for overlay in api._overlay_windows.values():
+                api._window_op(overlay.destroy)
+        window.events.closed += close_background_services
     webview.start()
 
 

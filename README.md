@@ -14,7 +14,8 @@ regras específicas no núcleo. Adicionar jogos, importar fontes e organizar gui
 
 - Interface híbrida DigiTracker/PSN/Steam Deck, responsiva e navegável por
   mouse, teclado ou controle.
-- Guia em três modos: **Compacto**, **Completo** e **Fonte original**.
+- Guia em quatro modos: **Rota**, **Guia completo**, **Sistemas visuais** e
+  **Fonte original**.
 - Fonte imutável, até dez revisões, restauração, favoritos, notas, spoilers,
   checkpoints e planejador de sessão.
 - Organização genérica por IA: objetivos, checklists, avisos, perdíveis,
@@ -372,3 +373,12 @@ anterior à v0.6.0 precisa ser atualizada manualmente uma última vez.
   recalculado localmente sobre a ordem do walkthrough.
 - Ícones: `media.retroachievements.org/Badge/{BadgeName}.png`, cacheados em
   `assets/badges/{slug}/`. Destravadas = coloridas; bloqueadas = grayscale.
+
+## Atlas de Sistemas Visuais (v0.10)
+
+O Guia Inteligente pode representar relações documentadas como um mapa visual
+genérico: evoluções, habilidades, classes, crafting, rotas narrativas e outros
+sistemas usam o mesmo schema. O Atlas oferece caminhos alternativos, requisitos,
+filtros, spoilers, imagens aprovadas manualmente e um objetivo que também aparece
+no overlay. A fonte importada permanece intacta e toda edição publica uma nova
+revisão reversível.

@@ -263,6 +263,10 @@ class RAClient:
             players = max(0, int(progress.get("NumDistinctPlayers") or 0))
         except (TypeError, ValueError):
             players = 0
+        try:
+            players_hardcore = max(0, int(progress.get("NumDistinctPlayersHardcore") or 0))
+        except (TypeError, ValueError):
+            players_hardcore = 0
         ach = progress.get("Achievements") or {}
         for raw_id, a in ach.items():
             try:
@@ -292,6 +296,7 @@ class RAClient:
                 display_order = int(a.get("DisplayOrder"))
             except (TypeError, ValueError):
                 display_order = 10_000_000   # sem ordem definida -> vai para o fim
+            achievement_type = str(a.get("type") or a.get("Type") or "").strip().lower()
             out[aid] = {
                 "id": aid,
                 "title": a.get("Title") or "",
@@ -302,7 +307,9 @@ class RAClient:
                 "num_awarded": awarded,
                 "num_awarded_hardcore": awarded_hardcore,
                 "rarity": round(awarded / players * 100, 2) if players else None,
+                "rarity_hardcore": min(100, round(awarded_hardcore / players_hardcore * 100, 2)) if players_hardcore else None,
                 "display_order": display_order,   # ordem canônica/lógica do set no RA
+                "achievement_type": achievement_type,
                 "earned": bool(earned_date),
                 "hardcore": bool(date_hc),
                 "date": earned_date or "",

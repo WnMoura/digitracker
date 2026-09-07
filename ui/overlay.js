@@ -21,12 +21,27 @@ function background(game, mode) {
 
 function objective(game) {
   const smart = game?.smart_guide || {};
+  const system = smart.system_objective || {};
+  if (system.title) {
+    const requirement = system.next_requirement?.text || "";
+    return {
+      title: system.title,
+      text: requirement || system.subtitle || `${system.requirements_completed || 0} de ${system.requirements_total || 0} requisitos`,
+      system: true,
+    };
+  }
   const next = smart.next_objective || {};
   if (next.title || next.text) return { title: next.title || next.text, text: next.text || "" };
   const achievement = (game?.next_ids || []).map((id) => (game.achievements || []).find((row) => row.id === id)).find(Boolean);
   return achievement
     ? { title: achievement.name, text: achievement.desc || "" }
     : { title: "Guia concluído", text: "Nenhum próximo objetivo pendente." };
+}
+
+function missableWarning(game) {
+  const row = (game?.pending_missables || [])[0];
+  if (!row) return null;
+  return { title: row.name || "Conquista perdível", softcore: !!row.earned && !row.hardcore };
 }
 
 function shell(game, body) {
@@ -43,12 +58,13 @@ function shell(game, body) {
 
 function summaryHTML(game) {
   const current = objective(game);
+  const missable = missableWarning(game);
   const mastery = game.mastery || {};
   const progress = Math.max(0, Math.min(100, Number(mastery.percent || 0)));
   const cover = game.art?.cover || game.art?.box;
   const body = `<div class="summary-card">
     ${cover ? `<img class="summary-cover" src="${esc(cover)}" alt="">` : `<span class="summary-cover"></span>`}
-    <div class="summary-copy"><span class="kicker">PRÓXIMO OBJETIVO</span><strong>${esc(current.title)}</strong><small>${esc(current.text || `${mastery.hardcore || 0} de ${mastery.total || 0} conquistas`)}</small></div>
+    <div class="summary-copy"><span class="kicker">${missable ? "△ PERDÍVEL ANTES DE AVANÇAR" : "PRÓXIMO OBJETIVO"}</span><strong>${esc(missable?.title || current.title)}</strong><small>${esc(missable ? (missable.softcore ? "Obtida só em Softcore · refaça em Hardcore" : "Classificação oficial RetroAchievements") : (current.text || `${mastery.hardcore || 0} de ${mastery.total || 0} conquistas`))}</small></div>
     <div class="progress-ring" style="--p:${progress}"><span>${progress}%</span></div>
   </div>`;
   return shell(game, body);
@@ -76,12 +92,13 @@ function achievementsHTML(game) {
 
 function guideHTML(game) {
   const smart = game.smart_guide || {};
+  const missable = missableWarning(game);
   const chapters = (smart.current?.chapters || []).slice(0, 3);
   if (!chapters.length) {
     const current = objective(game);
-    return `<div class="detail-kicker">GUIA INTELIGENTE</div><div class="guide-block"><b>${esc(current.title)}</b><p>${esc(current.text)}</p></div>`;
+    return `<div class="detail-kicker">GUIA INTELIGENTE</div>${missable ? `<div class="guide-block missable"><b>△ ${esc(missable.title)}</b><p>${missable.softcore ? "Refazer em Hardcore" : "Perdível oficial RetroAchievements"}</p></div>` : ""}<div class="guide-block"><b>${esc(current.title)}</b><p>${esc(current.text)}</p></div>`;
   }
-  return `<div class="detail-kicker">GUIA INTELIGENTE</div>${chapters.map((chapter) => `<div class="guide-block"><b>${esc(chapter.title || "Capítulo")}</b>${(chapter.blocks || []).filter((block) => block.type !== "text").slice(0, 2).map((block) => `<p>${esc(block.title || block.text || "")}</p>`).join("")}</div>`).join("")}`;
+  return `<div class="detail-kicker">GUIA INTELIGENTE</div>${missable ? `<div class="guide-block missable"><b>△ ${esc(missable.title)}</b><p>${missable.softcore ? "Refazer em Hardcore" : "Antes do próximo objetivo comum"}</p></div>` : ""}${chapters.map((chapter) => `<div class="guide-block"><b>${esc(chapter.title || "Capítulo")}</b>${(chapter.blocks || []).filter((block) => block.type !== "text").slice(0, 2).map((block) => `<p>${esc(block.title || block.text || "")}</p>`).join("")}</div>`).join("")}`;
 }
 
 function detailsHTML(game) {

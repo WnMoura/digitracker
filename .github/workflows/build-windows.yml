@@ -64,7 +64,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create ${{ github.ref_name }} dist/DigiTracker.exe dist/DigiTracker.exe.sha256
-          --title "DigiTracker ${{ github.ref_name }}"
-          --generate-notes
+        shell: pwsh
+        run: |
+          $releaseNotes = "docs/RELEASE_${{ github.ref_name }}.md"
+          $releaseArgs = @("release", "create", "${{ github.ref_name }}", "dist/DigiTracker.exe", "dist/DigiTracker.exe.sha256", "--title", "DigiTracker ${{ github.ref_name }}", "--generate-notes")
+          if (Test-Path -LiteralPath $releaseNotes) {
+            $releaseArgs += @("--notes-file", $releaseNotes)
+          }
+          gh @releaseArgs

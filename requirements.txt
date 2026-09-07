@@ -4,6 +4,11 @@ requests>=2.31
 pypdf>=4.0
 # Decodificação das imagens incorporadas em PDFs para o Guia Inteligente.
 Pillow>=10.0
+# Companion local e backups protegidos (nenhuma API é exposta automaticamente).
+Flask>=3.1,<4
+waitress>=3.0,<4
+qrcode>=8,<9
+pyzipper>=0.3.6,<0.4
 # Importar guias direto do GameFAQs: curl_cffi imita o TLS de um Chrome atual;
 # cloudscraper fica como fallback e BeautifulSoup lê o HTML.
 curl_cffi>=0.16.0

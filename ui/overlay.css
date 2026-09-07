@@ -59,6 +59,8 @@ button { color: inherit; font: inherit; }
 .guide-block { margin-top: 6px; padding: 8px; border: 1px solid rgba(255,255,255,.1); border-radius: 8px; background: rgba(0,0,0,.16); }
 .guide-block b { display: block; color: #fff; font-size: 10px; }
 .guide-block p { margin: 5px 0 0; overflow: hidden; color: #a9bbcd; font-size: 8px; white-space: nowrap; text-overflow: ellipsis; }
+.guide-block.missable { border-color: rgba(255,181,47,.55); background: rgba(92,54,0,.28); }
+.guide-block.missable b { color: #ffc255; }
 .empty { padding: 16px 8px; color: var(--muted); font-size: 9px; text-align: center; }
 
 .edit-hint { position: absolute !important; left: 10px; bottom: 4px; color: #6f8ba6; font-size: 6px; letter-spacing: .06em; }

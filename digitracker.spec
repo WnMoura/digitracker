@@ -50,6 +50,10 @@ for pkg in ("curl_cffi", "cloudscraper", "bs4"):
 
 # anthropic: refinamento opcional do guia por IA.
 hiddenimports += collect_submodules("anthropic")
+hiddenimports += collect_submodules("qrcode")
+hiddenimports += collect_submodules("waitress")
+hiddenimports += collect_submodules("pyzipper")
+hiddenimports += collect_submodules("Cryptodome")
 
 
 a = Analysis(

@@ -397,6 +397,7 @@ class TestGuiaInteligente:
                 }],
             }],
             "visual_suggestions": [],
+            "systems": [],
         })
 
     def test_gera_documento_paralelo_generico(self, monkeypatch):
@@ -415,3 +416,11 @@ class TestGuiaInteligente:
         enum = set(guide_ai.SMART_BLOCK_SCHEMA["properties"]["type"]["enum"])
         assert "digivolution" not in enum
         assert {"graph", "route", "comparison", "missable"} <= enum
+
+    def test_schema_do_atlas_e_generico_e_exige_referencias(self):
+        schema = guide_ai.GUIDE_SYSTEM_SCHEMA
+        assert "digivolution" not in json_mod.dumps(schema).lower()
+        assert {"nodes", "edges", "source_refs"} <= set(schema["required"])
+        node = schema["properties"]["nodes"]["items"]
+        edge = schema["properties"]["edges"]["items"]
+        assert "source_refs" in node["required"] and "source_refs" in edge["required"]
