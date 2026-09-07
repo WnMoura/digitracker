@@ -1421,14 +1421,14 @@ function mainHTML(game) {
         </button>
       </div>
       <aside class="activity-side-grid">
-        <div class="activity-card missable ${missables ? "warn" : "clear"}">
+        <button type="button" class="activity-card missable ${missables ? "warn" : "clear"}" data-open-missables aria-label="Ver detalhes dos perdíveis">
           <span class="activity-kicker">△ PERDÍVEL</span>
           <div><strong>${missables}</strong><span>${missables === 1 ? " perdível nesta seção" : " perdíveis pendentes"}</span></div>
           ${missables ? `<small class="missable-origin">${pendingRAMissables.length ? "Classificação oficial RetroAchievements" : "Aviso do guia"}</small>` : ""}
           <p>${esc(firstMissable.name || firstMissable.title || firstMissable.text || "Nenhum alerta crítico para o próximo objetivo.")}</p>
           ${pendingRAMissables[0]?.earned && !pendingRAMissables[0]?.hardcore ? `<span class="missable-softcore">Refazer em Hardcore</span>` : ""}
           <i>Ver detalhes <b>→</b></i>
-        </div>
+        </button>
         <button class="activity-card personal-notes" data-jump-guide="${esc(next.block_id || "")}">
           <span class="activity-kicker">✎ MINHAS ANOTAÇÕES</span>
           <p>${personalNotes ? `${personalNotes} ${personalNotes === 1 ? "anotação pessoal salva" : "anotações pessoais salvas"}.` : "Adicione suas anotações pessoais sobre estratégias, itens ou lembretes aqui."}</p>
@@ -2088,7 +2088,27 @@ function bindGuideAtlas(game) {
   if (system?._draftSource) root.querySelectorAll('#atlas-goal,#atlas-image,#atlas-path,[data-atlas-requirement]').forEach(el => {el.disabled=true;el.title='Aprove o sistema antes de alterar progresso ou imagens.';});
 }
 
+function showMissableDetails(game) {
+  if (!game) return toast("Não foi possível carregar os perdíveis. Abra o jogo novamente.", true);
+  const smart = game.smart_guide || {};
+  const progress = smart.effective_progress || smart.progress || {};
+  const completed = new Set(progress.completed || []);
+  const official = (game.pending_missables || []).filter(a => !a.hardcore);
+  const guide = (smart.current?.chapters || []).flatMap(chapter =>
+    (chapter.blocks || []).filter(b => b.type === 'missable' && !completed.has(b.id))
+      .map(block => ({ ...block, chapter: chapter.title })));
+  const modal = xpModal('Perdíveis pendentes', `<p>Confira estes avisos antes de avançar. Conquistas oficiais só são resolvidas em Hardcore.</p>
+    <div class="missable-details">${official.map(a => `<article><small>RETROACHIEVEMENTS · OFICIAL</small><h3>${esc(a.name || a.title || 'Conquista perdível')}</h3><p>${esc(a.desc || a.description || 'Descrição indisponível. Sincronize o jogo novamente.')}</p><b>${a.earned ? 'Refazer em Hardcore' : 'Pendente em Hardcore'}</b><p>${esc(a.area || 'Etapa ainda não identificada')}</p></article>`).join('')}
+    ${guide.map(b => `<article><small>AVISO DO GUIA</small><h3>${esc(b.title || 'Aviso perdível')}</h3><p>${esc(b.text || 'Consulte a etapa no guia.')}</p><ul>${(b.items || []).map(item => `<li>${esc(typeof item === 'string' ? item : item.text || item.title || '')}</li>`).join('')}</ul><p>${esc(b.chapter || 'Etapa ainda não identificada')}</p></article>`).join('')}
+    ${official.length || guide.length ? '' : '<p>Nenhum perdível pendente nesta sincronização.</p>'}</div>
+    ${official.length ? '<button type="button" class="primary" data-missables-list>Ver em Conquistas</button>' : ''}`);
+  modal.querySelector('[data-missables-list]')?.addEventListener('click', () => {
+    modal.remove(); S.tab = 'achievements'; S.achievementFilter = 'missable'; renderDashboard({ force: true });
+  });
+}
+
 function bindSidebar() {
+  root.querySelector('[data-open-missables]')?.addEventListener('click', () => showMissableDetails(S.dashboardGame));
   bindGuideAtlas(S.dashboardGame);
   $("#hall-entry")?.addEventListener("click", enterHall);
   $("#library-open-hall")?.addEventListener("click", enterHall);

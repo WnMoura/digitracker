@@ -1,4 +1,5 @@
 /* Preview A: one console composition; never loaded by native HUD surfaces. */
+.missable-details article{border:1px solid #66532e;border-radius:10px;background:#101e2d;padding:16px;margin:12px 0}.missable-details small,.missable-details b{color:#ffcd68;font-size:11px}.missable-details h3{margin:8px 0;color:#f2f6ff;font-size:17px}.missable-details p,.missable-details li{white-space:pre-wrap;overflow-wrap:anywhere;color:#c1cede;font-size:13px;line-height:1.6}.missable-details ul{padding-left:20px}.activity-card[data-open-missables]{text-align:left;cursor:pointer}
 /* Game and Hall reuse the same shell, search and navigation as the Journey. */
 #app .xp-preview-a .xp-embedded{display:flex;overflow:hidden;padding:8px 30px 20px 36px}
 #app .xp-preview-a .main{width:100%;min-width:0;flex:1;position:relative;overflow:auto;background:transparent;margin:0;border:0}

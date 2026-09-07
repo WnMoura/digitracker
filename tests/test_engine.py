@@ -837,7 +837,8 @@ class TestAtualizacoes:
         return engine.Api()
 
     def test_versao_aparece_no_estado(self, api):
-        assert api.get_app_state()["version"] == engine.APP_VERSION == "0.10.0"
+        from version import APP_VERSION
+        assert api.get_app_state()["version"] == engine.APP_VERSION == APP_VERSION
 
     def test_verificacao_automatica_ligada_por_padrao(self, api):
         assert api.get_app_state()["auto_check_updates"] is True
