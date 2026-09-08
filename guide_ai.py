@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
+import time
 import unicodedata
 
 import requests
@@ -38,6 +40,20 @@ SECTIONS_BATCH_MAX_COUNT = 16
 ATLAS_BATCH_MAX_CHARS = 18000
 ATLAS_BATCH_MAX_BLOCKS = 80
 
+# Retentativas HTTP para APIs de IA. Absorve oscilações transitórias sem
+# transformar um 503/429 em falha imediata para o usuário.
+HTTP_MAX_RETRIES = 4
+HTTP_BACKOFF_BASE = 1.0
+HTTP_BACKOFF_CAP = 30.0
+HTTP_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+# O fallback só é ativado no Atlas quando o campo Modelo ficou vazio.
+# Uma escolha explícita do usuário nunca é trocada silenciosamente.
+GEMINI_ATLAS_FALLBACK_MODELS = (
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+)
+
 # Metadados de cada provedor para a interface montar o formulário sozinha.
 PROVIDERS = {
     "anthropic": {
@@ -48,7 +64,7 @@ PROVIDERS = {
     },
     "gemini": {
         "label": "Google (Gemini)",
-        "default_model": "gemini-2.5-pro",
+        "default_model": "gemini-3.8-flash",
         "key_url": "https://aistudio.google.com/apikey",
         "needs_base_url": False,
     },
@@ -257,48 +273,87 @@ def _gemini_schema(schema: dict) -> dict:
     return out
 
 
-def _call_gemini(cfg: dict, system: str, user: str, schema: dict) -> dict:
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{cfg['model']}:generateContent"
-    )
+def _gemini_request(cfg: dict, model: str, system: str, user: str, schema: dict):
+    """Executa uma chamada GenerateContent para um modelo específico."""
+    generation_config = {
+        "responseMimeType": "application/json",
+        "responseSchema": _gemini_schema(schema),
+        "maxOutputTokens": MAX_TOKENS,
+    }
+    thinking_level = str(cfg.get("thinking_level") or "").strip().lower()
+    if thinking_level in {"minimal", "low", "medium", "high"}:
+        generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
+
     body = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": _gemini_schema(schema),
-            "maxOutputTokens": MAX_TOKENS,
-        },
+        "generationConfig": generation_config,
     }
-    headers = {"x-goog-api-key": cfg["api_key"], "content-type": "application/json"}
+    headers = {
+        "x-goog-api-key": cfg["api_key"],
+        "content-type": "application/json",
+    }
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent"
+    )
 
-    resp = _post(url, body, headers)
-    if resp.status_code == 400 and "schema" in resp.text.lower():
-        # Modelos mais antigos recusam o responseSchema; o mime type sozinho já
-        # garante JSON e a validação é nossa de qualquer forma.
-        body["generationConfig"].pop("responseSchema", None)
+    for _ in range(3):
         resp = _post(url, body, headers)
+        if resp.status_code != 400:
+            return resp
+        detail = (resp.text or "").lower()
+        changed = False
+        if "responseSchema" in generation_config and "schema" in detail:
+            generation_config.pop("responseSchema", None)
+            changed = True
+        if "thinkingConfig" in generation_config and (
+                "thinkingconfig" in detail
+                or "thinkinglevel" in detail
+                or "thinking level" in detail):
+            generation_config.pop("thinkingConfig", None)
+            changed = True
+        if not changed:
+            return resp
+    return resp
 
-    _raise_for_status(resp, "Gemini")
-    try:
-        data = resp.json()
-        candidate = data["candidates"][0]
-        finish_reason = str(candidate.get("finishReason") or "").upper()
-        if finish_reason == "MAX_TOKENS":
-            raise GuideAIError(
-                "O Gemini cortou a resposta por limite de tokens. "
-                "Tente novamente; as dicas serão processadas em lotes menores."
-            )
-        if finish_reason and finish_reason not in ("STOP", "FINISH_REASON_UNSPECIFIED"):
-            raise GuideAIError(f"O Gemini interrompeu a resposta: {finish_reason}.")
-        parts = candidate["content"]["parts"]
-        text = "".join(p.get("text", "") for p in parts)
-    except GuideAIError:
-        raise
-    except (ValueError, KeyError, IndexError) as exc:
-        raise GuideAIError("Resposta inesperada do Gemini.") from exc
-    return _extract_json(text)
+
+def _call_gemini(cfg: dict, system: str, user: str, schema: dict) -> dict:
+    models = []
+    for model in [cfg["model"], *(cfg.get("fallback_models") or [])]:
+        model = str(model or "").strip()
+        if model and model not in models:
+            models.append(model)
+
+    for model_index, model in enumerate(models):
+        resp = _gemini_request(cfg, model, system, user, schema)
+        if (resp.status_code in {500, 502, 503, 504}
+                and model_index < len(models) - 1):
+            continue
+
+        _raise_for_status(resp, "Gemini")
+        try:
+            data = resp.json()
+            candidate = data["candidates"][0]
+            finish_reason = str(candidate.get("finishReason") or "").upper()
+            if finish_reason == "MAX_TOKENS":
+                raise GuideAIError(
+                    "O Gemini cortou a resposta por limite de tokens. "
+                    "Tente novamente; as dicas serão processadas em lotes menores."
+                )
+            if finish_reason and finish_reason not in ("STOP", "FINISH_REASON_UNSPECIFIED"):
+                raise GuideAIError(f"O Gemini interrompeu a resposta: {finish_reason}.")
+            parts = candidate["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts)
+        except GuideAIError:
+            raise
+        except (ValueError, KeyError, IndexError) as exc:
+            raise GuideAIError("Resposta inesperada do Gemini.") from exc
+
+        cfg["model"] = model
+        return _extract_json(text)
+
+    raise GuideAIError("O Gemini não conseguiu concluir a solicitação.")
 
 
 # ---------------------------------------------------------------------------- #
@@ -338,11 +393,43 @@ def _call_openai(cfg: dict, system: str, user: str, schema: dict) -> dict:
 # ---------------------------------------------------------------------------- #
 # HTTP compartilhado
 # ---------------------------------------------------------------------------- #
-def _post(url: str, body: dict, headers: dict):
+def _retry_after(resp) -> float:
+    """Lê Retry-After em segundos; valores inválidos são ignorados."""
     try:
-        return requests.post(url, json=body, headers=headers, timeout=TIMEOUT)
-    except requests.RequestException as exc:
-        raise GuideAIError(f"Falha de rede ao chamar a IA: {exc}") from exc
+        return max(0.0, float(resp.headers.get("Retry-After", "")))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
+def _post(url: str, body: dict, headers: dict):
+    """POST com exponential backoff para rede, 429 e 5xx transitórios."""
+    wait = 0.0
+    for attempt in range(HTTP_MAX_RETRIES + 1):
+        if attempt and wait > 0:
+            jitter = random.uniform(0.0, min(1.0, max(0.1, wait * .25)))
+            time.sleep(min(HTTP_BACKOFF_CAP, wait + jitter))
+        try:
+            resp = requests.post(url, json=body, headers=headers, timeout=TIMEOUT)
+        except requests.RequestException as exc:
+            if attempt >= HTTP_MAX_RETRIES:
+                raise GuideAIError(
+                    "Falha de rede ao chamar o provedor de IA após novas tentativas."
+                ) from exc
+            wait = min(HTTP_BACKOFF_CAP, HTTP_BACKOFF_BASE * (2 ** attempt))
+            continue
+
+        if resp.status_code not in HTTP_RETRYABLE_STATUS:
+            return resp
+        if attempt >= HTTP_MAX_RETRIES:
+            return resp
+
+        hint = _retry_after(resp)
+        wait = min(
+            HTTP_BACKOFF_CAP,
+            hint if hint > 0 else HTTP_BACKOFF_BASE * (2 ** attempt),
+        )
+
+    raise GuideAIError("Não foi possível completar a chamada ao provedor de IA.")
 
 
 def _raise_for_status(resp, nome: str) -> None:
@@ -350,8 +437,25 @@ def _raise_for_status(resp, nome: str) -> None:
         return
     if resp.status_code in (401, 403):
         raise GuideAIError(f"Chave do {nome} inválida ou sem permissão.")
+    if resp.status_code == 404:
+        raise GuideAIError(
+            f"Modelo ou endpoint do {nome} não encontrado. Confira o id configurado."
+        )
     if resp.status_code == 429:
-        raise GuideAIError(f"Limite de uso do {nome} atingido. Tente mais tarde.")
+        raise GuideAIError(
+            f"Limite de uso do {nome} atingido mesmo após novas tentativas. "
+            "Aguarde a cota liberar ou escolha outro modelo."
+        )
+    if resp.status_code in (408, 504):
+        raise GuideAIError(
+            f"O {nome} excedeu o tempo de resposta mesmo após novas tentativas."
+        )
+    if resp.status_code in (500, 502, 503):
+        raise GuideAIError(
+            f"O {nome} está temporariamente indisponível ou com alta demanda. "
+            "O DigiTracker tentou novamente automaticamente; tente mais tarde "
+            "ou escolha outro modelo."
+        )
     detalhe = (resp.text or "")[:200]
     raise GuideAIError(f"O {nome} respondeu {resp.status_code}: {detalhe}")
 
@@ -1100,14 +1204,111 @@ def _atlas_refs(item: dict) -> list[dict]:
     return refs
 
 
+def _normalize_atlas_candidate_refs(batch: list[dict], candidate: dict) -> dict:
+    """Corrige apenas numeração local de source_refs quando ela é inequívoca."""
+    section_order = []
+    section_map = {}
+    for fallback_section, section in enumerate(batch, 1):
+        actual_section = int(section.get("_source_section") or fallback_section)
+        if actual_section not in section_map:
+            section_order.append(actual_section)
+            section_map[actual_section] = {
+                "blocks": [],
+                "page": int(section.get("page") or 0),
+            }
+        entry = section_map[actual_section]
+        for fallback_block, block in enumerate(section.get("blocks") or [], 1):
+            actual_block = int(block.get("_source_block") or fallback_block)
+            if actual_block not in entry["blocks"]:
+                entry["blocks"].append(actual_block)
+            if not entry["page"]:
+                entry["page"] = int(block.get("page") or 0)
+
+    for ref in _atlas_refs(candidate):
+        if not isinstance(ref, dict):
+            continue
+        try:
+            section_number = int(ref.get("section") or 0)
+        except (TypeError, ValueError):
+            section_number = 0
+        if (section_number not in section_map
+                and 1 <= section_number <= len(section_order)):
+            section_number = section_order[section_number - 1]
+            ref["section"] = section_number
+
+        entry = section_map.get(section_number)
+        if not entry:
+            continue
+        try:
+            block_number = int(ref.get("block") or 0)
+        except (TypeError, ValueError):
+            block_number = 0
+        if (block_number not in entry["blocks"]
+                and 1 <= block_number <= len(entry["blocks"])):
+            ref["block"] = entry["blocks"][block_number - 1]
+        try:
+            page_number = int(ref.get("page") or 0)
+        except (TypeError, ValueError):
+            page_number = 0
+        if page_number <= 0 and entry["page"] > 0:
+            ref["page"] = entry["page"]
+    return candidate
+
+
+_ATLAS_TABLE_DIVIDER_RE = re.compile(
+    r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
+)
+
+
+def _atlas_is_table_divider(text: object) -> bool:
+    lines = [
+        line.strip() for line in str(text or "").splitlines()
+        if "|" in line and line.strip()
+    ]
+    return bool(lines) and all(_ATLAS_TABLE_DIVIDER_RE.match(line) for line in lines)
+
+
+def _atlas_has_table_data(text: object) -> bool:
+    """True para bloco com dados de tabela; separadores puros não contam."""
+    lines = [
+        line.strip() for line in str(text or "").splitlines()
+        if "|" in line and line.strip()
+    ]
+    if not lines:
+        return False
+    divider_positions = [
+        index for index, line in enumerate(lines)
+        if _ATLAS_TABLE_DIVIDER_RE.match(line)
+    ]
+    if divider_positions:
+        last_divider = divider_positions[-1]
+        return any(
+            not _ATLAS_TABLE_DIVIDER_RE.match(line)
+            for line in lines[last_divider + 1:]
+        )
+    return any(not _ATLAS_TABLE_DIVIDER_RE.match(line) for line in lines)
+
+
 def _atlas_batch_quality(batch: list[dict], candidate: dict) -> dict:
     """Reject the common failure mode: one sample path from a large table."""
     table_blocks = set()
     for fallback_section, section in enumerate(batch, 1):
         section_number = int(section.get("_source_section") or fallback_section)
-        for fallback_block, block in enumerate(section.get("blocks") or [], 1):
-            if "|" in str(block.get("text") or ""):
-                table_blocks.add((section_number, int(block.get("_source_block") or fallback_block)))
+        blocks = list(section.get("blocks") or [])
+        header_indexes = set()
+        for index, block in enumerate(blocks):
+            if not _atlas_is_table_divider(block.get("text", "")) or index <= 0:
+                continue
+            if "|" in str(blocks[index - 1].get("text") or ""):
+                header_indexes.add(index - 1)
+        for fallback_block, block in enumerate(blocks, 1):
+            if fallback_block - 1 in header_indexes:
+                continue
+            if _atlas_has_table_data(block.get("text", "")):
+                table_blocks.add((
+                    section_number,
+                    int(block.get("_source_block") or fallback_block),
+                ))
     cited = {(int(ref.get("section") or 0), int(ref.get("block") or 0))
              for ref in _atlas_refs(candidate) if isinstance(ref, dict)}
     covered = len(table_blocks & cited)
@@ -1253,19 +1454,23 @@ def _merge_atlas_fragments(fragments: list[dict], title: str) -> dict:
 
 def generate_system_from_source(source: dict, system_title: str, game: dict,
                                 config: dict, progress=None) -> dict:
-    """Extrai um sistema completo em lotes e combina os caminhos localmente.
-
-    Fontes longas não podem ser resumidas em uma única chamada: provedores
-    tendem a devolver apenas um caminho representativo. Cada lote conserva os
-    índices absolutos da fonte; nós repetidos são reunidos sem perder relações.
-    """
+    """Extrai um sistema completo em lotes e combina os caminhos localmente."""
     provider = (config.get("provider") or DEFAULT_PROVIDER).strip()
     info = provider_info(provider)
+    configured_model = str(config.get("model") or "").strip()
     cfg = {"api_key": (config.get("api_key") or "").strip(),
            "model": resolve_model(provider, config.get("model", "")),
            "base_url": resolve_base_url(provider, config.get("base_url", ""))}
     if not cfg["api_key"]:
         raise GuideAIError(f"Nenhuma chave configurada para {info['label']}.")
+    if provider == "gemini":
+        cfg["thinking_level"] = "high"
+        if not configured_model:
+            cfg["fallback_models"] = [
+                model for model in GEMINI_ATLAS_FALLBACK_MODELS
+                if model != cfg["model"]
+            ]
+
     sections = [{**section, "_source_id": source.get("id", ""),
                  "_source_section": index}
                 for index, section in enumerate(source.get("sections") or [], 1)]
@@ -1281,31 +1486,33 @@ linhagem representativa. Em tabelas, percorra todas as linhas e todos os destino
 informados. Inclua em cada fragmento os dois nós usados por cada relação.
 Retorne um único objeto no schema do sistema, sem capítulos. Use nodes=[] e
 edges=[] somente quando o lote realmente não documentar relação alguma. Cada nó,
-relação e requisito deve citar seu próprio section/block/page recebido."""
+relação e requisito deve citar seu próprio section/block/page recebido.
+Em source_refs, COPIE os números escritos nos campos `section`, `block` e `page`
+da entrada. Não renumere seções ou blocos a partir de 1 dentro deste lote."""
     fragments, qualities = [], []
     if progress:
         progress(0, len(batches))
     for index, batch in enumerate(batches, 1):
         raw = _CALLERS[provider](cfg, system_prompt, _smart_payload(batch, game),
                                  GUIDE_SYSTEM_SCHEMA)
-        candidate = _atlas_candidate(raw)
+        candidate = _normalize_atlas_candidate_refs(batch, _atlas_candidate(raw))
         quality = _atlas_batch_quality(batch, candidate)
         if not quality["complete"]:
             retry_prompt = system_prompt + (
                 "\n\nA tentativa anterior cobriu somente "
-                f"{quality['covered_table_blocks']} de {quality['table_blocks']} linhas de tabela "
+                f"{quality['covered_table_blocks']} de {quality['table_blocks']} linhas de dados da tabela "
                 "deste lote. Refaça a extração completa, linha por linha. Não resuma nem escolha "
                 "um único caminho."
             )
             raw = _CALLERS[provider](cfg, retry_prompt, _smart_payload(batch, game),
                                      GUIDE_SYSTEM_SCHEMA)
-            candidate = _atlas_candidate(raw)
+            candidate = _normalize_atlas_candidate_refs(batch, _atlas_candidate(raw))
             quality = _atlas_batch_quality(batch, candidate)
             if not quality["complete"]:
                 raise GuideAIError(
-                    "A IA não conseguiu cobrir a tabela inteira no lote "
+                    "A IA não atingiu a cobertura mínima da tabela no lote "
                     f"{index}/{len(batches)} ({quality['covered_table_blocks']} de "
-                    f"{quality['table_blocks']} linhas referenciadas). Nenhuma prévia parcial "
+                    f"{quality['table_blocks']} linhas de dados referenciadas). Nenhuma prévia parcial "
                     "foi salva. Tente um modelo mais capaz ou divida a fonte."
                 )
         fragments.append(candidate)
@@ -1317,7 +1524,7 @@ relação e requisito deve citar seu próprio section/block/page recebido."""
     if table_blocks >= 4 and covered_table_blocks < math.ceil(table_blocks * .60):
         raise GuideAIError(
             "A extração não cobriu a fonte inteira "
-            f"({covered_table_blocks} de {table_blocks} linhas de tabela referenciadas). "
+            f"({covered_table_blocks} de {table_blocks} linhas de dados da tabela referenciadas). "
             "Nenhuma prévia parcial foi salva."
         )
     raw = _merge_atlas_fragments(fragments, system_title)
@@ -1363,6 +1570,7 @@ relação e requisito deve citar seu próprio section/block/page recebido."""
         "referenced_pages": len(referenced_pages), "source_pages": len(source_pages),
         "table_blocks": table_blocks,
         "covered_table_blocks": covered_table_blocks,
+        "provider": provider, "model": cfg.get("model", ""),
     }
     return system
 
