@@ -44,6 +44,19 @@ jobs:
           p.write_text(fixed, encoding='utf-8')
           PY
 
+      - name: Preserve network error compatibility
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('guide_ai.py')
+          text = p.read_text(encoding='utf-8')
+          old = 'Não foi possível falar com o provedor de IA após novas tentativas.'
+          new = 'Falha de rede ao chamar o provedor de IA após novas tentativas.'
+          if text.count(old) != 1:
+              raise SystemExit(f'Mensagem de rede não encontrada exatamente uma vez: {text.count(old)}')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
       - name: Bump version
         run: |
           python - <<'PY'
