@@ -157,12 +157,15 @@ revisão do Guia Inteligente somente depois de passar pelo schema genérico.
 | Provedor | Padrão | Observação |
 |---|---|---|
 | **Anthropic (Claude)** | `claude-opus-4-8` | via SDK oficial |
-| **Google (Gemini)** | `gemini-2.5-pro` | via API REST do AI Studio |
+| **Google (Gemini)** | `gemini-3.8-flash` | via API REST do AI Studio |
 | **OpenAI ou compatível** | `gpt-4o` | endpoint configurável — serve para OpenRouter, DeepSeek, **Ollama**, LM Studio… |
 
-O campo *Modelo* aceita qualquer id (`gemini-2.5-flash`, `llama3`, …) e o
+O campo *Modelo* aceita qualquer id (`gemini-3.7-flash`, `llama3`, …) e o
 *Endpoint* permite apontar para um servidor local. Cada provedor guarda a
-**própria chave**, então trocar de um para outro não apaga a anterior.
+**própria chave**, então trocar de um para outro não apaga a anterior. Chamadas
+REST repetem erros transitórios (429/5xx/rede) com backoff exponencial. No Atlas,
+quando o campo Modelo fica vazio, o Gemini usa raciocínio alto e pode cair para
+outro Flash somente após esgotar as tentativas do modelo principal.
 
 É **opcional e cobrado pelo provedor** (com Claude, um guia grande sai por menos
 de US$ 1; com um modelo local via Ollama, nada). Sem chave, tudo acima continua
