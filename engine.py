@@ -2287,6 +2287,21 @@ class Api(ExperienceApi, DataToolsApi):
         except smart_guide.SmartGuideError as exc:
             return {"ok": False, "error": str(exc)}
 
+    @staticmethod
+    def _atlas_faq_sections(faq: dict) -> list:
+        pages = faq.get('page_records') or [{'number': 1, 'text': faq.get('text', '')}]
+        sections = []
+        for page in pages:
+            parsed = guide_parser.parse_freeform('1. Página do guia\n\n' + page['text'], max_blocks=10000)
+            for section in parsed.get('sections') or []:
+                section['page'] = page['number']
+                for block in section.get('blocks') or []:
+                    if '— guia truncado:' in block.get('text', ''):
+                        raise gamefaqs.GameFAQsError('A fonte excede o limite de processamento. Nenhuma importação parcial foi salva.')
+                    block['page'] = page['number']
+                sections.append(section)
+        return sections
+
     def create_guide_system_from_gamefaqs(self, slug: str, title: str,
                                           url: str) -> dict:
         game = load_game_file(GAMES_DIR / f"{slug}.json")
@@ -2299,7 +2314,8 @@ class Api(ExperienceApi, DataToolsApi):
             self._ensure_atlas_document(game)
             source = self._guides.add_system_source(
                 slug, title or faq.get("title") or "Sistema visual", "gamefaqs",
-                parsed.get("sections") or [], {"filename": faq.get("title") or "", "url": url},
+                self._atlas_faq_sections(faq), {"filename": faq.get("title") or "", "url": url,
+                    "pages": faq.get('pages', 1), "page_urls": [p['url'] for p in faq.get('page_records') or []]},
                 text=faq.get("text") or "")
             return self._queue_atlas_source(
                 slug, source, title or faq.get("title") or "Sistema visual")
@@ -2354,8 +2370,9 @@ class Api(ExperienceApi, DataToolsApi):
                 faq = gamefaqs.fetch_faq(session, url)
                 parsed = guide_parser.parse_freeform(faq.get("text") or "")
                 saved = self._guides.add_system_source(
-                    slug, title, "gamefaqs", parsed.get("sections") or [],
-                    {"filename": faq.get("title") or "", "url": url},
+                    slug, title, "gamefaqs", self._atlas_faq_sections(faq),
+                    {"filename": faq.get("title") or "", "url": url, "pages": faq.get('pages', 1),
+                     "page_urls": [p['url'] for p in faq.get('page_records') or []]},
                     text=faq.get("text") or "")
             else:
                 return {"ok": False, "error": "Escolha PDF ou GameFAQs."}
@@ -2397,17 +2414,17 @@ class Api(ExperienceApi, DataToolsApi):
             return {"ok": False, "error": str(exc)}
 
     def search_guide_system_media(self, slug: str, system_id: str, node_id: str,
-                                  query: str = "", page: int = 0) -> dict:
+                                  query: str = "", page: int = 0, source_id: str = '') -> dict:
         game = load_game_file(GAMES_DIR / f"{slug}.json")
-        current = self._guides.current(slug)
-        system = next((item for item in current.get("systems") or [] if item.get("id") == system_id), None)
+        try:
+            system = self._guides.media_system(slug, system_id, source_id)
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc), "results": []}
         node = next((item for item in (system or {}).get("nodes") or [] if item.get("id") == node_id), None)
         if not game or not node:
             return {"ok": False, "error": "Nó do sistema não encontrado.", "results": []}
-        term = re.sub(r"\s+", " ", " ".join(filter(None, (
-            game.get("title", ""), game.get("platform", ""),
-            query or node.get("media_query") or node.get("label", ""), "artwork",
-        )))).strip()[:300]
+        # An edited query is intentional; don't bury it under game/platform suffixes.
+        term = re.sub(r"\s+", " ", query or f"{node.get('label', '')} {game.get('title', '')} artwork").strip()[:300]
         result = self.search_web_images(slug, term, page, "moderate", "icon", "google")
         result["system_id"] = system_id
         result["node_id"] = node_id
@@ -2415,11 +2432,11 @@ class Api(ExperienceApi, DataToolsApi):
         return result
 
     def set_guide_system_media(self, slug: str, system_id: str, node_id: str,
-                               media_id: str) -> dict:
+                               media_id: str, source_id: str = '') -> dict:
         try:
             if media_id and media_id not in {item.get("id") for item in self._guide_media.list(slug)}:
                 return {"ok": False, "error": "Imagem aprovada não encontrada."}
-            state = self._guides.set_system_media(slug, system_id, node_id, media_id)
+            state = self._guides.set_system_media(slug, system_id, node_id, media_id, source_id)
             self._refresh_smart_bundle(slug)
             return {"ok": True, "state": state, **self._guide_systems_payload(slug)}
         except smart_guide.SmartGuideError as exc:

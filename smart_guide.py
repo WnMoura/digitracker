@@ -813,6 +813,10 @@ class SmartGuideStore:
             system["id"] = source["replace_system_id"]
         validate_system_references({"systems": [system]}, source.get("sections") or [])
         result = self.save_system(slug, system)
+        nodes = {node['id'] for node in result['system'].get('nodes') or []}
+        for node_id, media_id in (draft.get('node_media') or {}).items():
+            if node_id in nodes:
+                self.set_system_media(slug, result['system']['id'], node_id, media_id)
         self.update_system_source(slug, source_id, status="published", system_id=result["system"]["id"])
         self.link_system_source(slug, source_id, result["system"]["id"])
         return result
@@ -1043,12 +1047,27 @@ class SmartGuideStore:
         state["completed_requirements"] = sorted(items)
         return self._save_system_state(slug, state)
 
+    def media_system(self, slug: str, system_id: str, source_id: str = '') -> dict:
+        if source_id:
+            source = self.system_source(slug, source_id)
+            draft = self.atlas_draft(slug, source_id)
+            system = draft.get('system') or {}
+            if source.get('status') != 'suggested' or draft.get('job_id') != source.get('job_id') or system.get('id') != system_id:
+                raise SmartGuideError('Esta prévia foi alterada ou encerrada. Reabra a revisão do Atlas.')
+            return system
+        return next((s for s in self.current(slug).get('systems') or [] if s.get('id') == system_id), {})
+
+    @_serialized
     def set_system_media(self, slug: str, system_id: str, node_id: str,
-                         media_id: str) -> dict:
-        current = self.current(slug)
-        system = next((item for item in current.get("systems") or [] if item.get("id") == system_id), None)
+                         media_id: str, source_id: str = '') -> dict:
+        system = self.media_system(slug, system_id, source_id)
         if not system or node_id not in {item.get("id") for item in system.get("nodes") or []}:
             raise SmartGuideError("Nó do sistema não encontrado.")
+        if source_id:
+            draft = self.atlas_draft(slug, source_id)
+            draft.setdefault('node_media', {})[node_id] = _clean_text(media_id, 100)
+            _atomic_json(self._path(slug, f'atlas_drafts/{source_id}.json'), draft)
+            return self.system_state(slug)
         state = self.system_state(slug)
         key = f"{system_id}:{node_id}"
         media_id = _clean_text(media_id, 100)

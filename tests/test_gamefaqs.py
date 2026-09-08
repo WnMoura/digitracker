@@ -191,6 +191,16 @@ class TestParsingConteudo:
 
 
 class TestPaginacao:
+    def test_page_label_and_table_columns(self):
+        html = '<div class="faqtext"><p>Page 1 of 6</p><table><tr><th>Form</th><th>Level</th></tr><tr><td>Alpha</td><td>15</td></tr></table></div>'
+        assert gamefaqs.parse_page_count(html) == 6
+        assert 'Form | Level' in gamefaqs.parse_faq_content(html)
+        assert 'Alpha | 15' in gamefaqs.parse_faq_content(html)
+
+    def test_strict_limit_refuses_partial_import(self):
+        with pytest.raises(gamefaqs.GameFAQsError, match='limite'):
+            gamefaqs.parse_page_count('Page 1 of 99', strict=True)
+
     def test_conta_as_paginas(self):
         assert gamefaqs.parse_page_count(PAGINADO) == 3
 
@@ -222,6 +232,14 @@ class TestListFaqs:
 
 
 class TestFetchFaq:
+    def test_middle_page_url_restarts_and_preserves_query(self):
+        body = 'Contents of the guide. ' * 40
+        s = FakeSession({'71975': FakeResponse('<div class="faqtext">' + body + '</div><a href="?page=1">Next</a>')})
+        faq = gamefaqs.fetch_faq(s, f'{BASE}/71975?lang=en&page=1#section')
+        assert s.pedidos == [f'{BASE}/71975?lang=en', f'{BASE}/71975?lang=en&page=1']
+        assert faq['pages'] == 2
+        assert len(faq['page_records']) == 2
+
     def test_baixa_o_guia(self):
         texto = "1)Intro\n\n" + "conteudo do guia. " * 50
         s = FakeSession({"38057": FakeResponse(f'<div class="faqtext">{texto}</div>')})

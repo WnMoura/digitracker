@@ -28,6 +28,28 @@ def pending(store):
     return source["id"]
 
 
+def test_draft_media_is_isolated_and_survives_approval(store):
+    sid = pending(store)
+    draft = store.save_atlas_draft('game', sid, system(), 'job1')
+    sys_id = draft['system']['id']
+    node = draft['system']['nodes'][0]['id']
+    before = store.current('game')
+    store.set_system_media('game', sys_id, node, 'approved-image', sid)
+    assert store.atlas_draft('game', sid)['node_media'][node] == 'approved-image'
+    assert store.current('game') == before
+    assert not store.system_state('game')['node_media']
+    published = store.approve_atlas_draft('game', sid)
+    assert store.system_state('game')['node_media'][f"{published['system']['id']}:{node}"] == 'approved-image'
+
+
+def test_cancelled_draft_cannot_accept_media(store):
+    sid = pending(store)
+    draft = store.save_atlas_draft('game', sid, system(), 'job1')
+    store.update_system_source('game', sid, status='cancelled')
+    with pytest.raises(smart_guide.SmartGuideError, match='prévia'):
+        store.set_system_media('game', draft['system']['id'], 'a', 'image', sid)
+
+
 def test_draft_does_not_publish_and_approval_does(store):
     before = store.current("game")
     sid = pending(store)

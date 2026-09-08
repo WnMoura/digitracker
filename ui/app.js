@@ -476,16 +476,16 @@ const backend = {
     }
     return window.pywebview.api.update_guide_requirement(slug, systemId, edgeId, requirementId, !!completed);
   },
-  async searchGuideSystemMedia(slug, systemId, nodeId, query, page = 0) {
+  async searchGuideSystemMedia(slug, systemId, nodeId, query, page = 0, sourceId = '') {
     if (S.mode === "demo") return { ok: true, results: [], query, provider: "demo" };
-    return window.pywebview.api.search_guide_system_media(slug, systemId, nodeId, query || "", page);
+    return window.pywebview.api.search_guide_system_media(slug, systemId, nodeId, query || "", page, sourceId);
   },
-  async setGuideSystemMedia(slug, systemId, nodeId, mediaId) {
+  async setGuideSystemMedia(slug, systemId, nodeId, mediaId, sourceId = '') {
     if (S.mode === "demo") {
       S.dashboardGame.smart_guide.system_state.node_media[`${systemId}:${nodeId}`] = mediaId;
       return { ok: true, state: S.dashboardGame.smart_guide.system_state };
     }
-    return window.pywebview.api.set_guide_system_media(slug, systemId, nodeId, mediaId || "");
+    return window.pywebview.api.set_guide_system_media(slug, systemId, nodeId, mediaId || "", sourceId);
   },
   async searchGuideMedia(query, source) {
     return window.pywebview.api.search_guide_media(query, source || "openverse");
@@ -1583,7 +1583,7 @@ function guideSystemLayout(system, visibleNodes) {
 
 function atlasSystems(game) {
   const draft = (game.smart_guide?.atlas_drafts || []).find((item) => item.source_id === S.guideAtlas.draftSource);
-  return draft?.system ? [{ ...draft.system, _draftSource: draft.source_id }] : (game.smart_guide?.current?.systems || []);
+  return draft?.system ? [{ ...draft.system, _draftSource: draft.source_id, _draftMedia: draft.node_media || {} }] : (game.smart_guide?.current?.systems || []);
 }
 
 function atlasJobsHTML(game) {
@@ -1633,7 +1633,7 @@ function guideSystemsHTML(game) {
   };
   const refsHTML = (refs) => (refs || []).map((ref) => ref.page ? `p.${ref.page}` : `§${ref.section}.${ref.block}`).join(" · ");
   const nodeHTML = visibleNodes.map((node) => {
-    const pos = layout.positions.get(node.id), mediaId = (state.node_media || {})[`${system.id}:${node.id}`];
+    const pos = layout.positions.get(node.id), mediaId = (system._draftMedia || {})[node.id] ?? (state.node_media || {})[`${system.id}:${node.id}`];
     const media = (bundle.media || []).find((item) => item.id === mediaId);
     const goal = (state.goals || {})[system.id] === node.id;
     return `<button class="atlas-node ${node.id === selectedId ? "selected" : ""} ${available(node) ? "available" : "blocked"} ${goal ? "goal" : ""}" data-atlas-node="${esc(node.id)}" style="left:${pos.x}px;top:${pos.y}px">
@@ -1646,7 +1646,7 @@ function guideSystemsHTML(game) {
   const incoming = selected ? (system.edges || []).filter((edge) => edge.to === selected.id) : [];
   const chosenPath = incoming.find(edge => edge.id === state.preferences?.[system.id]?.edge_id) || [...incoming].sort((a,b) => a.requirements.filter(r=>!completed.has(r.id)).length-b.requirements.filter(r=>!completed.has(r.id)).length)[0];
   const requirements = chosenPath ? (chosenPath.requirements || []).map(req => ({...req,edge_id:chosenPath.id,missable:chosenPath.missable})) : [];
-  const mediaId = selected ? (state.node_media || {})[`${system.id}:${selected.id}`] : "";
+  const mediaId = selected ? ((system._draftMedia || {})[selected.id] ?? (state.node_media || {})[`${system.id}:${selected.id}`]) : "";
   const media = (bundle.media || []).find((item) => item.id === mediaId);
   const inspector = selected ? `<aside class="atlas-inspector">
     ${incoming.length > 1 ? `<label class="atlas-path-label">Caminho para este objetivo<select id="atlas-path">${incoming.map(edge=>`<option value="${esc(edge.id)}" ${edge.id===chosenPath?.id?'selected':''}>${esc(system.nodes.find(node=>node.id===edge.from)?.label || edge.label)}</option>`).join('')}</select></label>` : ''}
@@ -1807,7 +1807,7 @@ function closeGuideMedia() { document.getElementById("guide-media-modal")?.remov
 async function finishGuideMedia(media) {
   const context = S.GM?.context;
   if (context && media?.id) {
-    const linked = await backend.setGuideSystemMedia(S.activeSlug, context.systemId, context.nodeId, media.id)
+    const linked = await backend.setGuideSystemMedia(S.activeSlug, context.systemId, context.nodeId, media.id, context.sourceId || '')
       .catch((error) => ({ ok: false, error: String(error) }));
     if (!linked?.ok) return toast(linked?.error || "A imagem foi salva, mas não pôde ser associada.", true);
   }
@@ -1865,7 +1865,7 @@ async function searchGuideMedia() {
   if (G.source === "library") return;
   G.busy = true; G.error = ""; renderGuideMedia();
   const res = await (G.source === "web" && G.context
-    ? backend.searchGuideSystemMedia(S.activeSlug, G.context.systemId, G.context.nodeId, G.query, 0)
+    ? backend.searchGuideSystemMedia(S.activeSlug, G.context.systemId, G.context.nodeId, G.query, 0, G.context.sourceId || '')
     : backend.searchGuideMedia(G.query, G.source)).catch((e) => ({ ok: false, error: String(e) }));
   if (!S.GM) return;
   G.busy = false; G.results = res?.results || []; G.error = res?.ok ? "" : (res?.error || "Falha na busca."); renderGuideMedia();
@@ -1965,7 +1965,7 @@ async function viewAtlasSource(systemId) {
   const result = await backend.guideSystemSource(S.activeSlug, systemId).catch((error) => ({ ok: false, error: String(error) }));
   if (!result?.ok) return toast(result?.error || "Fonte não encontrada.", true);
   const source = result.source || {};
-  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="atlas-source-view"><div class="gf-panel atlas-source-view"><h3>Fonte exclusiva do Atlas</h3><p><b>${esc(source.title || "Fonte do sistema")}</b></p><dl><div><dt>Tipo</dt><dd>${esc(source.kind || "legacy")}</dd></div><div><dt>Arquivo</dt><dd>${esc(source.filename || "—")}</dd></div><div><dt>URL</dt><dd>${esc(source.url || "—")}</dd></div></dl><p>Esta fonte não participa da consolidação da Jornada.</p><button class="btn-primary" id="atlas-source-view-close">Fechar</button></div></div>`);
+  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="atlas-source-view"><div class="gf-panel atlas-source-view"><h3>Fonte exclusiva do Atlas</h3><p><b>${esc(source.title || "Fonte do sistema")}</b></p><dl><div><dt>Tipo</dt><dd>${esc(source.kind || "legacy")}</dd></div><div><dt>Arquivo</dt><dd>${esc(source.filename || "—")}</dd></div><div><dt>URL</dt><dd>${esc(source.url || "—")}</dd></div>${source.metadata?.pages ? `<div><dt>Páginas importadas</dt><dd>${esc(source.metadata.pages)}</dd></div>` : ""}</dl><p>Esta fonte não participa da consolidação da Jornada.</p><button class="btn-primary" id="atlas-source-view-close">Fechar</button></div></div>`);
   $("#atlas-source-view-close").onclick = () => $("#atlas-source-view")?.remove();
 }
 
@@ -2082,10 +2082,10 @@ function bindGuideAtlas(game) {
   $("#atlas-reject")?.addEventListener("click", async () => { const result = system._draftSource ? await appCall("cancel_atlas_job", game.slug, system._draftSource) : await backend.saveGuideSystem(game.slug, { ...system, status: "rejected" }); if (!result?.ok) return toast(result?.error || "Falha ao rejeitar.", true); S.guideAtlas.draftSource = ""; S.guideAtlas.systemId = ""; toast("Sugestão rejeitada; a fonte permanece intacta."); await rerender(); });
   $("#atlas-goal")?.addEventListener("click", async () => { if (!selected || system._draftSource) return; const current = game.smart_guide?.system_state?.goals?.[system.id]; const result = await backend.setGuideSystemGoal(S.activeSlug, system.id, current === selected.id ? "" : selected.id); if (!result?.ok) return toast(result?.error || "Falha ao fixar objetivo.", true); toast(current === selected.id ? "Objetivo removido." : "Objetivo enviado ao overlay."); await rerender(); });
   root.querySelectorAll("[data-atlas-requirement]").forEach((input) => input.onchange = async () => { const result = await backend.updateGuideRequirement(S.activeSlug, system.id, input.dataset.edge, input.dataset.atlasRequirement, input.checked); if (!result?.ok) { input.checked = !input.checked; return toast(result?.error || "Falha ao salvar requisito.", true); } await rerender(); });
-  $("#atlas-media")?.addEventListener("click", () => selected && openGuideMedia(selected.media_query || `${game.title} ${selected.label}`, { systemId: system.id, nodeId: selected.id }));
+  $("#atlas-media")?.addEventListener("click", () => selected && openGuideMedia(selected.media_query || `${game.title} ${selected.label}`, { systemId: system.id, nodeId: selected.id, sourceId: system._draftSource || "" }));
   $("#atlas-replace-source")?.addEventListener("click", () => openAtlasSourceWizard(system));
   $("[data-atlas-source]")?.addEventListener("click", () => viewAtlasSource(system.id));
-  if (system?._draftSource) root.querySelectorAll('#atlas-goal,#atlas-image,#atlas-path,[data-atlas-requirement]').forEach(el => {el.disabled=true;el.title='Aprove o sistema antes de alterar progresso ou imagens.';});
+  if (system?._draftSource) root.querySelectorAll('#atlas-goal,#atlas-image,#atlas-path,[data-atlas-requirement]').forEach(el => {el.disabled=true;el.title='Aprove o sistema antes de alterar progresso.';});
 }
 
 function showMissableDetails(game) {

@@ -22,7 +22,7 @@ from __future__ import annotations
 import random
 import re
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
 
 HOST = "gamefaqs.gamespot.com"
 
@@ -75,7 +75,7 @@ def normalize_url(url: str) -> str:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     host = (urlparse(url).hostname or "").lower()
-    if not host.endswith("gamefaqs.gamespot.com"):
+    if host != HOST and not host.endswith('.' + HOST):
         raise GameFAQsError("Essa URL não é do GameFAQs (gamefaqs.gamespot.com).")
     return url
 
@@ -129,16 +129,30 @@ def parse_faq_content(html: str) -> str:
     node = soup.find("div", class_="faqtext") or soup.find("pre") or soup.body
     if node is None:
         return ""
+    # Preserve column/value association: plain get_text loses table structure.
+    for table in node.find_all('table'):
+        rows = []
+        for tr in table.find_all('tr'):
+            cells = [' '.join(cell.get_text(' ', strip=True).split())
+                     for cell in tr.find_all(['th', 'td'], recursive=False)]
+            if cells:
+                rows.append(' | '.join(cells))
+        table.replace_with('\n' + '\n'.join(rows) + '\n')
     return node.get_text("\n")
 
 
-def parse_page_count(html: str) -> int:
+def parse_page_count(html: str, *, strict: bool = False) -> int:
     """Quantas páginas tem o guia formatado (1 se não for paginado)."""
     pages = {1}
     for a in _soup(html).find_all("a", href=True):
         m = re.search(r"[?&]page=(\d+)", a["href"])
         if m:
             pages.add(int(m.group(1)) + 1)   # o parâmetro é 0-indexado
+    label = re.search(r'Page\s+\d+\s+of\s+(\d+)', _soup(html).get_text(' '), re.I)
+    if label:
+        pages.add(int(label.group(1)))
+    if strict and max(pages) > MAX_PAGES:
+        raise GameFAQsError(f'O guia excede o limite de {MAX_PAGES} páginas. Importe um PDF completo; nenhuma fonte parcial foi salva.')
     return min(max(pages), MAX_PAGES)
 
 
@@ -198,16 +212,31 @@ def list_faqs(session, url: str) -> list[dict]:
 def fetch_faq(session, url: str, on_progress=None) -> dict:
     """Baixa o guia inteiro (seguindo a paginação) -> {title, text, pages}."""
     url = normalize_url(url)
+    parsed = urlparse(url)
+    query = [(k, v) for k, v in parse_qsl(parsed.query) if k != 'page']
+    url = urlunparse(parsed._replace(query=urlencode(query), fragment=''))
+    def page_url(page):
+        return urlunparse(parsed._replace(query=urlencode(query + [('page', str(page))]), fragment=''))
     first = _get(session, url)
     title = parse_faq_title(first)
     parts = [parse_faq_content(first)]
-    total = parse_page_count(first)
+    total = parse_page_count(first, strict=True)
+    page_records = [{"number": 1, "url": url, "text": parts[0]}]
 
-    for page in range(1, total):
+    page = 1
+    while page < total:
         if on_progress:
             on_progress(page + 1, total)
         time.sleep(random.uniform(*PAGE_DELAY))
-        parts.append(parse_faq_content(_get(session, f"{url}?page={page}")))
+        address = page_url(page)
+        html = _get(session, address)
+        content = parse_faq_content(html)
+        if len(content.strip()) < 80:
+            raise GameFAQsError(f'Página {page + 1} sem texto suficiente. A importação completa foi interrompida; tente novamente.')
+        parts.append(content)
+        page_records.append({"number": page + 1, "url": address, "text": content})
+        total = max(total, parse_page_count(html, strict=True))
+        page += 1
 
     text = "\n".join(p for p in parts if p).strip()
     if len(text) < MIN_TEXT_CHARS:
@@ -215,4 +244,4 @@ def fetch_faq(session, url: str, on_progress=None) -> dict:
             "A página veio sem o texto do guia — o GameFAQs pode ter pedido "
             "verificação. Tente de novo em alguns minutos."
         )
-    return {"title": title, "text": text, "pages": total}
+    return {"title": title, "text": text, "pages": total, "page_records": page_records, "complete": True}

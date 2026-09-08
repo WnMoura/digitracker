@@ -33,6 +33,25 @@ def api(tmp_path, monkeypatch):
     return value
 
 
+def test_draft_media_search_keeps_custom_query(api, monkeypatch):
+    source = api._guides.add_system_source('game', 'Atlas', 'pdf', SECTIONS)
+    sid = source['id']
+    api._guides.update_system_source('game', sid, status='running', job_id='j')
+    draft = api._guides.save_atlas_draft('game', sid, system(), 'j')['system']
+    calls = []
+    monkeypatch.setattr(api, 'search_web_images', lambda *args: calls.append(args) or {'ok': True, 'results': []})
+    result = api.search_guide_system_media('game', draft['id'], draft['nodes'][0]['id'], 'Entity artwork', 0, sid)
+    assert result['ok']
+    assert calls[0][1] == 'Entity artwork'
+    assert not api.search_guide_system_media('game', draft['id'], 'missing', '', 0, sid)['ok']
+
+
+def test_atlas_faq_sections_keep_page_numbers():
+    faq = {'page_records': [{'number': i, 'url': f'https://example.test/{i}', 'text': f'1. Chapter {i}\n\nDocumented condition {i}.'} for i in range(1, 7)]}
+    sections = engine.Api._atlas_faq_sections(faq)
+    assert {section['page'] for section in sections} == set(range(1, 7))
+
+
 def test_companion_progress_returns_no_source_or_private_notes(api):
     bundle = api.get_smart_guide("game")
     block = bundle["current"]["chapters"][0]["blocks"][0]
