@@ -24,8 +24,11 @@ from pathlib import Path
 SCHEMA_VERSION = 3
 MAX_REVISIONS = 10
 MAX_WALKTHROUGH_SOURCES = 10
-MAX_SYSTEM_NODES = 80
-MAX_SYSTEM_EDGES = 160
+# A fonte continua sendo dividida em lotes pequenos para a IA. O limite maior
+# vale somente para o resultado já consolidado e permite Atlas extensos, com
+# grupos/filtros, sem descartar silenciosamente criaturas ou caminhos.
+MAX_SYSTEM_NODES = 240
+MAX_SYSTEM_EDGES = 720
 BLOCK_TYPES = {
     "text", "objective", "checklist", "warning", "missable", "achievement",
     "challenge", "table", "comparison", "image", "route", "graph", "note",
@@ -778,6 +781,9 @@ class SmartGuideStore:
         for key in ("status", "error", "system_id", "replace_system_id", "job_id"):
             if key in changes:
                 value[key] = _clean_text(changes[key], 2_000 if key == "error" else 100)
+        for key in ("analysis_done", "analysis_total"):
+            if key in changes:
+                value[key] = max(0, _safe_int(changes[key]))
         _atomic_json(path, value)
         return self.system_source(slug, source_id)
 
@@ -785,7 +791,8 @@ class SmartGuideStore:
         return _read_json(self._path(slug, f"atlas_drafts/{source_id}.json"), {})
 
     @_serialized
-    def save_atlas_draft(self, slug: str, source_id: str, system: dict, job_id: str) -> dict:
+    def save_atlas_draft(self, slug: str, source_id: str, system: dict, job_id: str,
+                         diagnostics: dict | None = None) -> dict:
         source = self.system_source(slug, source_id, include_sections=True)
         if not source or source.get("job_id") != job_id or source.get("status") != "running":
             raise SmartGuideError("Análise cancelada ou substituída.")
@@ -796,7 +803,8 @@ class SmartGuideStore:
             raise SmartGuideError("A fonte precisa documentar ao menos dois nós e uma relação.")
         validate_system_references({"systems": normalized}, source.get("sections") or [])
         draft = {"system": normalized[0], "source_id": source_id, "job_id": job_id,
-                 "created_at": _now(), "base_revision": self.current(slug).get("revision_id", "")}
+                 "created_at": _now(), "base_revision": self.current(slug).get("revision_id", ""),
+                 "diagnostics": deepcopy(diagnostics or {})}
         _atomic_json(self._path(slug, f"atlas_drafts/{source_id}.json"), draft)
         self.update_system_source(slug, source_id, status="suggested", error="")
         return draft

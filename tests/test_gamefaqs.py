@@ -194,8 +194,10 @@ class TestPaginacao:
     def test_page_label_and_table_columns(self):
         html = '<div class="faqtext"><p>Page 1 of 6</p><table><tr><th>Form</th><th>Level</th></tr><tr><td>Alpha</td><td>15</td></tr></table></div>'
         assert gamefaqs.parse_page_count(html) == 6
-        assert 'Form | Level' in gamefaqs.parse_faq_content(html)
-        assert 'Alpha | 15' in gamefaqs.parse_faq_content(html)
+        text = gamefaqs.parse_faq_content(html)
+        assert 'Form | Level' in text
+        assert 'Alpha | 15' in text
+        assert 'Form | Level\n\nAlpha | 15' in text
 
     def test_strict_limit_refuses_partial_import(self):
         with pytest.raises(gamefaqs.GameFAQsError, match='limite'):

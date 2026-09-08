@@ -20,6 +20,9 @@ algoritmo do fluxo de PDF. Nenhum provedor consegue fabricar um id.
 from __future__ import annotations
 
 import json
+import math
+import re
+import unicodedata
 
 import requests
 
@@ -32,6 +35,8 @@ TIMEOUT = 300           # guias longos levam minutos
 # limite de saída para impedir que o JSON seja cortado no meio pelo provedor.
 SECTIONS_BATCH_MAX_CHARS = 18000
 SECTIONS_BATCH_MAX_COUNT = 16
+ATLAS_BATCH_MAX_CHARS = 18000
+ATLAS_BATCH_MAX_BLOCKS = 80
 
 # Metadados de cada provedor para a interface montar o formulário sozinha.
 PROVIDERS = {
@@ -736,10 +741,12 @@ def _smart_payload(sections: list, game: dict) -> str:
     source = []
     for si, section in enumerate(sections, 1):
         source.append({
-            "section": si, "source_id": section.get("_source_id", ""),
+            "section": section.get("_source_section") or si,
+            "source_id": section.get("_source_id", ""),
             "title": section.get("title", ""),
             "blocks": [{
-                "block": bi, "type": block.get("type", "p"),
+                "block": block.get("_source_block") or bi,
+                "type": block.get("type", "p"),
                 "text": block.get("text", ""), "page": block.get("page") or section.get("page") or 0,
             } for bi, block in enumerate(section.get("blocks") or [], 1)],
         })
@@ -1018,9 +1025,240 @@ def generate_merged_guide(sources: list[dict], game: dict, config: dict, progres
     return smart_guide.validate_document(document), conflicts
 
 
+def _atlas_text_pieces(text: str, limit: int) -> list[str]:
+    """Split an exceptional paragraph without losing its original citation."""
+    text = str(text or "").strip()
+    pieces = []
+    while len(text) > limit:
+        cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        pieces.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        pieces.append(text)
+    return pieces
+
+
+def _atlas_batches(sections: list, max_chars: int | None = None,
+                   max_blocks: int = ATLAS_BATCH_MAX_BLOCKS) -> list[list[dict]]:
+    """Create small Atlas batches while preserving absolute source positions."""
+    max_chars = max_chars or ATLAS_BATCH_MAX_CHARS
+    batches, current = [], []
+    current_chars = current_blocks = 0
+
+    def flush() -> None:
+        nonlocal current, current_chars, current_blocks
+        if current:
+            batches.append(current)
+        current, current_chars, current_blocks = [], 0, 0
+
+    for fallback_section, section in enumerate(sections, 1):
+        section_number = int(section.get("_source_section") or fallback_section)
+        title = str(section.get("title") or "Trecho da fonte")
+        for fallback_block, block in enumerate(section.get("blocks") or [], 1):
+            block_number = int(block.get("_source_block") or fallback_block)
+            for piece in _atlas_text_pieces(block.get("text", ""), max(1000, max_chars - 500)):
+                cost = len(piece) + len(title) + 100
+                if current and (current_chars + cost > max_chars or current_blocks >= max_blocks):
+                    flush()
+                if (not current or current[-1].get("_source_section") != section_number
+                        or current[-1].get("page") != section.get("page")):
+                    current.append({
+                        "title": title, "page": section.get("page") or 0,
+                        "_source_id": section.get("_source_id", ""),
+                        "_source_section": section_number, "blocks": [],
+                    })
+                current[-1]["blocks"].append({
+                    **block, "text": piece, "_source_block": block_number,
+                })
+                current_chars += cost
+                current_blocks += 1
+    flush()
+    return batches
+
+
+def _atlas_candidate(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise GuideAIError("A IA não devolveu um objeto para o Atlas.")
+    candidates = raw.get("systems") if "systems" in raw else [raw]
+    if not isinstance(candidates, list) or len(candidates) != 1 or not isinstance(candidates[0], dict):
+        raise GuideAIError("Cada lote do Atlas deve devolver exatamente um fragmento de sistema.")
+    return candidates[0]
+
+
+def _atlas_refs(item: dict) -> list[dict]:
+    if not isinstance(item, dict):
+        return []
+    refs = list(item.get("source_refs") or [])
+    for edge in item.get("edges") or []:
+        refs.extend(edge.get("source_refs") or [])
+        for requirement in edge.get("requirements") or []:
+            refs.extend(requirement.get("source_refs") or [])
+    for node in item.get("nodes") or []:
+        refs.extend(node.get("source_refs") or [])
+    return refs
+
+
+def _atlas_batch_quality(batch: list[dict], candidate: dict) -> dict:
+    """Reject the common failure mode: one sample path from a large table."""
+    table_blocks = set()
+    for fallback_section, section in enumerate(batch, 1):
+        section_number = int(section.get("_source_section") or fallback_section)
+        for fallback_block, block in enumerate(section.get("blocks") or [], 1):
+            if "|" in str(block.get("text") or ""):
+                table_blocks.add((section_number, int(block.get("_source_block") or fallback_block)))
+    cited = {(int(ref.get("section") or 0), int(ref.get("block") or 0))
+             for ref in _atlas_refs(candidate) if isinstance(ref, dict)}
+    covered = len(table_blocks & cited)
+    required = math.ceil(len(table_blocks) * .60) if len(table_blocks) >= 4 else 0
+    return {
+        "table_blocks": len(table_blocks), "covered_table_blocks": covered,
+        "required_table_blocks": required, "complete": not required or covered >= required,
+    }
+
+
+def _atlas_identity(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "").casefold())
+    return re.sub(r"[^a-z0-9]+", " ", text.encode("ascii", "ignore").decode()).strip()
+
+
+def _merge_refs(*groups: list) -> list[dict]:
+    output, seen = [], set()
+    for group in groups:
+        for ref in group or []:
+            if not isinstance(ref, dict):
+                continue
+            key = (str(ref.get("source_id") or ""), int(ref.get("section") or 0),
+                   int(ref.get("block") or 0), int(ref.get("page") or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(dict(ref))
+    return output
+
+
+def _merge_atlas_fragments(fragments: list[dict], title: str) -> dict:
+    """Union independently extracted fragments without another lossy AI pass."""
+    merged = {
+        "id": "atlas-complete", "title": title or "Sistema visual",
+        "description": "", "group_label": "Grupo", "layout": "layered",
+        "origin": "ai", "status": "suggested", "source_refs": [],
+        "nodes": [], "edges": [],
+    }
+    node_by_key, edge_by_key = {}, {}
+    descriptions = []
+    for fragment_index, fragment in enumerate(fragments, 1):
+        if fragment.get("description") and fragment["description"] not in descriptions:
+            descriptions.append(str(fragment["description"]))
+        if fragment.get("group_label") and merged["group_label"] == "Grupo":
+            merged["group_label"] = fragment["group_label"]
+        if fragment.get("layout") in {"layered", "vertical", "radial"}:
+            merged["layout"] = fragment["layout"]
+        merged["source_refs"] = _merge_refs(merged["source_refs"], fragment.get("source_refs") or [])
+        local_nodes = {}
+        for node_index, raw_node in enumerate(fragment.get("nodes") or [], 1):
+            if not isinstance(raw_node, dict) or not str(raw_node.get("label") or "").strip():
+                continue
+            raw_id = str(raw_node.get("id") or f"node-{node_index}")
+            key = _atlas_identity(raw_node.get("label"))
+            if not key:
+                continue
+            node = node_by_key.get(key)
+            if node is None:
+                node = dict(raw_node)
+                node["id"] = f"node-{len(merged['nodes']) + 1}"
+                node["source_refs"] = _merge_refs(raw_node.get("source_refs") or [])
+                node["tags"] = list(dict.fromkeys(raw_node.get("tags") or []))
+                node["attributes"] = list(raw_node.get("attributes") or [])
+                merged["nodes"].append(node)
+                node_by_key[key] = node
+            else:
+                node["source_refs"] = _merge_refs(node.get("source_refs") or [], raw_node.get("source_refs") or [])
+                node["tags"] = list(dict.fromkeys((node.get("tags") or []) + (raw_node.get("tags") or [])))
+                known_attributes = {_atlas_identity(item.get("key")): item
+                                    for item in node.get("attributes") or [] if isinstance(item, dict)}
+                for attribute in raw_node.get("attributes") or []:
+                    if isinstance(attribute, dict) and _atlas_identity(attribute.get("key")) not in known_attributes:
+                        node.setdefault("attributes", []).append(attribute)
+                for field in ("subtitle", "stage", "group", "media_query"):
+                    if not node.get(field) and raw_node.get(field):
+                        node[field] = raw_node[field]
+                node["spoiler"] = bool(node.get("spoiler") or raw_node.get("spoiler"))
+            local_nodes[raw_id] = node["id"]
+        for edge_index, raw_edge in enumerate(fragment.get("edges") or [], 1):
+            if not isinstance(raw_edge, dict):
+                continue
+            from_id = local_nodes.get(str(raw_edge.get("from") or ""))
+            to_id = local_nodes.get(str(raw_edge.get("to") or ""))
+            if not from_id or not to_id:
+                raise GuideAIError(
+                    f"A IA criou uma relação sem os dois nós no lote {fragment_index}. "
+                    "Nenhuma prévia parcial foi salva."
+                )
+            requirement_signature = tuple(sorted(
+                _atlas_identity(item.get("text"))
+                for item in raw_edge.get("requirements") or []
+                if isinstance(item, dict) and _atlas_identity(item.get("text"))))
+            # The same endpoints may have independent alternative conditions.
+            # Merge only an exact path repeated in two source fragments.
+            key = (from_id, to_id, _atlas_identity(raw_edge.get("label")),
+                   requirement_signature)
+            edge = edge_by_key.get(key)
+            if edge is None:
+                edge = dict(raw_edge)
+                edge["id"] = f"edge-{len(merged['edges']) + 1}"
+                edge["from"], edge["to"] = from_id, to_id
+                edge["source_refs"] = _merge_refs(raw_edge.get("source_refs") or [])
+                edge["requirements"] = []
+                merged["edges"].append(edge)
+                edge_by_key[key] = edge
+            else:
+                edge["source_refs"] = _merge_refs(edge.get("source_refs") or [], raw_edge.get("source_refs") or [])
+                edge["missable"] = bool(edge.get("missable") or raw_edge.get("missable"))
+                edge["spoiler"] = bool(edge.get("spoiler") or raw_edge.get("spoiler"))
+                if not edge.get("label") and raw_edge.get("label"):
+                    edge["label"] = raw_edge["label"]
+            known_requirements = {_atlas_identity(item.get("text")): item
+                                  for item in edge.get("requirements") or [] if isinstance(item, dict)}
+            for requirement in raw_edge.get("requirements") or []:
+                if not isinstance(requirement, dict) or not _atlas_identity(requirement.get("text")):
+                    continue
+                requirement_key = _atlas_identity(requirement.get("text"))
+                if requirement_key in known_requirements:
+                    current = known_requirements[requirement_key]
+                    current["source_refs"] = _merge_refs(
+                        current.get("source_refs") or [], requirement.get("source_refs") or [])
+                else:
+                    item = dict(requirement)
+                    item["id"] = ""
+                    item["source_refs"] = _merge_refs(requirement.get("source_refs") or [])
+                    edge.setdefault("requirements", []).append(item)
+                    known_requirements[requirement_key] = item
+    merged["description"] = " ".join(descriptions)[:2000]
+    if len(merged["nodes"]) > smart_guide.MAX_SYSTEM_NODES:
+        raise GuideAIError(
+            f"A fonte contém pelo menos {len(merged['nodes'])} nós, acima do limite de "
+            f"{smart_guide.MAX_SYSTEM_NODES} por sistema. Divida a fonte em sistemas menores; "
+            "nenhum nó foi descartado silenciosamente."
+        )
+    if len(merged["edges"]) > smart_guide.MAX_SYSTEM_EDGES:
+        raise GuideAIError(
+            f"A fonte contém pelo menos {len(merged['edges'])} relações, acima do limite de "
+            f"{smart_guide.MAX_SYSTEM_EDGES} por sistema. Divida a fonte em sistemas menores; "
+            "nenhum caminho foi descartado silenciosamente."
+        )
+    return merged
+
+
 def generate_system_from_source(source: dict, system_title: str, game: dict,
-                                config: dict) -> dict:
-    """Extrai exatamente um sistema visual de uma fonte exclusiva."""
+                                config: dict, progress=None) -> dict:
+    """Extrai um sistema completo em lotes e combina os caminhos localmente.
+
+    Fontes longas não podem ser resumidas em uma única chamada: provedores
+    tendem a devolver apenas um caminho representativo. Cada lote conserva os
+    índices absolutos da fonte; nós repetidos são reunidos sem perder relações.
+    """
     provider = (config.get("provider") or DEFAULT_PROVIDER).strip()
     info = provider_info(provider)
     cfg = {"api_key": (config.get("api_key") or "").strip(),
@@ -1028,22 +1266,63 @@ def generate_system_from_source(source: dict, system_title: str, game: dict,
            "base_url": resolve_base_url(provider, config.get("base_url", ""))}
     if not cfg["api_key"]:
         raise GuideAIError(f"Nenhuma chave configurada para {info['label']}.")
-    sections = [{**section, "_source_id": source.get("id", "")}
-                for section in (source.get("sections") or [])]
+    sections = [{**section, "_source_id": source.get("id", ""),
+                 "_source_section": index}
+                for index, section in enumerate(source.get("sections") or [], 1)]
+    batches = _atlas_batches(sections)
+    if not batches:
+        raise GuideAIError("A fonte do Atlas não contém trechos utilizáveis.")
     system_prompt = SMART_GUIDE_SYSTEM + f"""
 
-Esta é uma fonte exclusiva do Atlas. Gere exatamente um único system chamado
-{json.dumps(system_title, ensure_ascii=False)}. Não produza sistemas adicionais.
-Retorne somente o objeto do sistema visual no schema informado, sem capítulos.
-Cada nó, relação e requisito deve ter sua própria referência para trecho existente.
-Se a fonte não documentar relações, informe que não há conteúdo suficiente."""
-    raw = _CALLERS[provider](cfg, system_prompt, _smart_payload(sections, game),
-                             GUIDE_SYSTEM_SCHEMA)
+Esta é uma parte de uma fonte exclusiva do Atlas chamada
+{json.dumps(system_title, ensure_ascii=False)}. Extraia TODOS os nós e TODAS as
+relações explicitamente documentadas neste lote, não apenas uma rota, exemplo ou
+linhagem representativa. Em tabelas, percorra todas as linhas e todos os destinos
+informados. Inclua em cada fragmento os dois nós usados por cada relação.
+Retorne um único objeto no schema do sistema, sem capítulos. Use nodes=[] e
+edges=[] somente quando o lote realmente não documentar relação alguma. Cada nó,
+relação e requisito deve citar seu próprio section/block/page recebido."""
+    fragments, qualities = [], []
+    if progress:
+        progress(0, len(batches))
+    for index, batch in enumerate(batches, 1):
+        raw = _CALLERS[provider](cfg, system_prompt, _smart_payload(batch, game),
+                                 GUIDE_SYSTEM_SCHEMA)
+        candidate = _atlas_candidate(raw)
+        quality = _atlas_batch_quality(batch, candidate)
+        if not quality["complete"]:
+            retry_prompt = system_prompt + (
+                "\n\nA tentativa anterior cobriu somente "
+                f"{quality['covered_table_blocks']} de {quality['table_blocks']} linhas de tabela "
+                "deste lote. Refaça a extração completa, linha por linha. Não resuma nem escolha "
+                "um único caminho."
+            )
+            raw = _CALLERS[provider](cfg, retry_prompt, _smart_payload(batch, game),
+                                     GUIDE_SYSTEM_SCHEMA)
+            candidate = _atlas_candidate(raw)
+            quality = _atlas_batch_quality(batch, candidate)
+            if not quality["complete"]:
+                raise GuideAIError(
+                    "A IA não conseguiu cobrir a tabela inteira no lote "
+                    f"{index}/{len(batches)} ({quality['covered_table_blocks']} de "
+                    f"{quality['table_blocks']} linhas referenciadas). Nenhuma prévia parcial "
+                    "foi salva. Tente um modelo mais capaz ou divida a fonte."
+                )
+        fragments.append(candidate)
+        qualities.append(quality)
+        if progress:
+            progress(index, len(batches))
+    table_blocks = sum(item["table_blocks"] for item in qualities)
+    covered_table_blocks = sum(item["covered_table_blocks"] for item in qualities)
+    if table_blocks >= 4 and covered_table_blocks < math.ceil(table_blocks * .60):
+        raise GuideAIError(
+            "A extração não cobriu a fonte inteira "
+            f"({covered_table_blocks} de {table_blocks} linhas de tabela referenciadas). "
+            "Nenhuma prévia parcial foi salva."
+        )
+    raw = _merge_atlas_fragments(fragments, system_title)
     try:
-        # Accept the legacy envelope while providers migrate to the smaller schema.
-        if not isinstance(raw, dict):
-            raise smart_guide.SmartGuideError("A resposta não é um objeto JSON.")
-        candidates = raw.get("systems") if "systems" in raw else [raw]
+        candidates = [raw]
         for item in candidates or []:
             if not isinstance(item, dict):
                 raise smart_guide.SmartGuideError("Sistema inválido.")
@@ -1072,6 +1351,19 @@ Se a fonte não documentar relações, informe que não há conteúdo suficiente
         for requirement in edge.get("requirements") or []:
             for ref in requirement.get("source_refs") or []:
                 ref["source_id"] = source.get("id", "")
+    referenced_pages = {int(ref.get("page") or 0) for refs in
+                        [node.get("source_refs") or [] for node in system.get("nodes") or []] +
+                        [edge.get("source_refs") or [] for edge in system.get("edges") or []]
+                        for ref in refs if int(ref.get("page") or 0) > 0}
+    source_pages = {int(section.get("page") or 0) for section in sections
+                    if int(section.get("page") or 0) > 0}
+    system["_analysis"] = {
+        "batches": len(batches), "nodes": len(system.get("nodes") or []),
+        "edges": len(system.get("edges") or []),
+        "referenced_pages": len(referenced_pages), "source_pages": len(source_pages),
+        "table_blocks": table_blocks,
+        "covered_table_blocks": covered_table_blocks,
+    }
     return system
 
 

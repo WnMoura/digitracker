@@ -42,6 +42,13 @@ def test_draft_media_is_isolated_and_survives_approval(store):
     assert store.system_state('game')['node_media'][f"{published['system']['id']}:{node}"] == 'approved-image'
 
 
+def test_draft_preserves_extraction_diagnostics(store):
+    sid = pending(store)
+    draft = store.save_atlas_draft(
+        'game', sid, system(), 'job1', {"batches": 6, "nodes": 42, "edges": 70})
+    assert draft['diagnostics'] == {"batches": 6, "nodes": 42, "edges": 70}
+
+
 def test_cancelled_draft_cannot_accept_media(store):
     sid = pending(store)
     draft = store.save_atlas_draft('game', sid, system(), 'job1')
@@ -113,6 +120,74 @@ def test_system_only_ai_response_is_supported(monkeypatch):
         {"id": "source", "sections": SECTIONS}, "Classes", {}, {"provider": provider, "api_key": "test"})
     assert len(result["nodes"]) == 2
     assert calls == [guide_ai.GUIDE_SYSTEM_SCHEMA]
+
+
+def test_long_source_is_extracted_in_batches_and_all_paths_are_merged(monkeypatch):
+    sections = [{"title": "Tabela", "page": 1, "blocks": [
+        {"type": "p", "text": f"Origin | Target {index} | Requirement {index}" + " detail" * 14,
+         "page": 1}
+        for index in range(1, 5)
+    ]}]
+    calls = []
+
+    def fake(_cfg, _system, payload, _schema):
+        data = __import__('json').loads(payload)
+        block = data['source_sections'][0]['blocks'][0]
+        index = block['block']
+        ref = [{"section": 1, "block": index, "page": 1}]
+        calls.append(index)
+        return {
+            "id": f"part-{index}", "title": "Evoluções", "description": "",
+            "group_label": "Estágio", "layout": "layered", "origin": "ai",
+            "status": "suggested", "source_refs": ref,
+            "nodes": [
+                {"id": "origin", "label": "Origin", "subtitle": "", "stage": "Base",
+                 "group": "", "tags": [], "attributes": [], "media_query": "Origin",
+                 "spoiler": False, "source_refs": ref},
+                {"id": f"target-{index}", "label": f"Target {index}", "subtitle": "",
+                 "stage": "Next", "group": "", "tags": [], "attributes": [],
+                 "media_query": f"Target {index}", "spoiler": False, "source_refs": ref},
+            ],
+            "edges": [{"id": f"edge-{index}", "from": "origin", "to": f"target-{index}",
+                       "label": "", "path_kind": "alternative", "requirements": [],
+                       "missable": False, "spoiler": False, "source_refs": ref}],
+        }
+
+    provider = guide_ai.DEFAULT_PROVIDER
+    monkeypatch.setitem(guide_ai._CALLERS, provider, fake)
+    monkeypatch.setattr(guide_ai, 'ATLAS_BATCH_MAX_CHARS', 300)
+    seen_progress = []
+    result = guide_ai.generate_system_from_source(
+        {"id": "source", "sections": sections}, "Evoluções", {},
+        {"provider": provider, "api_key": "test"},
+        lambda done, total: seen_progress.append((done, total)))
+    assert len(calls) == 4
+    assert len(result['nodes']) == 5
+    assert len(result['edges']) == 4
+    assert result['_analysis']['batches'] == 4
+    assert seen_progress[0] == (0, 4) and seen_progress[-1] == (4, 4)
+
+
+def test_table_coverage_rejects_a_single_representative_path():
+    batch = [{"title": "Tabela", "_source_section": 1, "blocks": [
+        {"text": f"A{i} | B{i}", "_source_block": i} for i in range(1, 11)
+    ]}]
+    candidate = system()
+    quality = guide_ai._atlas_batch_quality(batch, candidate)
+    assert quality['table_blocks'] == 10
+    assert quality['covered_table_blocks'] == 1
+    assert not quality['complete']
+
+
+def test_merge_preserves_alternative_conditions_for_same_endpoints():
+    ref = [{"section": 1, "block": 1, "page": 1}]
+    base = system()
+    base['edges'][0]['requirements'] = [{"text": "Condition A", "source_refs": ref}]
+    other = deepcopy(base)
+    other['edges'][0]['requirements'] = [{"text": "Condition B", "source_refs": ref}]
+    merged = guide_ai._merge_atlas_fragments([base, other], 'Paths')
+    assert len(merged['nodes']) == 2
+    assert len(merged['edges']) == 2
 
 
 def test_alternative_paths_not_combined_as_required(store):

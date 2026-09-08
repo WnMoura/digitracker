@@ -1583,12 +1583,12 @@ function guideSystemLayout(system, visibleNodes) {
 
 function atlasSystems(game) {
   const draft = (game.smart_guide?.atlas_drafts || []).find((item) => item.source_id === S.guideAtlas.draftSource);
-  return draft?.system ? [{ ...draft.system, _draftSource: draft.source_id, _draftMedia: draft.node_media || {} }] : (game.smart_guide?.current?.systems || []);
+  return draft?.system ? [{ ...draft.system, _draftSource: draft.source_id, _draftMedia: draft.node_media || {}, _draftDiagnostics: draft.diagnostics || {} }] : (game.smart_guide?.current?.systems || []);
 }
 
 function atlasJobsHTML(game) {
   const labels = { running: "Analisando a fonte…", suggested: "Prévia pronta para revisão", error: "Falha na análise", interrupted: "Análise interrompida", cancelled: "Análise cancelada", awaiting_consent: "Aguardando consentimento", awaiting_configuration: "Aguardando configuração da IA" };
-  return `<div class="atlas-jobs">${(game.smart_guide?.atlas_jobs || []).filter((job) => labels[job.status]).map((job) => `<article class="atlas-job"><div><b>${esc(job.title)}</b><p>${labels[job.status]}</p>${job.error ? `<p class="atlas-job-error">${esc(job.error)}</p>` : ""}</div>${job.status === "suggested" ? `<button data-atlas-review-job="${esc(job.id)}">Revisar prévia</button>` : job.status === "running" ? `<button data-atlas-cancel-job="${esc(job.id)}">Cancelar</button>` : `<button data-atlas-retry-job="${esc(job.id)}">Tentar novamente</button><button data-atlas-manual-job="${esc(job.id)}">Editar manualmente</button>`}</article>`).join("")}</div>`;
+  return `<div class="atlas-jobs">${(game.smart_guide?.atlas_jobs || []).filter((job) => labels[job.status]).map((job) => `<article class="atlas-job"><div><b>${esc(job.title)}</b><p>${labels[job.status]}${job.status === "running" && job.analysis_total ? ` · lote ${esc(job.analysis_done || 0)}/${esc(job.analysis_total)}` : ""}</p>${job.error ? `<p class="atlas-job-error">${esc(job.error)}</p>` : ""}</div>${job.status === "suggested" ? `<button data-atlas-review-job="${esc(job.id)}">Revisar prévia</button>` : job.status === "running" ? `<button data-atlas-cancel-job="${esc(job.id)}">Cancelar</button>` : `<button data-atlas-retry-job="${esc(job.id)}">Tentar novamente</button><button data-atlas-manual-job="${esc(job.id)}">Editar manualmente</button>`}</article>`).join("")}</div>`;
 }
 
 function guideSystemsHTML(game) {
@@ -1658,7 +1658,9 @@ function guideSystemsHTML(game) {
     ${system.source_id ? `<button class="atlas-source" data-atlas-source="${esc(selected.id)}">Fonte exclusiva: ${esc(system.source_id === "legacy-main" ? "guia migrado" : refsHTML(selected.source_refs || system.source_refs || []))}</button>` : ""}
     <div class="atlas-inspector-actions"><button class="primary" id="atlas-goal">${(state.goals || {})[system.id] === selected.id ? "✓ Objetivo fixado" : "◎ Fixar como objetivo"}</button><button id="atlas-media">▧ Trocar imagem</button><button id="atlas-edit">✎ Editar sistema</button><button id="atlas-replace-source">↺ Trocar fonte</button></div>
   </aside>` : `<aside class="atlas-inspector empty">Selecione um nó para ver seus detalhes.</aside>`;
-  const review = system.status === "suggested" ? `<div class="atlas-review"><span>REVISÃO NECESSÁRIA</span><p>Confira nomes, caminhos, requisitos, spoilers e perdíveis antes de publicar.</p><button id="atlas-approve">Aprovar sistema</button><button id="atlas-edit">Revisar e editar</button><button id="atlas-reject">Rejeitar</button></div>` : "";
+  const diagnostics = system._draftDiagnostics || {};
+  const coverage = diagnostics.batches ? `${(system.nodes || []).length} nós · ${(system.edges || []).length} caminhos · ${diagnostics.batches} lotes${diagnostics.source_pages ? ` · ${diagnostics.referenced_pages}/${diagnostics.source_pages} páginas citadas` : ""}${diagnostics.table_blocks ? ` · ${diagnostics.covered_table_blocks}/${diagnostics.table_blocks} linhas de tabela cobertas` : ""}` : "";
+  const review = system.status === "suggested" ? `<div class="atlas-review"><span>REVISÃO NECESSÁRIA</span><p>Confira nomes, caminhos, requisitos, spoilers e perdíveis antes de publicar.${coverage ? `<strong>${esc(coverage)}</strong>` : ""}</p><button id="atlas-approve">Aprovar sistema</button><button id="atlas-edit">Revisar e editar</button><button id="atlas-reject">Rejeitar</button></div>` : "";
   return `${jobs}<section class="atlas-shell ${A.list ? "list-view" : ""}" style="--atlas-zoom:${A.zoom};--atlas-x:${A.panX}px;--atlas-y:${A.panY}px">
     <header class="atlas-toolbar"><div><span>ATLAS DE SISTEMAS</span><h2>${esc(system.title)}</h2><p>${esc(system.description)}</p></div><button id="atlas-create">＋ Novo sistema</button></header>
     ${review}<div class="atlas-filters">
@@ -1921,7 +1923,7 @@ function openAtlasSourceWizard(replaceSystem = null) {
     <label>Nome do sistema<input id="atlas-source-title" value="${esc(replaceSystem?.title || "")}" placeholder="Ex.: Árvore de habilidades, crafting, relacionamentos"></label>
     <div class="atlas-source-options"><button id="atlas-source-pdf"><span>▤</span><b>Importar PDF</b><small>Analisa texto, relações e requisitos deste arquivo.</small></button><button id="atlas-source-gamefaqs"><span>◎</span><b>Usar GameFAQs</b><small>Cole o endereço direto de um guia.</small></button></div>
     <div class="atlas-source-url" id="atlas-source-url-row" hidden><input id="atlas-source-url" placeholder="https://gamefaqs.gamespot.com/..."><button id="atlas-source-url-submit">Analisar guia</button></div>
-    <p class="atlas-source-foot">A IA não poderá inventar relações ausentes. Sem IA configurada, a fonte será anexada ao editor manual.</p>
+    <p class="atlas-source-foot">A IA não poderá inventar relações ausentes. Fontes longas serão processadas em vários lotes e podem gerar custo no provedor. Sem IA configurada, a fonte será anexada ao editor manual.</p>
   </div>`;
   document.body.appendChild(modal);
   const title = () => ($("#atlas-source-title", modal)?.value || "").trim();

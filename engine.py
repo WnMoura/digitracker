@@ -2199,7 +2199,8 @@ class Api(ExperienceApi, DataToolsApi):
                     "message": "Analisando a fonte exclusiva do Atlas…", "error": ""}
             self._atlas_ai_status[f"{slug}:{source['id']}"] = task
             self._guides.update_system_source(slug, source["id"], status="running", error="",
-                                              job_id=job_id, replace_system_id=replace_system_id)
+                                              job_id=job_id, replace_system_id=replace_system_id,
+                                              analysis_done=0, analysis_total=0)
         self._refresh_smart_bundle(slug)
         threading.Thread(target=self._atlas_source_worker,
                          args=(slug, source["id"], title, replace_system_id, job_id), daemon=True).start()
@@ -2210,12 +2211,29 @@ class Api(ExperienceApi, DataToolsApi):
         game = load_game_file(GAMES_DIR / f"{slug}.json") or {}
         try:
             source = self._guides.system_source(slug, source_id, include_sections=True)
+            def report_progress(done: int, total: int) -> None:
+                with self._atlas_job_lock:
+                    latest = self._guides.system_source(slug, source_id)
+                    if latest.get("job_id") != job_id or latest.get("status") != "running":
+                        raise guide_ai.GuideAIError("Análise cancelada.")
+                    self._guides.update_system_source(
+                        slug, source_id, analysis_done=done, analysis_total=total)
+                with self._smart_ai_lock:
+                    self._atlas_ai_status[f"{slug}:{source_id}"] = {
+                        "ok": True, "phase": "running", "slug": slug,
+                        "source_id": source_id, "title": title, "job_id": job_id,
+                        "analysis_done": done, "analysis_total": total,
+                        "message": f"Extraindo todos os caminhos: lote {done}/{total}…",
+                        "error": "",
+                    }
             system = guide_ai.generate_system_from_source(
-                source, title, game, self._ai_config())
+                source, title, game, self._ai_config(), report_progress)
+            diagnostics = system.pop("_analysis", {})
             if replace_system_id:
                 system["id"] = replace_system_id
             with self._atlas_job_lock:
-                draft = self._guides.save_atlas_draft(slug, source_id, system, job_id)
+                draft = self._guides.save_atlas_draft(
+                    slug, source_id, system, job_id, diagnostics)
             system = draft["system"]
             saved = self._guides.system_source(slug, source_id)
             status = {"ok": True, "phase": "suggested", "slug": slug,

@@ -137,7 +137,10 @@ def parse_faq_content(html: str) -> str:
                      for cell in tr.find_all(['th', 'td'], recursive=False)]
             if cells:
                 rows.append(' | '.join(cells))
-        table.replace_with('\n' + '\n'.join(rows) + '\n')
+        # Blank lines make each row an independent guide block. Besides keeping
+        # columns readable, this lets Atlas cite and audit every relationship
+        # instead of treating a whole multi-page table as one giant paragraph.
+        table.replace_with('\n' + '\n\n'.join(rows) + '\n')
     return node.get_text("\n")
 
 
