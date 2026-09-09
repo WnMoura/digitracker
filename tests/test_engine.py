@@ -615,6 +615,43 @@ class TestConfigDeIA:
         salvo = engine.load_settings()
         assert salvo["ai_provider"] == "gemini" and salvo["ai_model"] == "gemini-2.5-flash"
 
+    def test_status_de_uso_nao_expoe_chave_e_lista_todos_provedores(self, api):
+        engine.guide_ai._reset_ai_usage_status_for_tests()
+        api.set_ai_config("gemini", "chave-super-secreta", "gemini-2.5-flash")
+        engine.guide_ai._telemetry_update(
+            "gemini", requests=3, retries=1, rate_limit_events=1,
+            total_tokens=420)
+        status = api.get_ai_usage_status()
+        assert status["provider"] == "gemini"
+        assert status["providers"]["gemini"]["requests"] == 3
+        assert status["providers"]["gemini"]["rate_limit_events"] == 1
+        assert status["providers"]["gemini"]["total_tokens"] == 420
+        assert set(status["provider_meta"]) >= {"anthropic", "gemini", "openai"}
+        assert "chave-super-secreta" not in json.dumps(status)
+
+    @pytest.mark.parametrize(("code", "kind"), [
+        ("rate_limited", "api_limit"),
+        ("authentication", "api_configuration"),
+        ("service_unavailable", "api_service"),
+        ("network_error", "network"),
+        ("atlas_incomplete", "ai_response"),
+        ("empty_source", "source_validation"),
+    ])
+    def test_falhas_do_atlas_sao_classificadas_para_a_interface(self, code, kind):
+        exc = engine.guide_ai.GuideAIError(
+            "Mensagem segura", code=code, provider="gemini", retryable=True)
+        result = engine.Api._atlas_error_info(exc)
+        assert result["kind"] == kind
+        assert result["code"] == code
+        assert result["details"]["provider"] == "gemini"
+        assert "hint" in result["details"]
+
+    def test_falha_do_gamefaqs_nao_e_rotulada_como_erro_da_api(self):
+        result = engine.Api._atlas_error_info(
+            engine.gamefaqs.GameFAQsError("Página incompleta"))
+        assert result["kind"] == "source_import"
+        assert result["code"] == "gamefaqs_import"
+
     def test_refino_sem_chave_avisa_o_provedor_certo(self, api):
         api.set_ai_config("gemini", "")
         api.pending_import = {"achievements_meta": {"1": {"title": "X"}}}
@@ -638,6 +675,7 @@ class TestConfigDeIA:
         saved = json.loads((engine.GAMES_DIR / "jogo.json").read_text(encoding="utf-8"))
         assert saved["walkthrough"] == original["walkthrough"]
         assert saved["guide"][0]["title"] == "Depois"
+
 
     def test_falha_da_ia_preserva_dicas_originais(self, api, monkeypatch):
         api.set_ai_config("anthropic", "k")

@@ -123,12 +123,32 @@ def parse_faq_listing(html: str, base_url: str) -> list[dict]:
 
 
 def parse_faq_content(html: str) -> str:
-    """Texto do guia. Mesma cascata do scraper original: a div do FAQ, senão um
-    `<pre>`, senão a página inteira."""
+    """Extrai somente o texto do guia formatado.
+
+    O GameFAQs historicamente usava ``.faqtext``. A versão atual da página
+    envolve o conteúdo em ``#faqwrap``; cair direto para ``body`` nessa versão
+    mistura menus, rodapé e navegação ao guia e faz a IA analisar centenas de
+    blocos irrelevantes. Mantemos os seletores antigos como compatibilidade,
+    mas sempre preferimos um contêiner explícito do FAQ.
+    """
     soup = _soup(html)
-    node = soup.find("div", class_="faqtext") or soup.find("pre") or soup.body
+    node = (
+        soup.select_one(".faqtext")
+        or soup.select_one("#faqwrap")
+        or soup.select_one("[data-faq-content]")
+        or soup.find("pre")
+        or soup.body
+    )
     if node is None:
         return ""
+    # Mesmo dentro do contêiner do guia podem existir controles de página e
+    # anúncios. Eles não são fonte editorial e não devem consumir tokens nem
+    # virar referências do Atlas.
+    for unwanted in node.select(
+        "script, style, noscript, nav, form, .ad, .ads, .advertisement, "
+        ".pagination, [aria-label='pagination'], [aria-label='Pagination']"
+    ):
+        unwanted.decompose()
     # Preserve column/value association: plain get_text loses table structure.
     for table in node.find_all('table'):
         rows = []

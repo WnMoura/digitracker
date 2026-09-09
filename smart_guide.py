@@ -778,10 +778,16 @@ class SmartGuideStore:
         value = _read_json(path, {})
         if not value:
             raise SmartGuideError("Fonte exclusiva do Atlas não encontrada.")
-        for key in ("status", "error", "system_id", "replace_system_id", "job_id"):
+        for key in ("status", "stage", "message", "error", "error_kind",
+                    "error_code", "system_id", "replace_system_id", "job_id",
+                    "provider", "model"):
             if key in changes:
-                value[key] = _clean_text(changes[key], 2_000 if key == "error" else 100)
-        for key in ("analysis_done", "analysis_total"):
+                limit = 2_000 if key in {"error", "message"} else 200
+                value[key] = _clean_text(changes[key], limit)
+        if "error_details" in changes:
+            details = changes.get("error_details")
+            value["error_details"] = deepcopy(details) if isinstance(details, dict) else {}
+        for key in ("analysis_done", "analysis_total", "checkpoint_count"):
             if key in changes:
                 value[key] = max(0, _safe_int(changes[key]))
         _atomic_json(path, value)
@@ -789,6 +795,47 @@ class SmartGuideStore:
 
     def atlas_draft(self, slug: str, source_id: str) -> dict:
         return _read_json(self._path(slug, f"atlas_drafts/{source_id}.json"), {})
+
+    def atlas_checkpoint(self, slug: str, source_id: str) -> dict:
+        """Return the last complete Atlas batches for an interrupted job.
+
+        Checkpoints are deliberately separate from drafts: a draft is user
+        reviewable only after the whole source has passed validation, whereas
+        a checkpoint is private worker state that may contain only a prefix of
+        the source.
+        """
+        source_id = _clean_text(source_id, 100)
+        return _read_json(self._path(slug, f"atlas_checkpoints/{source_id}.json"), {})
+
+    @_serialized
+    def save_atlas_checkpoint(self, slug: str, source_id: str, checkpoint: dict,
+                              job_id: str) -> dict:
+        """Atomically persist progress, but only for the active Atlas worker."""
+        source_id = _clean_text(source_id, 100)
+        source = self.system_source(slug, source_id)
+        if not source or source.get("job_id") != job_id or source.get("status") != "running":
+            raise SmartGuideError("Análise cancelada ou substituída.")
+        if not isinstance(checkpoint, dict):
+            raise SmartGuideError("Checkpoint do Atlas inválido.")
+        value = deepcopy(checkpoint)
+        value.update(source_id=source_id, job_id=_clean_text(job_id, 100), updated_at=_now())
+        _atomic_json(self._path(slug, f"atlas_checkpoints/{source_id}.json"), value)
+        return deepcopy(value)
+
+    @_serialized
+    def clear_atlas_checkpoint(self, slug: str, source_id: str,
+                               job_id: str = "") -> bool:
+        """Remove completed worker state without deleting a newer job's data."""
+        source_id = _clean_text(source_id, 100)
+        path = self._path(slug, f"atlas_checkpoints/{source_id}.json")
+        current = _read_json(path, {})
+        if job_id and current and current.get("job_id") != job_id:
+            return False
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise SmartGuideError(f"Não foi possível limpar o checkpoint do Atlas: {exc}") from exc
+        return True
 
     @_serialized
     def save_atlas_draft(self, slug: str, source_id: str, system: dict, job_id: str,

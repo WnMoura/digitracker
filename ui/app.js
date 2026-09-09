@@ -518,6 +518,10 @@ const backend = {
     if (S.mode === "demo") return { ok: false };
     return window.pywebview.api.get_ai_config();
   },
+  async getAiUsageStatus() {
+    if (S.mode === "demo") return { ok: true, provider: "demo", providers: {} };
+    return window.pywebview.api.get_ai_usage_status();
+  },
   async setAiConfig(cfg) {
     if (S.mode === "demo") return { ok: false };
     return window.pywebview.api.set_ai_config(cfg.provider, cfg.api_key, cfg.model, cfg.base_url);
@@ -1587,8 +1591,32 @@ function atlasSystems(game) {
 }
 
 function atlasJobsHTML(game) {
-  const labels = { running: "Analisando a fonte…", suggested: "Prévia pronta para revisão", error: "Falha na análise", interrupted: "Análise interrompida", cancelled: "Análise cancelada", awaiting_consent: "Aguardando consentimento", awaiting_configuration: "Aguardando configuração da IA" };
-  return `<div class="atlas-jobs">${(game.smart_guide?.atlas_jobs || []).filter((job) => labels[job.status]).map((job) => `<article class="atlas-job"><div><b>${esc(job.title)}</b><p>${labels[job.status]}${job.status === "running" && job.analysis_total ? ` · lote ${esc(job.analysis_done || 0)}/${esc(job.analysis_total)}` : ""}</p>${job.error ? `<p class="atlas-job-error">${esc(job.error)}</p>` : ""}</div>${job.status === "suggested" ? `<button data-atlas-review-job="${esc(job.id)}">Revisar prévia</button>` : job.status === "running" ? `<button data-atlas-cancel-job="${esc(job.id)}">Cancelar</button>` : `<button data-atlas-retry-job="${esc(job.id)}">Tentar novamente</button><button data-atlas-manual-job="${esc(job.id)}">Editar manualmente</button>`}</article>`).join("")}</div>`;
+  const labels = { running: "Processando a fonte", suggested: "Prévia pronta para revisão", error: "Falha na análise", interrupted: "Análise interrompida", cancelled: "Análise cancelada", awaiting_consent: "Aguardando consentimento", awaiting_configuration: "Aguardando configuração da IA" };
+  const errorMeta = (job) => {
+    const raw = String(job.error || ""); let kind = job.error_kind || "";
+    if (!kind && /(503|UNAVAILABLE|high demand)/i.test(raw)) kind = "api_service";
+    if (!kind && /(429|rate.?limit|limite de uso)/i.test(raw)) kind = "api_limit";
+    if (!kind && /(tabela inteira|linhas referenciadas|Atlas inválido)/i.test(raw)) kind = "ai_response";
+    const titles = { api_service: "O serviço de IA está instável", api_limit: "A chave atingiu um limite temporário", api_configuration: "A configuração da IA precisa de atenção", network: "Falha de conexão com a IA", ai_response: "A fonte carregou, mas a resposta da IA falhou", source_import: "Não foi possível ler a fonte", source_validation: "A fonte não pôde ser validada", internal: "Falha interna do Atlas" };
+    let message = raw;
+    if (kind === "api_service" && /\{.*(?:503|UNAVAILABLE)/s.test(raw)) message = "O provedor está temporariamente indisponível ou com alta demanda. O DigiTracker tentou novamente.";
+    const hint = job.error_details?.hint || (Number(job.checkpoint_count || 0) ? `${job.checkpoint_count} lote(s) já foram salvos e serão reaproveitados.` : "Você pode tentar novamente sem alterar o Atlas publicado.");
+    return { kind: kind || "internal", title: titles[kind] || "A análise não terminou", message, hint };
+  };
+  const cards = (game.smart_guide?.atlas_jobs || []).filter((job) => labels[job.status]).map((job) => {
+    const done = Number(job.analysis_done || 0), total = Number(job.analysis_total || 0);
+    const pct = total ? Math.max(2, Math.min(100, Math.round(done / total * 100))) : 8;
+    const meta = job.error ? errorMeta(job) : null;
+    const technical = job.error_details && Object.keys(job.error_details).length
+      ? JSON.stringify(job.error_details, null, 2) : "";
+    return `<article class="atlas-job ${job.status} ${meta ? esc(meta.kind) : ""}">
+      <div class="atlas-job-main"><div class="atlas-job-heading"><div><span>${esc(job.provider || "ATLAS")}${job.model ? ` · ${esc(job.model)}` : ""}</span><b>${esc(job.title)}</b></div><em>${esc(labels[job.status])}</em></div>
+      ${job.status === "running" ? `<p>${esc(job.message || "Analisando relações e requisitos…")}</p><div class="atlas-job-progress"><i style="width:${pct}%"></i></div><small>${total ? `Lote ${done}/${total}` : "Preparando lotes"}${job.checkpoint_count ? ` · ${esc(job.checkpoint_count)} salvo(s)` : ""}</small>` : ""}
+      ${meta ? `<div class="atlas-job-error"><b>${esc(meta.title)}</b><p>${esc(meta.message)}</p><small>${esc(meta.hint)}</small>${technical ? `<details><summary>Detalhes técnicos</summary><pre>${esc(technical)}</pre></details>` : ""}</div>` : ""}</div>
+      <div class="atlas-job-actions">${job.status === "suggested" ? `<button data-atlas-review-job="${esc(job.id)}">Revisar prévia</button>` : job.status === "running" ? `<button data-atlas-cancel-job="${esc(job.id)}">Cancelar</button>` : `<button data-atlas-retry-job="${esc(job.id)}">${job.checkpoint_count ? "Retomar" : "Tentar novamente"}</button>${["api_limit","api_service","api_configuration"].includes(meta?.kind) ? `<button data-atlas-settings>Trocar modelo</button>` : ""}<button data-atlas-manual-job="${esc(job.id)}">Criar manualmente</button>`}</div>
+    </article>`;
+  }).join("");
+  return `<div class="atlas-jobs">${cards}</div>`;
 }
 
 function guideSystemsHTML(game) {
@@ -1914,6 +1942,43 @@ function openGuideSystemEditor(system = null, sourceId = "") {
 
 function closeAtlasSourceWizard() { document.getElementById("atlas-source-wizard")?.remove(); }
 
+function atlasImportProgress(title, kind) {
+  $("#atlas-processing")?.remove();
+  const modal = document.createElement("div");
+  modal.id = "atlas-processing"; modal.className = "modal-bg";
+  modal.innerHTML = `<div class="atlas-processing" role="dialog" aria-modal="true" aria-live="polite">
+    <div class="atlas-processing-orbit"><i></i><span>◇</span></div>
+    <span class="atlas-processing-kicker">ATLAS / ${kind === "pdf" ? "PDF" : "GAMEFAQS"}</span>
+    <h2>${esc(title || "Novo sistema visual")}</h2>
+    <p id="atlas-processing-message">${kind === "pdf" ? "Lendo e estruturando o arquivo…" : "Baixando todas as páginas do guia…"}</p>
+    <div class="atlas-processing-steps"><span class="active" data-process-step="source">1 <b>Fonte</b></span><i></i><span data-process-step="structure">2 <b>Estrutura</b></span><i></i><span data-process-step="ai">3 <b>IA</b></span></div>
+    <div class="atlas-processing-error" id="atlas-processing-error" hidden></div>
+    <button id="atlas-processing-close" hidden>Fechar</button>
+  </div>`;
+  document.body.appendChild(modal);
+  return modal;
+}
+
+function updateAtlasImportProgress(step, message, result = null) {
+  const modal = $("#atlas-processing"); if (!modal) return;
+  const order = ["source", "structure", "ai"], active = Math.max(0, order.indexOf(step));
+  modal.querySelectorAll("[data-process-step]").forEach((item) => {
+    const index = order.indexOf(item.dataset.processStep);
+    item.classList.toggle("done", index < active); item.classList.toggle("active", index === active);
+  });
+  const copy = $("#atlas-processing-message"); if (copy) copy.textContent = message || "Processando…";
+  if (result && result.ok === false) {
+    modal.querySelector(".atlas-processing")?.classList.add("failed");
+    const error = $("#atlas-processing-error"), kind = result.error_kind || "source_import";
+    const titles = { source_import: "Não consegui ler a fonte", source_validation: "A fonte não pôde ser validada", network: "Falha de conexão", api_limit: "Limite da API", api_service: "Serviço de IA indisponível", api_configuration: "Configuração da IA", ai_response: "Resposta da IA inválida", internal: "Falha interna" };
+    const hint = result.error_details?.hint || "Confira os dados e tente novamente.";
+    error.hidden = false; error.innerHTML = `<b>${esc(titles[kind] || "Falha no processamento")}</b><p>${esc(result.error || "Não foi possível continuar.")}</p><small>${esc(hint)}</small>${result.error_code ? `<code>${esc(result.error_code)}</code>` : ""}`;
+    const close = $("#atlas-processing-close"); close.hidden = false; close.onclick = () => modal.remove();
+  }
+}
+
+function closeAtlasImportProgress() { $("#atlas-processing")?.remove(); }
+
 function openAtlasSourceWizard(replaceSystem = null) {
   closeAtlasSourceWizard();
   const modal = document.createElement("div");
@@ -1933,10 +1998,19 @@ function openAtlasSourceWizard(replaceSystem = null) {
     const input = document.createElement("input"); input.type = "file"; input.accept = ".pdf,application/pdf";
     input.onchange = async () => {
       const file = input.files?.[0]; if (!file) return;
-      const data = await fileToBase64(file); closeAtlasSourceWizard();
-      const payload = { kind: "pdf", title: title(), data, filename: file.name };
-      const result = replaceSystem ? await backend.replaceGuideSystemSource(S.activeSlug, replaceSystem.id, payload).catch((error) => ({ ok: false, error: String(error) })) : await backend.createGuideSystemPdf(S.activeSlug, title(), data, file.name).catch((error) => ({ ok: false, error: String(error) }));
-      await finishAtlasSourceImport(result, title());
+      const systemTitle = title(); closeAtlasSourceWizard(); atlasImportProgress(systemTitle, "pdf");
+      try {
+        const data = await fileToBase64(file);
+        updateAtlasImportProgress("structure", "Extraindo texto, tabelas e referências do PDF…");
+        const payload = { kind: "pdf", title: systemTitle, data, filename: file.name };
+        const result = replaceSystem ? await backend.replaceGuideSystemSource(S.activeSlug, replaceSystem.id, payload).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" })) : await backend.createGuideSystemPdf(S.activeSlug, systemTitle, data, file.name).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" }));
+        await finishAtlasSourceImport(result, systemTitle);
+      } catch (error) {
+        updateAtlasImportProgress("source", "Não foi possível abrir o arquivo selecionado.", {
+          ok: false, error: String(error), error_kind: "source_import",
+          error_code: "local_file_read", error_details: { hint: "Escolha o PDF novamente ou confira se outro programa o bloqueou." },
+        });
+      }
     };
     input.click();
   };
@@ -1944,23 +2018,48 @@ function openAtlasSourceWizard(replaceSystem = null) {
   $("#atlas-source-url-submit", modal).onclick = async () => {
     const url = ($("#atlas-source-url", modal)?.value || "").trim();
     if (!title() || !url) return toast("Informe o nome e o endereço do guia.", true);
-    const systemTitle = title(); closeAtlasSourceWizard();
+    const systemTitle = title(); closeAtlasSourceWizard(); atlasImportProgress(systemTitle, "gamefaqs");
+    updateAtlasImportProgress("source", "Baixando e conferindo todas as páginas do GameFAQs…");
     const payload = { kind: "gamefaqs", title: systemTitle, url };
-    const result = replaceSystem ? await backend.replaceGuideSystemSource(S.activeSlug, replaceSystem.id, payload).catch((error) => ({ ok: false, error: String(error) })) : await backend.createGuideSystemGameFaqs(S.activeSlug, systemTitle, url).catch((error) => ({ ok: false, error: String(error) }));
+    const result = replaceSystem ? await backend.replaceGuideSystemSource(S.activeSlug, replaceSystem.id, payload).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" })) : await backend.createGuideSystemGameFaqs(S.activeSlug, systemTitle, url).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" }));
     await finishAtlasSourceImport(result, systemTitle);
   };
 }
 
 async function finishAtlasSourceImport(result, title) {
-  if (!result?.ok) return toast(result?.error || "Não foi possível importar a fonte do Atlas.", true);
+  if (!result?.ok) {
+    updateAtlasImportProgress("source", "A importação não pôde continuar.", result || { ok: false });
+    return toast(result?.error || "Não foi possível importar a fonte do Atlas.", true);
+  }
   const sourceId = result.source?.id || result.source_id;
   if (["awaiting_configuration", "awaiting_consent"].includes(result.phase)) {
+    closeAtlasImportProgress();
     toast(result.message || "Fonte anexada. Complete o sistema manualmente.");
     return openGuideSystemEditor(null, sourceId);
   }
+  updateAtlasImportProgress("ai", "Fonte pronta. A IA iniciou a extração em lotes recuperáveis…");
+  await esperar(350); closeAtlasImportProgress();
   toast("Fonte anexada. A IA está montando a prévia do sistema.");
   // Dashboard polling displays persisted job state; no loop tied to mutable activeSlug.
   await renderDashboard({ force: true });
+  acompanharAtlasJob(S.activeSlug, sourceId);
+}
+
+async function acompanharAtlasJob(slug, sourceId) {
+  if (!slug || !sourceId) return;
+  S.atlasPolling ||= new Set();
+  const key = `${slug}:${sourceId}`; if (S.atlasPolling.has(key)) return;
+  S.atlasPolling.add(key);
+  try {
+    while (S.view === "dashboard" && S.activeSlug === slug) {
+      const status = await appCall("get_atlas_job", slug, sourceId);
+      if (!status?.ok || status.phase !== "running") {
+        await renderDashboard({ force: true }); break;
+      }
+      await esperar(850);
+      await renderDashboard({ force: true });
+    }
+  } finally { S.atlasPolling.delete(key); }
 }
 
 async function viewAtlasSource(systemId) {
@@ -2036,10 +2135,12 @@ function bindGuideAtlas(game) {
   $("#atlas-path")?.addEventListener("change", async event => { const r = await appCall("set_guide_system_path", game.slug, system.id, event.target.value); if (!r.ok) toast(r.error,true); await rerender(); });
   root.querySelectorAll("[data-atlas-review-job]").forEach((b) => b.onclick = () => { S.guideAtlas.draftSource = b.dataset.atlasReviewJob; S.guideAtlas.systemId = ""; rerender(); });
   root.querySelectorAll("[data-atlas-manual-job]").forEach((b) => b.onclick = () => openGuideSystemEditor(null, b.dataset.atlasManualJob));
+  root.querySelectorAll("[data-atlas-settings]").forEach((b) => b.onclick = () => enterSettings("ai", { slug: game.slug, tab: "atlas" }));
   for (const [attr, method] of [["atlasCancelJob", "cancel_atlas_job"], ["atlasRetryJob", "retry_atlas_job"]]) {
     root.querySelectorAll(attr === "atlasCancelJob" ? "[data-atlas-cancel-job]" : "[data-atlas-retry-job]").forEach((b) => b.onclick = async () => {
       b.disabled = true; const r = await appCall(method, game.slug, b.dataset[attr]);
-      if (!r.ok) { b.disabled = false; toast(r.error, true); } else await rerender();
+      if (!r.ok) { b.disabled = false; toast(r.error, true); }
+      else { await rerender(); if (method === "retry_atlas_job") acompanharAtlasJob(game.slug, r.source_id || b.dataset[attr]); }
     });
   }
   $("#atlas-back-published")?.addEventListener("click", () => { S.guideAtlas.draftSource = ""; rerender(); });
@@ -2234,9 +2335,10 @@ function bindSidebar() {
 async function enterSettings(section = "", returnTo = null) {
   S.view = "settings";
   stopPolling();
-  const [estado, ia, sources, compact, overlay, update, guideSources] = await Promise.all([
+  const [estado, ia, aiUsage, sources, compact, overlay, update, guideSources] = await Promise.all([
     backend.appState().catch(() => ({})),
     backend.getAiConfig().catch(() => ({ ok: false })),
+    backend.getAiUsageStatus().catch(() => ({ ok: false, providers: {} })),
     backend.getSourcesConfig().catch(() => ({ ok: false })),
     backend.getCompactConfig().catch(() => null),
     backend.overlayStatus().catch((e) => ({ ok: false, error: String(e) })),
@@ -2246,6 +2348,7 @@ async function enterSettings(section = "", returnTo = null) {
   S.SET = {
     estado,
     ia: ia && ia.ok ? ia : null,
+    aiUsage: aiUsage && aiUsage.ok ? aiUsage : null,
     sources: sources && sources.ok ? sources.ready : {},
     compact: compact && compact.ok ? compact : { width: 300, height: 232, last: 2, next: 0 },
     overlay,
@@ -2471,6 +2574,25 @@ async function viewWalkthroughSource(sourceId) {
   $("#guide-source-view-close").onclick = () => $("#guide-source-view")?.remove();
 }
 
+function aiUsageHTML(status, provider) {
+  const bucket = status?.providers?.[provider] || {};
+  const providerMeta = status?.provider_meta?.[provider] || {};
+  const limitsUrl = providerMeta.limits_url || (status?.provider === provider ? status?.limits_url : "");
+  const health = bucket.health || "unknown";
+  const label = {
+    healthy: "API respondendo", degraded: "Serviço instável",
+    rate_limited: "Limite temporário atingido", error: "Configuração com erro",
+    unknown: "Ainda não testada",
+  }[health] || "Status desconhecido";
+  const retry = Math.ceil(Number(bucket.retry_after_seconds || 0));
+  return `<div class="settings-card ai-usage-card ${esc(health)}">
+    <div class="ai-usage-head"><div><h3>Uso e limite da API</h3><p class="set-hint">${esc(status?.quota_note || "Medição local desta execução.")}</p></div><span>${esc(label)}</span></div>
+    <div class="ai-usage-grid"><div><b>${Number(bucket.requests || 0).toLocaleString("pt-BR")}</b><span>requisições</span></div><div><b>${Number(bucket.retries || 0).toLocaleString("pt-BR")}</b><span>novas tentativas</span></div><div><b>${Number(bucket.total_tokens || 0).toLocaleString("pt-BR")}</b><span>tokens observados</span></div><div><b>${Number(bucket.rate_limit_events || 0).toLocaleString("pt-BR")}</b><span>limites detectados</span></div></div>
+    ${retry ? `<p class="ai-limit-wait">Nova tentativa recomendada em aproximadamente <b>${retry}s</b>.</p>` : ""}
+    <div class="ai-usage-actions"><button class="btn-ghost" id="ai-usage-refresh">Atualizar status</button>${limitsUrl ? `<button class="btn-ghost" id="ai-usage-provider" data-url="${esc(limitsUrl)}">Abrir painel do provedor ↗</button>` : ""}</div>
+  </div>`;
+}
+
 function renderSettings() {
   $("#btn-library").hidden = true; closeLibraryDrawer();
   const id = S.SET.section || "account";
@@ -2485,7 +2607,7 @@ function renderSettings() {
   let panel = id === "account" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Conta conectada</h3><div class="set-row"><div><div class="set-txt">RetroAchievements</div><div class="set-sub" data-private>${estado.username ? esc(estado.username) : "não conectada"}</div></div><button class="btn-ghost" id="set-reconnect">Trocar conta</button></div></div>
     <div class="settings-card"><h3>Atualizações</h3><div class="set-row"><div><div class="set-txt">DigiTracker ${esc(estado.version || S.version)}</div><div class="set-sub">${upText}</div></div><button class="btn-ghost" id="set-update-check">Procurar agora</button></div>${settingsToggle("auto_check_updates", draft.auto_check_updates, "Procurar atualizações ao iniciar", "Apenas releases estáveis; a instalação sempre pede confirmação")}</div>`)
   : id === "experience" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Experiência DigiTracker Console</h3><p class="set-hint">Combina a apresentação cinematográfica da PSN, a navegação do Steam Deck e a identidade do DigiTracker. O Guia Inteligente nunca apaga sua fonte importada.</p>${settingsToggle("smart_guide_auto", draft.smart_guide_auto, "Organizar guias automaticamente", "Depois de cada importação, cria uma revisão compacta e validada")}${settingsToggle("smart_guide_consent", draft.smart_guide_consent, "Permitir envio do guia à IA", "O provedor configurado pode cobrar pelo processamento. Imagens pesquisadas continuam exigindo aprovação")}${settingsToggle("reduced_motion", draft.reduced_motion, "Reduzir animações", "Remove transições de profundidade e movimentos não essenciais")}</div><div class="settings-card"><div class="experience-grid"><div><label class="set-label">Densidade</label><select class="set-field" data-draft-field="guide_density"><option value="comfortable" ${draft.guide_density === "comfortable" ? "selected" : ""}>Confortável adaptável</option><option value="compact" ${draft.guide_density === "compact" ? "selected" : ""}>Compacta</option></select></div><div><label class="set-label">Escala da interface: <b id="settings-scale-label">${draft.ui_scale}%</b></label><input class="set-range" data-draft-field="ui_scale" type="range" min="80" max="140" step="5" value="${draft.ui_scale}"></div></div></div>`)
-  : id === "ai" ? settingsPanelFrame(id, ia ? `<div class="settings-card"><h3>Provedor ativo</h3><div class="ai-providers">${ia.providers.map((p) => `<button class="ai-prov ${p.id === draft.provider ? "on" : ""}" data-settings-provider="${esc(p.id)}"><span class="ai-prov-name">${esc(p.label)}</span>${p.has_key ? `<span class="ai-prov-ok">✓ chave salva</span>` : ""}</button>`).join("")}</div></div><div class="settings-card"><label class="set-label">Chave da API${(ia.providers.find((p) => p.id === draft.provider) || {}).has_key ? " (salva — deixe em branco para manter)" : ""}</label>${field("api_key", "", "password", `placeholder="${((ia.providers.find((p) => p.id === draft.provider) || {}).has_key) ? "••••••••••••••••" : "cole a chave aqui"}" autocomplete="off"`)}<button class="btn-ghost settings-inline-action ${draft.clear_key ? "selected" : ""}" data-ai-clear>${draft.clear_key ? "Chave será removida" : "Remover chave salva"}</button><label class="set-label">Modelo</label>${field("model", draft.model, "text", "autocomplete=off")}${(ia.providers.find((p) => p.id === draft.provider) || {}).needs_base_url ? `<label class="set-label">Endpoint (OpenRouter, Ollama, LM Studio…)</label>${field("base_url", draft.base_url, "text", "autocomplete=off")}` : ""}<p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.</p></div>` : `<div class="settings-card"><h3>Inteligência artificial</h3><p class="set-hint">Indisponível no modo demonstração.</p></div>`)
+  : id === "ai" ? settingsPanelFrame(id, ia ? `<div class="settings-card"><h3>Provedor ativo</h3><div class="ai-providers">${ia.providers.map((p) => `<button class="ai-prov ${p.id === draft.provider ? "on" : ""}" data-settings-provider="${esc(p.id)}"><span class="ai-prov-name">${esc(p.label)}</span>${p.has_key ? `<span class="ai-prov-ok">✓ chave salva</span>` : ""}</button>`).join("")}</div></div><div class="settings-card"><label class="set-label">Chave da API${(ia.providers.find((p) => p.id === draft.provider) || {}).has_key ? " (salva — deixe em branco para manter)" : ""}</label>${field("api_key", "", "password", `placeholder="${((ia.providers.find((p) => p.id === draft.provider) || {}).has_key) ? "••••••••••••••••" : "cole a chave aqui"}" autocomplete="off"`)}<button class="btn-ghost settings-inline-action ${draft.clear_key ? "selected" : ""}" data-ai-clear>${draft.clear_key ? "Chave será removida" : "Remover chave salva"}</button><label class="set-label">Modelo</label>${field("model", draft.model, "text", "autocomplete=off")}${(ia.providers.find((p) => p.id === draft.provider) || {}).needs_base_url ? `<label class="set-label">Endpoint (OpenRouter, Ollama, LM Studio…)</label>${field("base_url", draft.base_url, "text", "autocomplete=off")}` : ""}<p class="set-hint">A chave fica só em <code>config/secrets.json</code>, nesta máquina.</p></div>${aiUsageHTML(S.SET.aiUsage, draft.provider)}` : `<div class="settings-card"><h3>Inteligência artificial</h3><p class="set-hint">Indisponível no modo demonstração.</p></div>`)
   : id === "images" ? settingsPanelFrame(id, `<p class="set-hint settings-intro">Configure as fontes opcionais de capas e fundos. As credenciais só serão enviadas quando você salvar esta sessão.</p>${[["steamgriddb","SteamGridDB","Capas da comunidade.",ready.steamgriddb],["rawg","RAWG","Fundos e screenshots para jogos retrô.",ready.rawg],["igdb","IGDB","Capas de qualidade via Twitch.",ready.igdb]].map(([key,label,sub,has]) => `<div class="src-cfg settings-card"><h3>${label} ${has ? "✓" : ""}</h3><p class="set-hint">${sub}</p>${field(`${key}.key1`, "", key === "igdb" ? "text" : "password", `placeholder="${has ? "•••••••• (salva — em branco mantém)" : (key === "igdb" ? "Twitch Client ID" : "chave da API")}" autocomplete="off"`)}${key === "igdb" ? field(`${key}.key2`, "", "password", `placeholder="${has ? "•••• (segredo salvo — em branco mantém)" : "Twitch Client Secret"}" autocomplete="off"`) : ""}<button class="btn-ghost settings-inline-action ${draft[key].clear ? "selected" : ""}" data-source-clear="${key}">${draft[key].clear ? "Fonte será removida" : "Remover credencial salva"}</button></div>`).join("")}`)
   : id === "library" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Entrada de jogos</h3>${settingsToggle("auto_import", draft.auto_import, "Importar jogos novos automaticamente", "Verifica a cada 5 minutos e traz os jogos em que você começou a jogar")}</div>${guideSourcesSettingsHTML()}`)
   : id === "overlay" ? settingsPanelFrame(id, `<div class="settings-card"><h3>Comportamento</h3>${settingsToggle("auto_overlay", draft.auto_overlay, "Grudar no emulador", "Vira overlay e acompanha a janela quando um emulador abre")}${settingsToggle("overlay_exit_fullscreen", draft.overlay_exit_fullscreen, "Sair do fullscreen exclusivo", "Manda Alt+Enter para o emulador quando autorizado")}${settingsToggle("overlay_second_screen", draft.overlay_second_screen, "Usar o segundo monitor", "Leva o overlay para a tela que o jogo não ocupa")}${settingsToggle("overlay_fit_emulator", draft.overlay_fit_emulator, "Ajustar ao tamanho do emulador", "Mantém o overlay proporcional à janela do emulador")}</div><div class="overlay-diag settings-card ${ov.detected ? "ok" : ""}"><h3>Diagnóstico de detecção</h3><div class="set-sub">${ovState}</div><div class="overlay-diag-grid"><span>Área interna</span><code>${esc(ovRect)}</code><span>Overlay</span><code>${esc((ov.overlay_size || []).join(" × ") || "—")}</code><span>Posição</span><code>${esc((ov.dock || []).join(", ") || "—")}</code><span>Modo nativo</span><code>${esc(ov.native_input_mode || "—")}</code><span>Hotkey</span><code>${esc(ov.hotkey || "—")}${ov.hotkey_error ? ` · ${esc(ov.hotkey_error)}` : ""}</code></div><button class="btn-ghost" id="overlay-test">Testar detecção agora</button></div>`)
@@ -2527,6 +2649,12 @@ function renderSettings() {
   });
   root.querySelectorAll("[data-settings-provider]").forEach((b) => b.addEventListener("click", () => { S.SET.drafts.ai.provider = b.dataset.settingsProvider; S.SET.drafts.ai.model = ""; S.SET.drafts.ai.base_url = ""; markSettingsDirty(); renderSettings(); }));
   $("[data-ai-clear]")?.addEventListener("click", () => { S.SET.drafts.ai.clear_key = !S.SET.drafts.ai.clear_key; renderSettings(); });
+  $("#ai-usage-refresh")?.addEventListener("click", async () => {
+    S.SET.aiUsage = await backend.getAiUsageStatus().catch(() => null); renderSettings();
+  });
+  $("#ai-usage-provider")?.addEventListener("click", () => {
+    const url = $("#ai-usage-provider")?.dataset.url; if (url) backend.openImageSource(url);
+  });
   root.querySelectorAll("[data-source-clear]").forEach((b) => b.addEventListener("click", () => { const key = b.dataset.sourceClear; S.SET.drafts.images[key].clear = !S.SET.drafts.images[key].clear; renderSettings(); }));
   if (id === "library") bindGuideSourceSettings();
 }

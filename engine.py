@@ -1569,6 +1569,33 @@ class Api(ExperienceApi, DataToolsApi):
             "ai_ready": bool(self._ai_key(provider)),
         }
 
+    def get_ai_usage_status(self) -> dict:
+        """Retorna saúde/uso observado sem expor chave, prompt ou resposta."""
+        with self._lock:
+            provider = self.settings.get("ai_provider") or guide_ai.DEFAULT_PROVIDER
+            model = guide_ai.resolve_model(provider, self.settings.get("ai_model", ""))
+        # Entregamos todos os contadores para que trocar a opção no formulário
+        # atualize o cartão imediatamente, antes mesmo de salvar a sessão.
+        status = guide_ai.get_ai_usage_status()
+        info = guide_ai.PROVIDERS.get(provider) or {}
+        provider_meta = {
+            provider_id: {
+                "label": value.get("label", provider_id),
+                "limits_url": value.get("key_url", ""),
+            }
+            for provider_id, value in guide_ai.PROVIDERS.items()
+        }
+        return {
+            **status, "provider": provider, "model": model,
+            "provider_label": info.get("label", provider),
+            "limits_url": info.get("key_url", ""),
+            "provider_meta": provider_meta,
+            "quota_note": (
+                "Contadores locais desde que o DigiTracker foi aberto. A cota "
+                "total e a renovação oficial ficam no painel do provedor."
+            ),
+        }
+
     def set_ai_config(self, provider: str, api_key: str = None,
                       model: str = "", base_url: str = "") -> dict:
         """Escolhe o provedor e, opcionalmente, grava a chave dele.
@@ -1916,7 +1943,9 @@ class Api(ExperienceApi, DataToolsApi):
             raw = self._decode_upload(data)
             ok, error, sections = self._read_guide_sections(data)
             if not ok:
-                return {"ok": False, "error": error}
+                return {"ok": False, "error": error, "error_kind": "source_import",
+                        "error_code": "pdf_read", "error_details": {
+                            "hint": "Confirme se o PDF possui texto selecionável e não está corrompido."}}
             source = self._guides.add_walkthrough_source(
                 slug, filename or "Guia em PDF", "pdf", sections,
                 {"filename": filename}, raw=raw,
@@ -1924,7 +1953,8 @@ class Api(ExperienceApi, DataToolsApi):
             return {"ok": True, "source": source, "duplicate": bool(source.get("duplicate")),
                     "sources": self._guides.walkthrough_sources(slug)}
         except smart_guide.SmartGuideError as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": str(exc), "error_kind": "source_validation",
+                    "error_code": "atlas_validation"}
 
     def add_walkthrough_gamefaqs(self, slug: str, url: str) -> dict:
         game = load_game_file(GAMES_DIR / f"{slug}.json")
@@ -2161,6 +2191,11 @@ class Api(ExperienceApi, DataToolsApi):
             if source_id and source_id != "legacy-main":
                 self._guides.link_system_source(
                     slug, source_id, (result.get("system") or {}).get("id", ""))
+                self._guides.update_system_source(
+                    slug, source_id, status="published", stage="complete",
+                    error="", error_kind="", error_code="", error_details={},
+                    message="Sistema publicado manualmente.")
+                self._guides.clear_atlas_checkpoint(slug, source_id)
             self._refresh_smart_bundle(slug)
             return {"ok": True, **result, **self._guide_systems_payload(slug)}
         except smart_guide.SmartGuideError as exc:
@@ -2178,6 +2213,47 @@ class Api(ExperienceApi, DataToolsApi):
             }])
         self._guides.publish(game["slug"], placeholder, "", "local", "atlas-placeholder")
 
+    @staticmethod
+    def _atlas_error_info(exc: Exception) -> dict:
+        """Classifica a falha sem obrigar a interface a interpretar frases."""
+        if isinstance(exc, guide_ai.GuideAIError):
+            details = exc.as_dict()
+            code = details.get("code") or "guide_ai_error"
+            if code == "empty_source":
+                kind = "source_validation"
+                hint = "A fonte foi aberta, mas não contém trechos utilizáveis para o Atlas."
+            elif code == "rate_limited":
+                kind = "api_limit"
+                hint = "Aguarde o prazo indicado ou escolha outro modelo/provedor."
+            elif code in {"authentication", "model_not_found", "provider_error"}:
+                kind = "api_configuration"
+                hint = "Revise a chave, o modelo e o provedor em Configurações."
+            elif code in {"service_unavailable", "timeout"}:
+                kind = "api_service"
+                hint = "O serviço está instável. Seus lotes concluídos foram preservados."
+            elif code == "network_error":
+                kind = "network"
+                hint = "Verifique a internet, firewall ou proxy e tente retomar."
+            else:
+                kind = "ai_response"
+                hint = "A fonte foi carregada, mas a resposta da IA não pôde ser validada."
+            return {"message": str(exc), "kind": kind, "code": code,
+                    "hint": hint, "details": {**details, "hint": hint}}
+        if isinstance(exc, gamefaqs.GameFAQsError):
+            return {"message": str(exc), "kind": "source_import",
+                    "code": "gamefaqs_import", "hint": "Confira a URL e tente novamente.",
+                    "details": {"exception": type(exc).__name__}}
+        if isinstance(exc, smart_guide.SmartGuideError):
+            return {"message": str(exc), "kind": "source_validation",
+                    "code": "atlas_validation", "hint": "Revise a fonte ou edite o sistema manualmente.",
+                    "details": {"exception": type(exc).__name__}}
+        return {
+            "message": "O Atlas encontrou uma falha interna durante o processamento.",
+            "kind": "internal", "code": "atlas_internal",
+            "hint": "Tente retomar. Se persistir, exporte o diagnóstico.",
+            "details": {"exception": type(exc).__name__, "message": str(exc)[:1000]},
+        }
+
     def _queue_atlas_source(self, slug: str, source: dict, title: str,
                             replace_system_id: str = "") -> dict:
         if not (self.settings.get("smart_guide_consent", False) and self._ai_key()):
@@ -2193,14 +2269,27 @@ class Api(ExperienceApi, DataToolsApi):
             if current.get("status") == "running":
                 return {"ok": False, "error": "Esta fonte já está sendo analisada."}
             job_id = uuid.uuid4().hex
+            ai_config = self._ai_config()
+            checkpoint = self._guides.atlas_checkpoint(slug, source["id"])
+            checkpoint_count = len((checkpoint.get("batches") or {})) \
+                if isinstance(checkpoint, dict) else 0
             task = {"ok": True, "phase": "running", "slug": slug,
                     "source_id": source["id"], "title": title, "job_id": job_id,
                     "replace_system_id": replace_system_id,
-                    "message": "Analisando a fonte exclusiva do Atlas…", "error": ""}
+                    "stage": "queued", "provider": ai_config.get("provider", ""),
+                    "model": guide_ai.resolve_model(ai_config.get("provider") or guide_ai.DEFAULT_PROVIDER,
+                                                    ai_config.get("model", "")),
+                    "checkpoint_count": checkpoint_count,
+                    "message": ("Retomando lotes já processados…" if checkpoint_count else
+                                "Preparando a fonte exclusiva do Atlas…"), "error": ""}
             self._atlas_ai_status[f"{slug}:{source['id']}"] = task
             self._guides.update_system_source(slug, source["id"], status="running", error="",
                                               job_id=job_id, replace_system_id=replace_system_id,
-                                              analysis_done=0, analysis_total=0)
+                                              analysis_done=0, analysis_total=0,
+                                              checkpoint_count=checkpoint_count,
+                                              stage="queued", message=task["message"],
+                                              error_kind="", error_code="", error_details={},
+                                              provider=task["provider"], model=task["model"])
         self._refresh_smart_bundle(slug)
         threading.Thread(target=self._atlas_source_worker,
                          args=(slug, source["id"], title, replace_system_id, job_id), daemon=True).start()
@@ -2212,41 +2301,69 @@ class Api(ExperienceApi, DataToolsApi):
         try:
             source = self._guides.system_source(slug, source_id, include_sections=True)
             def report_progress(done: int, total: int) -> None:
+                stage = "preparing" if done <= 0 else ("assembling" if done >= total else "extracting")
+                message = ("Preparando lotes e referências…" if done <= 0 else
+                           "Montando e validando o Atlas…" if done >= total else
+                           f"Extraindo relações com a IA: lote {done}/{total}…")
                 with self._atlas_job_lock:
                     latest = self._guides.system_source(slug, source_id)
                     if latest.get("job_id") != job_id or latest.get("status") != "running":
                         raise guide_ai.GuideAIError("Análise cancelada.")
                     self._guides.update_system_source(
-                        slug, source_id, analysis_done=done, analysis_total=total)
+                        slug, source_id, analysis_done=done, analysis_total=total,
+                        stage=stage, message=message)
                 with self._smart_ai_lock:
                     self._atlas_ai_status[f"{slug}:{source_id}"] = {
                         "ok": True, "phase": "running", "slug": slug,
                         "source_id": source_id, "title": title, "job_id": job_id,
                         "analysis_done": done, "analysis_total": total,
-                        "message": f"Extraindo todos os caminhos: lote {done}/{total}…",
+                        "stage": stage, "message": message,
                         "error": "",
                     }
+
+            checkpoint = self._guides.atlas_checkpoint(slug, source_id)
+
+            def save_checkpoint(value: dict) -> None:
+                with self._atlas_job_lock:
+                    saved_checkpoint = self._guides.save_atlas_checkpoint(
+                        slug, source_id, value, job_id)
+                    count = len(saved_checkpoint.get("batches") or {})
+                    self._guides.update_system_source(
+                        slug, source_id, checkpoint_count=count,
+                        stage="checkpoint", message=f"Lote {count} salvo; o progresso pode ser retomado.")
+
             system = guide_ai.generate_system_from_source(
-                source, title, game, self._ai_config(), report_progress)
+                source, title, game, self._ai_config(), report_progress,
+                checkpoint=checkpoint, checkpoint_callback=save_checkpoint)
             diagnostics = system.pop("_analysis", {})
             if replace_system_id:
                 system["id"] = replace_system_id
             with self._atlas_job_lock:
                 draft = self._guides.save_atlas_draft(
                     slug, source_id, system, job_id, diagnostics)
+                self._guides.clear_atlas_checkpoint(slug, source_id)
             system = draft["system"]
             saved = self._guides.system_source(slug, source_id)
             status = {"ok": True, "phase": "suggested", "slug": slug,
                       "source_id": source_id, "system": system, "source": saved,
                       "message": "Sistema pronto para revisão.", "error": ""}
         except Exception as exc:
+            error_info = self._atlas_error_info(exc)
             with self._atlas_job_lock:
                 latest = self._guides.system_source(slug, source_id)
                 if latest.get("job_id") != job_id or latest.get("status") != "running":
                     return  # Cancelled/retried work must never overwrite the new job.
-                self._guides.update_system_source(slug, source_id, status="error", error=str(exc))
+                checkpoint = self._guides.atlas_checkpoint(slug, source_id)
+                self._guides.update_system_source(
+                    slug, source_id, status="error", stage="error",
+                    error=error_info["message"], error_kind=error_info["kind"],
+                    error_code=error_info["code"], error_details=error_info["details"],
+                    checkpoint_count=len((checkpoint.get("batches") or {})))
             status = {"ok": False, "phase": "error", "slug": slug,
-                      "source_id": source_id, "message": "", "error": str(exc)}
+                      "source_id": source_id, "stage": "error", "message": "",
+                      "error": error_info["message"], "error_kind": error_info["kind"],
+                      "error_code": error_info["code"],
+                      "error_details": error_info["details"]}
         with self._smart_ai_lock:
             self._atlas_ai_status[f"{slug}:{source_id}"] = status
         self._refresh_smart_bundle(slug)
@@ -2296,14 +2413,19 @@ class Api(ExperienceApi, DataToolsApi):
             raw = self._decode_upload(data)
             ok, error, sections = self._read_guide_sections(data)
             if not ok:
-                return {"ok": False, "error": error}
+                return {"ok": False, "error": error, "error_kind": "source_import",
+                        "error_code": "pdf_read", "error_details": {
+                            "hint": "Confirme se o PDF possui texto selecionável e não está corrompido."}}
             self._ensure_atlas_document(game)
             source = self._guides.add_system_source(
                 slug, title or filename or "Sistema visual", "pdf", sections,
                 {"filename": filename}, raw=raw)
             return self._queue_atlas_source(slug, source, title or filename or "Sistema visual")
         except smart_guide.SmartGuideError as exc:
-            return {"ok": False, "error": str(exc)}
+            info = self._atlas_error_info(exc)
+            return {"ok": False, "error": info["message"],
+                    "error_kind": info["kind"], "error_code": info["code"],
+                    "error_details": info["details"]}
 
     @staticmethod
     def _atlas_faq_sections(faq: dict) -> list:
@@ -2328,7 +2450,6 @@ class Api(ExperienceApi, DataToolsApi):
         try:
             session = gamefaqs.create_session()
             faq = gamefaqs.fetch_faq(session, url)
-            parsed = guide_parser.parse_freeform(faq.get("text") or "")
             self._ensure_atlas_document(game)
             source = self._guides.add_system_source(
                 slug, title or faq.get("title") or "Sistema visual", "gamefaqs",
@@ -2338,9 +2459,15 @@ class Api(ExperienceApi, DataToolsApi):
             return self._queue_atlas_source(
                 slug, source, title or faq.get("title") or "Sistema visual")
         except (gamefaqs.GameFAQsError, smart_guide.SmartGuideError) as exc:
-            return {"ok": False, "error": str(exc)}
+            info = self._atlas_error_info(exc)
+            return {"ok": False, "error": info["message"],
+                    "error_kind": info["kind"], "error_code": info["code"],
+                    "error_details": info["details"]}
         except Exception as exc:
-            return {"ok": False, "error": f"Falha ao importar a fonte do Atlas: {exc}"}
+            info = self._atlas_error_info(exc)
+            return {"ok": False, "error": info["message"],
+                    "error_kind": info["kind"], "error_code": info["code"],
+                    "error_details": info["details"]}
 
     def get_guide_system_source(self, slug: str, system_id: str) -> dict:
         current = self._guides.current(slug)
@@ -2378,7 +2505,8 @@ class Api(ExperienceApi, DataToolsApi):
                 raw = self._decode_upload(data)
                 ok, error, sections = self._read_guide_sections(data)
                 if not ok:
-                    return {"ok": False, "error": error}
+                    return {"ok": False, "error": error,
+                            "error_kind": "source_import", "error_code": "pdf_read"}
                 saved = self._guides.add_system_source(
                     slug, title, "pdf", sections,
                     {"filename": source.get("filename") or ""}, raw=raw)
@@ -2386,7 +2514,6 @@ class Api(ExperienceApi, DataToolsApi):
                 url = str(source.get("url") or "").strip()
                 session = gamefaqs.create_session()
                 faq = gamefaqs.fetch_faq(session, url)
-                parsed = guide_parser.parse_freeform(faq.get("text") or "")
                 saved = self._guides.add_system_source(
                     slug, title, "gamefaqs", self._atlas_faq_sections(faq),
                     {"filename": faq.get("title") or "", "url": url, "pages": faq.get('pages', 1),
@@ -2398,9 +2525,15 @@ class Api(ExperienceApi, DataToolsApi):
                 slug, saved["id"], replace_system_id=system_id)
             return self._queue_atlas_source(slug, saved, title, system_id)
         except (gamefaqs.GameFAQsError, smart_guide.SmartGuideError) as exc:
-            return {"ok": False, "error": str(exc)}
+            info = self._atlas_error_info(exc)
+            return {"ok": False, "error": info["message"],
+                    "error_kind": info["kind"], "error_code": info["code"],
+                    "error_details": info["details"]}
         except Exception as exc:
-            return {"ok": False, "error": f"Falha ao trocar a fonte: {exc}"}
+            info = self._atlas_error_info(exc)
+            return {"ok": False, "error": info["message"],
+                    "error_kind": info["kind"], "error_code": info["code"],
+                    "error_details": info["details"]}
 
     def delete_guide_system(self, slug: str, system_id: str) -> dict:
         try:

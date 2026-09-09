@@ -177,6 +177,27 @@ class TestParsingConteudo:
             "<html><body><pre>conteudo</pre></body></html>"
         )
 
+    def test_site_atual_isola_faqwrap_da_navegacao(self):
+        html = '''
+        <html><body>
+          <header>Games News Boards Community</header>
+          <nav>Home Games FAQs</nav>
+          <div id="faqwrap">
+            <div class="pagination">Page 1 Next</div>
+            <h2>Digivolution Chart</h2>
+            <table><tr><th>From</th><th>To</th></tr>
+              <tr><td>Agumon</td><td>Greymon</td></tr></table>
+          </div>
+          <footer>Privacy Terms</footer>
+        </body></html>
+        '''
+        texto = gamefaqs.parse_faq_content(html)
+        assert "Digivolution Chart" in texto
+        assert "Agumon | Greymon" in texto
+        assert "Games News Boards" not in texto
+        assert "Privacy Terms" not in texto
+        assert "Page 1 Next" not in texto
+
     def test_cai_para_o_body_como_ultimo_recurso(self):
         assert "solto" in gamefaqs.parse_faq_content("<html><body>texto solto</body></html>")
 

@@ -116,15 +116,23 @@ class TestPreCondicoes:
 
 
 class FakeResp:
-    def __init__(self, payload=None, status_code=200, text=""):
+    def __init__(self, payload=None, status_code=200, text="", headers=None):
         self._payload = payload
         self.status_code = status_code
         self.text = text or (json_mod.dumps(payload) if payload is not None else "")
+        self.headers = headers or {}
 
     def json(self):
         if self._payload is None:
             raise ValueError("sem json")
         return self._payload
+
+
+@pytest.fixture(autouse=True)
+def sem_backoff_real(monkeypatch):
+    """Retentativas continuam testáveis sem deixar a suíte esperando."""
+    monkeypatch.setattr(guide_ai.time, "sleep", lambda *_args: None)
+    guide_ai._reset_ai_usage_status_for_tests()
 
 
 def gemini_ok(conteudo):
@@ -334,6 +342,42 @@ class TestErrosDeProvedor:
         monkeypatch.setattr(guide_ai.requests, "post", explode)
         with pytest.raises(guide_ai.GuideAIError, match="rede"):
             guide_ai.refine(FAQ, META, {"provider": "gemini", "api_key": "k"})
+
+    def test_503_repete_e_recupera_sem_expor_json(self, monkeypatch):
+        chamadas = com_respostas(
+            monkeypatch,
+            FakeResp({"error": {"code": 503, "message": "internal detail"}}, 503),
+            FakeResp({"error": {"code": 503, "message": "internal detail"}}, 503),
+            gemini_ok(RESPOSTA_IA),
+        )
+        out = guide_ai.refine(FAQ, META, {"provider": "gemini", "api_key": "k"})
+        assert out["matched_by_name"] == 2
+        assert len(chamadas) == 3
+        status = guide_ai.get_ai_usage_status("gemini")["providers"]["gemini"]
+        assert status["retries"] == 2
+        assert status["successes"] == 1
+
+    def test_429_respeita_retry_after_e_explica_limite(self, monkeypatch):
+        esperas = []
+        monkeypatch.setattr(guide_ai.time, "sleep", esperas.append)
+        com_respostas(monkeypatch, *[
+            FakeResp({"error": {"code": 429}}, 429, headers={"Retry-After": "3"})
+            for _ in range(4)
+        ])
+        with pytest.raises(guide_ai.GuideAIError, match="limite") as captured:
+            guide_ai.refine(FAQ, META, {"provider": "gemini", "api_key": "k"})
+        assert esperas == [3.0, 3.0, 3.0]
+        assert captured.value.code == "rate_limited"
+        assert captured.value.status == 429
+        assert captured.value.as_dict()["retryable"] is True
+
+    def test_autenticacao_nao_e_repetida(self, monkeypatch):
+        chamadas = com_respostas(monkeypatch, FakeResp(status_code=401, text="secret raw body"))
+        with pytest.raises(guide_ai.GuideAIError) as captured:
+            guide_ai.refine(FAQ, META, {"provider": "gemini", "api_key": "k"})
+        assert len(chamadas) == 1
+        assert captured.value.code == "authentication"
+        assert "secret raw body" not in str(captured.value)
 
     def test_texto_que_nao_e_json(self, monkeypatch):
         com_respostas(monkeypatch, openai_ok("desculpe, não consigo"))
