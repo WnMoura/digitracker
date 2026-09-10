@@ -17,6 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import gamefaqs  # noqa: E402
 
 BASE = "https://gamefaqs.gamespot.com/ps2/580782-digimon-world-4/faqs"
+ARCHIVE_BASE = (
+    "https://web.archive.org/web/20181001160703/"
+    "https://gamefaqs.gamespot.com/psp/637157-digimon-world-redigitize/faqs/64658"
+)
 
 LISTAGEM = """
 <html><body>
@@ -130,6 +134,19 @@ class TestUrls:
         assert gamefaqs.is_faq_url(f"{BASE}/38057")
         assert not gamefaqs.is_faq_url(BASE)
 
+    def test_aceita_captura_do_web_archive_e_preserva_o_alvo(self):
+        info = gamefaqs.describe_url(ARCHIVE_BASE)
+        assert gamefaqs.is_faq_url(ARCHIVE_BASE)
+        assert info["archived"] is True
+        assert info["archive_timestamp"] == "20181001160703"
+        assert info["canonical_url"].endswith("/faqs/64658")
+
+    def test_recusa_captura_do_web_archive_de_outro_site(self):
+        with pytest.raises(gamefaqs.GameFAQsError, match="precisa apontar"):
+            gamefaqs.normalize_url(
+                "https://web.archive.org/web/20181001160703/https://example.com/faq/1"
+            )
+
 
 # ---------------------------------------------------------------------------- #
 # Parsing
@@ -209,6 +226,15 @@ class TestParsingConteudo:
 
     def test_titulo_ausente_devolve_vazio(self):
         assert gamefaqs.parse_faq_title("<html><body>x</body></html>") == ""
+
+    def test_titulo_da_captura_prefere_o_nome_do_faq(self):
+        html = """
+        <html><head><title>Digimon World Re:Digitize Digivolution Guide for PSP by Molivious - GameFAQs</title></head>
+        <body><h1 class="page-title">Digimon World Re:Digitize – Guides and FAQs</h1></body></html>
+        """
+        assert gamefaqs.parse_faq_title(html) == (
+            "Digimon World Re:Digitize Digivolution Guide for PSP by Molivious"
+        )
 
 
 class TestPaginacao:
@@ -333,6 +359,25 @@ class TestStructuredDocument:
         assert faq["stats"]["table_rows"] == 2
         assert "| Evolution | Weight |" in faq["markdown"]
         assert faq["page_records"][0]["html"] == html
+
+    def test_baixa_captura_do_web_archive_e_monta_a_proxima_pagina(self):
+        body = "conteudo arquivado do guia. " * 35
+        first = f"""
+        <html><head><title>Digimon World Re:Digitize Digivolution Guide for PSP by Molivious - GameFAQs</title></head>
+        <body><h1 class="page-title">Digimon World Re:Digitize – Guides and FAQs</h1>
+        <div id="faqwrap"><h2>Agumon</h2><table><tr><th>Evolution</th><th>Weight</th></tr>
+        <tr><td>Greymon</td><td>25 or more</td></tr></table><p>{body}</p>
+        <a href="?page=1">Page 2</a><p>Page 1 of 2</p></div></body></html>
+        """
+        second = f'<div id="faqwrap"><h2>Notes</h2><p>Page 2 of 2 {body}</p></div>'
+        session = FakeSession({"?page=1": FakeResponse(second), ARCHIVE_BASE: FakeResponse(first)})
+        faq = gamefaqs.fetch_faq(session, ARCHIVE_BASE)
+        assert faq["title"].endswith("by Molivious")
+        assert faq["pages"] == 2
+        assert session.pedidos == [ARCHIVE_BASE, ARCHIVE_BASE + "?page=1"]
+        assert faq["page_records"][1]["url"] == ARCHIVE_BASE + "?page=1"
+        assert faq["source"]["archived"] is True
+        assert faq["source"]["canonical_url"].endswith("/faqs/64658")
 
 
 class TestErrosDeRede:

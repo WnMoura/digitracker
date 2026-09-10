@@ -1495,9 +1495,11 @@ class Api(ExperienceApi, DataToolsApi):
             parsed, self.pending_import["achievements_meta"], text
         )
         # guardado para o refino por IA, que reusa o mesmo texto sem rebaixar
-        self.last_faq = {"title": faq["title"], "text": text, "url": url}
+        self.last_faq = {"title": faq["title"], "text": text, "url": url,
+                         "source": copy.deepcopy(faq.get("source") or {})}
         self.pending_import["guide_source"] = {
             "source": "gamefaqs", "filename": faq["title"], "url": url,
+            "capture": copy.deepcopy(faq.get("source") or {}),
         }
 
         order["ok"] = True
@@ -1524,7 +1526,8 @@ class Api(ExperienceApi, DataToolsApi):
         if not sections:
             return {"ok": False, "error": "Não consegui extrair seções desse guia."}
 
-        self.last_faq = {"title": faq["title"], "text": faq["text"], "url": url}
+        self.last_faq = {"title": faq["title"], "text": faq["text"], "url": url,
+                         "source": copy.deepcopy(faq.get("source") or {})}
         game["guide"] = sections
         (GAMES_DIR / f"{slug}.json").write_text(
             json.dumps(game, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1537,6 +1540,7 @@ class Api(ExperienceApi, DataToolsApi):
             self._sync_game(game)
         self._capture_smart_source(game, {
             "source": "gamefaqs", "filename": faq["title"], "url": url,
+            "capture": copy.deepcopy(faq.get("source") or {}),
         })
         return {"ok": True, "sections": len(sections), "filename": faq["title"]}
 
@@ -1967,7 +1971,8 @@ class Api(ExperienceApi, DataToolsApi):
             source = self._guides.add_walkthrough_source(
                 slug, faq.get("title") or "GameFAQs", "gamefaqs",
                 parsed.get("sections") or [],
-                {"filename": faq.get("title") or "", "url": url},
+                {"filename": faq.get("title") or "", "url": url,
+                 "capture": copy.deepcopy(faq.get("source") or {})},
                 text=faq.get("text") or "",
             )
             return {"ok": True, "source": source, "duplicate": bool(source.get("duplicate")),
@@ -2556,6 +2561,7 @@ class Api(ExperienceApi, DataToolsApi):
         return {
             "schema_version": getattr(gamefaqs, "STRUCTURED_SCHEMA_VERSION", 1),
             "format": "gamefaqs-json-v1",
+            "source": copy.deepcopy(faq.get("source") or {}),
             "pages": copy.deepcopy(documents),
             "stats": copy.deepcopy(faq.get("stats") or {}),
             "edition_signals": list(faq.get("edition_signals") or []),
@@ -2635,6 +2641,7 @@ class Api(ExperienceApi, DataToolsApi):
             "headings": headings,
             "edition_signals": signals,
             "edition_warning": warning,
+            "capture": copy.deepcopy(metadata.get("capture") or {}),
             "markdown": source.get("markdown", ""),
             "selection": {"table_ids": [t["id"] for t in tables if t.get("selected")]},
         }
@@ -2652,7 +2659,8 @@ class Api(ExperienceApi, DataToolsApi):
                 slug, title or faq.get("title") or "Sistema visual", "gamefaqs",
                 self._atlas_faq_sections(faq), {"filename": faq.get("title") or "", "url": url,
                     "pages": faq.get('pages', 1), "page_urls": [p['url'] for p in faq.get('page_records') or []],
-                    "source_format": "gamefaqs-json-v1"},
+                    "source_format": "gamefaqs-json-v1",
+                    "capture": copy.deepcopy(faq.get("source") or {})},
                 text=faq.get("text") or "",
                 structured=self._atlas_faq_structured(faq),
                 markdown=faq.get("markdown") or "",
@@ -2719,7 +2727,8 @@ class Api(ExperienceApi, DataToolsApi):
                     slug, title, "gamefaqs", self._atlas_faq_sections(faq),
                     {"filename": faq.get("title") or "", "url": url, "pages": faq.get('pages', 1),
                      "page_urls": [p['url'] for p in faq.get('page_records') or []],
-                     "source_format": "gamefaqs-json-v1"},
+                     "source_format": "gamefaqs-json-v1",
+                     "capture": copy.deepcopy(faq.get("source") or {})},
                     text=faq.get("text") or "",
                     structured=self._atlas_faq_structured(faq),
                     markdown=faq.get("markdown") or "",

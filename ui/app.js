@@ -2114,8 +2114,8 @@ function openAtlasSourceWizard(replaceSystem = null) {
   modal.innerHTML = `<div class="atlas-source-wizard" role="dialog" aria-modal="true" aria-label="Nova fonte exclusiva do Atlas">
     <header><div><span>ATLAS / ${replaceSystem ? "TROCAR FONTE" : "NOVO SISTEMA"}</span><h2>${replaceSystem ? "Escolha a nova fonte exclusiva" : "Qual estrutura deseja mapear?"}</h2><p>A fonte anterior continuará no histórico de revisões.</p></div><button id="atlas-source-close">×</button></header>
     <label>Nome do sistema<input id="atlas-source-title" value="${esc(replaceSystem?.title || "")}" placeholder="Ex.: Árvore de habilidades, crafting, relacionamentos"></label>
-    <div class="atlas-source-options"><button id="atlas-source-pdf"><span>▤</span><b>Importar PDF</b><small>Analisa texto, relações e requisitos deste arquivo.</small></button><button id="atlas-source-gamefaqs"><span>◎</span><b>Usar GameFAQs</b><small>Cole o endereço direto de um guia.</small></button></div>
-    <div class="atlas-source-url" id="atlas-source-url-row" hidden><input id="atlas-source-url" placeholder="https://gamefaqs.gamespot.com/..."><button id="atlas-source-url-submit">Analisar guia</button></div>
+    <div class="atlas-source-options"><button id="atlas-source-pdf"><span>▤</span><b>Importar PDF</b><small>Analisa texto, relações e requisitos deste arquivo.</small></button><button id="atlas-source-gamefaqs"><span>◎</span><b>Usar GameFAQs / Web Archive</b><small>Cole o endereço direto ou uma captura arquivada.</small></button></div>
+    <div class="atlas-source-url" id="atlas-source-url-row" hidden><input id="atlas-source-url" placeholder="https://gamefaqs.gamespot.com/... ou https://web.archive.org/web/..."><button id="atlas-source-url-submit">Analisar guia</button></div>
     <p class="atlas-source-foot">A IA não poderá inventar relações ausentes. Fontes longas serão processadas em vários lotes e podem gerar custo no provedor. Sem IA configurada, a fonte será anexada ao editor manual.</p>
   </div>`;
   document.body.appendChild(modal);
@@ -2199,6 +2199,8 @@ async function viewAtlasSource(systemId, nodeId = "") {
   if (!result?.ok) return toast(result?.error || "Fonte não encontrada.", true);
   const source = result.source || {};
   const review = source.id ? await backend.atlasSourceReview(S.activeSlug, source.id).catch(() => ({ ok: false })) : { ok: false };
+  const capture = source.metadata?.capture || review.review?.capture || {};
+  const sourceLinkLabel = capture.archived ? "Abrir captura do Web Archive" : "Abrir GameFAQs";
   const system = atlasSystems(S.dashboardGame || {}).find((item) => item.id === systemId);
   const node = system?.nodes?.find((item) => item.id === nodeId);
   const refs = new Set((node?.source_refs || []).map((ref) => `${ref.section}:${ref.block}`));
@@ -2209,7 +2211,7 @@ async function viewAtlasSource(systemId, nodeId = "") {
     const locator = [`p. ${item.table.page}`, ref.section || ref.block ? `§${ref.section || 0}.${ref.block || 0}` : "", rowNumber > 0 ? `linha ${rowNumber}` : "", item.table.id ? `tabela ${item.table.id}` : ""].filter(Boolean).join(" · ");
     return `<div class="atlas-source-excerpt-row"><small>${esc(locator)} · ${esc(item.table.title || "Tabela")}</small><span>${esc((item.cells || []).join(" | "))}</span></div>`;
   }).join("");
-  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="atlas-source-view"><div class="gf-panel atlas-source-view"><h3>Fonte exclusiva do Atlas</h3><p><b>${esc(source.title || "Fonte do sistema")}</b></p><dl><div><dt>Tipo</dt><dd>${esc(source.kind || "legacy")}</dd></div><div><dt>Arquivo</dt><dd>${esc(source.filename || "—")}</dd></div><div><dt>URL</dt><dd>${source.url ? `<a href="${esc(source.url)}" target="_blank" rel="noreferrer">Abrir GameFAQs</a>` : "—"}</dd></div>${source.metadata?.pages ? `<div><dt>Páginas importadas</dt><dd>${esc(source.metadata.pages)}</dd></div>` : ""}</dl>${excerpt ? `<h4>Trechos referenciados</h4><div class="atlas-source-excerpts">${excerpt}</div>` : `<p>Esta fonte não contém um trecho estruturado para o nó selecionado.</p>`}<button class="btn-primary" id="atlas-source-view-close">Fechar</button></div></div>`);
+  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="atlas-source-view"><div class="gf-panel atlas-source-view"><h3>Fonte exclusiva do Atlas</h3><p><b>${esc(source.title || "Fonte do sistema")}</b></p><dl><div><dt>Tipo</dt><dd>${esc(source.kind || "legacy")}</dd></div><div><dt>Arquivo</dt><dd>${esc(source.filename || "—")}</dd></div><div><dt>Origem</dt><dd>${capture.archived ? "Web Archive · captura " + esc(capture.archive_timestamp || "") : "GameFAQs"}</dd></div><div><dt>URL</dt><dd>${source.url ? `<a href="${esc(source.url)}" target="_blank" rel="noreferrer">${sourceLinkLabel}</a>` : "—"}</dd></div>${source.metadata?.pages ? `<div><dt>Páginas importadas</dt><dd>${esc(source.metadata.pages)}</dd></div>` : ""}</dl>${excerpt ? `<h4>Trechos referenciados</h4><div class="atlas-source-excerpts">${excerpt}</div>` : `<p>Esta fonte não contém um trecho estruturado para o nó selecionado.</p>`}<button class="btn-primary" id="atlas-source-view-close">Fechar</button></div></div>`);
   $("#atlas-source-view-close").onclick = () => $("#atlas-source-view")?.remove();
 }
 
@@ -2754,7 +2756,7 @@ async function refreshGuideSources(slug = S.activeSlug) {
 function openGuideSourceDialog(kind) {
   $("#guide-source-dialog")?.remove();
   const game = S.library.find((item) => item.slug === S.activeSlug) || S.dashboardGame || {};
-  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="guide-source-dialog"><div class="gf-panel guide-source-dialog"><h3>${kind === "gamefaqs" ? "Adicionar GameFAQs" : "Adicionar texto"}</h3><p>Fonte para a Jornada de <b>${esc(game.title || "jogo atual")}</b>.</p><label>Título<input id="guide-source-dialog-title" placeholder="Nome que identifica esta fonte"></label>${kind === "gamefaqs" ? `<label>URL direta do guia<input id="guide-source-dialog-value" placeholder="https://gamefaqs.gamespot.com/..."></label>` : `<label>Conteúdo<textarea id="guide-source-dialog-value" placeholder="Cole o guia completo aqui"></textarea></label>`}<div class="settings-pending-actions"><button class="btn-primary" id="guide-source-dialog-save">Adicionar fonte</button><button class="btn-ghost" id="guide-source-dialog-close">Cancelar</button></div></div></div>`);
+  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="guide-source-dialog"><div class="gf-panel guide-source-dialog"><h3>${kind === "gamefaqs" ? "Adicionar GameFAQs / Web Archive" : "Adicionar texto"}</h3><p>Fonte para a Jornada de <b>${esc(game.title || "jogo atual")}</b>.</p><label>Título<input id="guide-source-dialog-title" placeholder="Nome que identifica esta fonte"></label>${kind === "gamefaqs" ? `<label>URL direta do guia<input id="guide-source-dialog-value" placeholder="https://gamefaqs.gamespot.com/... ou https://web.archive.org/web/..."></label>` : `<label>Conteúdo<textarea id="guide-source-dialog-value" placeholder="Cole o guia completo aqui"></textarea></label>`}<div class="settings-pending-actions"><button class="btn-primary" id="guide-source-dialog-save">Adicionar fonte</button><button class="btn-ghost" id="guide-source-dialog-close">Cancelar</button></div></div></div>`);
   $("#guide-source-dialog-close").onclick = () => $("#guide-source-dialog")?.remove();
   $("#guide-source-dialog-save").onclick = async () => {
     const title = ($("#guide-source-dialog-title")?.value || "").trim();
@@ -3301,14 +3303,14 @@ function renderGameFaqs() {
       ${G.error ? `<div class="gf-error">${esc(G.error)}</div>` : ""}
 
       ${G.step === "url" && !G.busy ? `
-        <p class="gf-lead">Cole o endereço da aba <b>FAQs/Guides</b> do jogo — ou de um guia específico.</p>
+        <p class="gf-lead">Cole o endereço da aba <b>FAQs/Guides</b> do jogo, de um guia específico ou de uma captura do Web Archive.</p>
         <div class="search-box">
           <span style="color:var(--text-low)">🔗</span>
-          <input id="gf-url" placeholder="https://gamefaqs.gamespot.com/ps2/580782-digimon-world-4/faqs"
+          <input id="gf-url" placeholder="https://gamefaqs.gamespot.com/... ou https://web.archive.org/web/..."
                  aria-label="URL do jogo ou guia no GameFAQs"
                  autocomplete="off" spellcheck="false" value="${esc(G.url)}" />
         </div>
-        <p class="gf-note">O GameFAQs limita a velocidade de acesso: listar leva alguns segundos e baixar um guia grande pode levar um minuto.</p>
+        <p class="gf-note">O GameFAQs limita a velocidade de acesso. Capturas do Web Archive mantêm a edição e a paginação originais.</p>
       ` : ""}
 
       ${G.step === "list" && !G.busy ? `

@@ -23,9 +23,10 @@ import random
 import re
 import time
 import hashlib
-from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse, unquote
 
 HOST = "gamefaqs.gamespot.com"
+ARCHIVE_HOST = "web.archive.org"
 
 # Uma página de FAQ formatado é paginada; sem teto, um guia gigante viraria
 # dezenas de requisições.
@@ -71,24 +72,108 @@ def create_session():
 # URLs
 # ---------------------------------------------------------------------------- #
 _FAQ_LINK_RE = re.compile(r"/faqs/(\d+)")
+_WAYBACK_RE = re.compile(
+    r"^/web/(?P<timestamp>\d{6,14})(?P<modifier>[A-Za-z0-9_-]*)/"
+    r"(?P<target>https?://.+)$",
+    re.IGNORECASE,
+)
+
+
+def _is_gamefaqs_host(host: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    return host == HOST or host.endswith("." + HOST)
+
+
+def _wayback_info(url: str) -> dict | None:
+    """Extrai a captura e o alvo original de uma URL do Web Archive.
+
+    O Wayback coloca a URL original no caminho, então o ``?page=`` da página
+    arquivada vira a query externa da captura. Ela é anexada ao alvo antes de
+    montarmos a próxima página. Apenas capturas que apontam para o GameFAQs
+    são aceitas; isso evita transformar o importador em um proxy genérico.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host != ARCHIVE_HOST:
+        return None
+    match = _WAYBACK_RE.match(parsed.path or "")
+    if not match:
+        raise GameFAQsError(
+            "Essa URL do Web Archive não contém uma captura válida do GameFAQs."
+        )
+    target = unquote(match.group("target"))
+    target_parts = urlparse(target)
+    if parsed.query:
+        merged = parse_qsl(target_parts.query, keep_blank_values=True)
+        merged.extend(parse_qsl(parsed.query, keep_blank_values=True))
+        target_parts = target_parts._replace(query=urlencode(merged))
+    target_parts = target_parts._replace(fragment="")
+    if not _is_gamefaqs_host(target_parts.hostname or ""):
+        raise GameFAQsError(
+            "A captura do Web Archive precisa apontar para um guia do GameFAQs."
+        )
+    return {
+        "url": url,
+        "host": host,
+        "timestamp": match.group("timestamp"),
+        "modifier": match.group("modifier"),
+        "target_url": urlunparse(target_parts),
+    }
+
+
+def _wayback_url(info: dict, target_url: str) -> str:
+    target = urlunparse(urlparse(target_url)._replace(fragment=""))
+    return "https://{host}/web/{timestamp}{modifier}/{target}".format(
+        host=info["host"], timestamp=info["timestamp"],
+        modifier=info.get("modifier") or "", target=target,
+    )
+
+
+def describe_url(url: str) -> dict:
+    """Descreve a origem sem perder a URL arquivada nem o alvo original."""
+    normalized = normalize_url(url)
+    archive = _wayback_info(normalized)
+    if archive:
+        return {
+            "url": normalized,
+            "provider": "gamefaqs",
+            "archived": True,
+            "archive_host": archive["host"],
+            "archive_timestamp": archive["timestamp"],
+            "archive_modifier": archive.get("modifier") or "",
+            "canonical_url": archive["target_url"],
+        }
+    return {
+        "url": normalized,
+        "provider": "gamefaqs",
+        "archived": False,
+        "canonical_url": normalized,
+    }
 
 
 def normalize_url(url: str) -> str:
-    """Aceita a URL colada pelo usuário e valida que é do GameFAQs."""
+    """Aceita GameFAQs direto ou uma captura do Web Archive do GameFAQs."""
     url = (url or "").strip()
     if not url:
         raise GameFAQsError("Cole a URL do jogo ou do guia no GameFAQs.")
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     host = (urlparse(url).hostname or "").lower()
-    if host != HOST and not host.endswith('.' + HOST):
-        raise GameFAQsError("Essa URL não é do GameFAQs (gamefaqs.gamespot.com).")
+    if host == ARCHIVE_HOST:
+        _wayback_info(url)
+        return url
+    if not _is_gamefaqs_host(host):
+        raise GameFAQsError(
+            "Essa URL não é do GameFAQs (gamefaqs.gamespot.com) nem uma captura válida do Web Archive."
+        )
     return url
 
 
 def is_faq_url(url: str) -> bool:
     """`/faqs/12345` é um guia específico; `/faqs` é a lista de guias."""
-    return bool(_FAQ_LINK_RE.search(urlparse(url).path or ""))
+    archive = _wayback_info(url)
+    target = archive["target_url"] if archive else url
+    return bool(_FAQ_LINK_RE.search(urlparse(target).path or ""))
 
 
 # ---------------------------------------------------------------------------- #
@@ -527,12 +612,20 @@ def parse_page_count(html: str, *, strict: bool = False) -> int:
 
 def parse_faq_title(html: str) -> str:
     soup = _soup(html)
-    for sel in ("h1.page-title", "h1", "title"):
-        node = soup.select_one(sel)
-        if node:
-            text = " ".join(node.get_text(" ", strip=True).split())
-            if text:
-                return text
+    heading = soup.select_one("h1.page-title") or soup.select_one("h1")
+    title_node = soup.select_one("title")
+    heading_text = " ".join(heading.get_text(" ", strip=True).split()) if heading else ""
+    title_text = " ".join(title_node.get_text(" ", strip=True).split()) if title_node else ""
+    # A captura arquivada repete o título da página do jogo no h1
+    # ("... — Guides and FAQs"), enquanto o <title> preserva o nome do FAQ.
+    if heading_text and re.search(r"guides?\s+and\s+faqs?$", heading_text, re.IGNORECASE):
+        cleaned = re.split(r"\s+[-|]\s+GameFAQs\b", title_text,
+                           maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        if cleaned:
+            return cleaned
+    for text in (heading_text, title_text):
+        if text:
+            return text
     return ""
 
 
@@ -580,12 +673,22 @@ def list_faqs(session, url: str) -> list[dict]:
 
 def fetch_faq(session, url: str, on_progress=None) -> dict:
     """Baixa o guia inteiro e preserva uma captura estruturada por página."""
-    url = normalize_url(url)
-    parsed = urlparse(url)
-    query = [(k, v) for k, v in parse_qsl(parsed.query) if k != 'page']
-    url = urlunparse(parsed._replace(query=urlencode(query), fragment=''))
+    source_url = normalize_url(url)
+    archive = _wayback_info(source_url)
+    target_url = archive["target_url"] if archive else source_url
+    parsed = urlparse(target_url)
+    query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k != 'page']
+
+    def wrapped(target: str) -> str:
+        return _wayback_url(archive, target) if archive else target
+
+    url = wrapped(urlunparse(parsed._replace(query=urlencode(query), fragment='')))
+
     def page_url(page):
-        return urlunparse(parsed._replace(query=urlencode(query + [('page', str(page))]), fragment=''))
+        target = urlunparse(parsed._replace(
+            query=urlencode(query + [('page', str(page))]), fragment=''))
+        return wrapped(target)
+
     first = _get(session, url)
     title = parse_faq_title(first)
     parts = [parse_faq_content(first)]
@@ -657,5 +760,6 @@ def fetch_faq(session, url: str, on_progress=None) -> dict:
             for document in documents
             for signal in document.get("edition_signals", [])
         }),
+        "source": describe_url(source_url),
         "complete": True,
     }

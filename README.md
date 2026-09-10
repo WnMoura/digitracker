@@ -143,6 +143,13 @@ minuto. A ordenação reaproveita o mesmo casamento do fluxo de PDF: nome exato 
 sem sufixo → aproximado → posição no texto. O que não casar continua no pool
 manual: **nada é perdido**.
 
+Guias que só existem em uma captura do [Web Archive](https://web.archive.org/)
+também são aceitos: cole a URL completa da captura. O importador valida que o
+alvo original é do GameFAQs, mantém a data da captura, percorre as páginas
+arquivadas e guarda a URL original junto do JSON estruturado. Assim a revisão
+do Atlas consegue abrir a mesma edição arquivada sem tratar o Web Archive como
+uma fonte diferente.
+
 > Uso pessoal e em volume baixo. O texto dos guias é de autoria de quem os
 > escreveu — fica no seu `config/games/{slug}.json`, não é para redistribuir.
 
