@@ -172,6 +172,26 @@ def test_valida_duplicados_referencias_e_limites():
         smart_guide.validate_document({**doc, "systems": [oversized]})
 
 
+def test_aceita_rotas_alternativas_entre_os_mesmos_nos():
+    doc = smart_guide.from_legacy_sections("Jogo", SECTIONS)
+    system = _system()
+    system["edges"].append({
+        **system["edges"][0],
+        "id": "",
+        "label": "Avançar por outra rota",
+        "path_kind": "alternative",
+        "requirements": [{"id": "", "text": "Usar a chave especial"}],
+    })
+    clean = smart_guide.validate_document({**doc, "systems": [system]})["systems"][0]
+    assert len(clean["edges"]) == 2
+    assert {edge["path_kind"] for edge in clean["edges"]} == {"normal", "alternative"}
+
+    duplicate = _system()
+    duplicate["edges"].append({**duplicate["edges"][0], "id": ""})
+    with pytest.raises(smart_guide.SmartGuideError, match="Relação duplicada"):
+        smart_guide.validate_document({**doc, "systems": [duplicate]})
+
+
 def test_aceita_ciclo_multiplas_raizes_e_no_orfao():
     doc = smart_guide.from_legacy_sections("Jogo", SECTIONS)
     system = _system()

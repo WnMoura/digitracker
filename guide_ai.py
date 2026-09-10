@@ -1895,8 +1895,12 @@ def _merge_atlas_fragments(fragments: list[dict], title: str) -> dict:
                 if isinstance(item, dict) and _atlas_identity(item.get("text"))))
             # The same endpoints may have independent alternative conditions.
             # Merge only an exact path repeated in two source fragments.
+            path_kind = (raw_edge.get("path_kind")
+                         if raw_edge.get("path_kind") in {
+                             "normal", "alternative", "optional"}
+                         else "normal")
             key = (from_id, to_id, _atlas_identity(raw_edge.get("label")),
-                   requirement_signature)
+                   path_kind, requirement_signature)
             edge = edge_by_key.get(key)
             if edge is None:
                 edge = dict(raw_edge)

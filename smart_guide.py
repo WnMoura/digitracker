@@ -261,7 +261,28 @@ def _validate_systems(document: dict) -> list[dict]:
             refs = _source_refs(raw_edge.get("source_refs")) or system_refs
             if origin == "ai" and not _has_source(refs):
                 raise SmartGuideError(f"Relação sem referência de origem em {title}.")
-            edge_id = _stable_system_id("edge", raw_edge.get("id"), system_id, from_id, to_id, refs)
+            # Two documented paths may connect the same pair of nodes.  This
+            # is common for evolution/skill tables where the requirement (or
+            # the path label) changes, and it must not be mistaken for the
+            # same relation.  Keep the endpoint/source identity, but include
+            # the relation semantics in the generated id so only an actual
+            # duplicate is rejected.
+            edge_label = _clean_text(raw_edge.get("label"), 300)
+            edge_path_kind = _clean_text(raw_edge.get("path_kind"), 40)
+            if edge_path_kind not in {"normal", "alternative", "optional"}:
+                edge_path_kind = "normal"
+            requirement_texts = []
+            for item in raw_edge.get("requirements") or []:
+                value = ((item.get("text") or item.get("label"))
+                         if isinstance(item, dict) else item)
+                text = _clean_text(value, 1_000)
+                if text:
+                    requirement_texts.append(text)
+            requirement_signature = " | ".join(sorted(requirement_texts))
+            edge_id = _stable_system_id(
+                "edge", raw_edge.get("id"), system_id, from_id, to_id,
+                edge_label, edge_path_kind, requirement_signature, refs,
+            )
             if edge_id in edge_ids:
                 raise SmartGuideError(f"Relação duplicada em {title}.")
             edge_ids.add(edge_id)
@@ -281,10 +302,8 @@ def _validate_systems(document: dict) -> list[dict]:
                 })
             edges.append({
                 "id": edge_id, "from": from_id, "to": to_id,
-                "label": _clean_text(raw_edge.get("label"), 300),
-                "path_kind": (_clean_text(raw_edge.get("path_kind"), 40)
-                              if _clean_text(raw_edge.get("path_kind"), 40) in {"normal", "alternative", "optional"}
-                              else "normal"),
+                "label": edge_label,
+                "path_kind": edge_path_kind,
                 "requirements": requirements[:30],
                 "missable": bool(raw_edge.get("missable", False)),
                 "spoiler": bool(raw_edge.get("spoiler", False)),
