@@ -296,10 +296,14 @@ def _validate_systems(document: dict) -> list[dict]:
                 req_refs = _source_refs(raw_req.get("source_refs")) or refs
                 if origin == "ai" and not _has_source(req_refs):
                     raise SmartGuideError(f"Requisito sem referência de origem: {text}")
-                requirements.append({
+                requirement = {
                     "id": _stable_system_id("req", raw_req.get("id"), edge_id, ri, text, req_refs),
                     "text": text, "source_refs": req_refs,
-                })
+                }
+                for field in ("field", "operator", "value", "original", "group", "mode"):
+                    if isinstance(raw_req, dict) and raw_req.get(field) not in (None, ""):
+                        requirement[field] = _clean_text(raw_req.get(field), 300)
+                requirements.append(requirement)
             edges.append({
                 "id": edge_id, "from": from_id, "to": to_id,
                 "label": edge_label,
@@ -743,7 +747,8 @@ class SmartGuideStore:
 
     def add_system_source(self, slug: str, title: str, kind: str, sections: list,
                           metadata: dict | None = None, raw: bytes | None = None,
-                          text: str = "") -> dict:
+                          text: str = "", structured: dict | list | None = None,
+                          markdown: str = "", raw_pages: list[dict] | None = None) -> dict:
         """Registra a fonte exclusiva de um futuro sistema do Atlas."""
         sections = deepcopy(sections or [])
         if not sections:
@@ -751,8 +756,16 @@ class SmartGuideStore:
         kind = str(kind or "text").lower()
         if kind not in {"pdf", "gamefaqs", "legacy"}:
             raise SmartGuideError("O Atlas aceita PDF ou GameFAQs.")
-        raw_for_hash = raw if raw is not None else json.dumps(
-            sections, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        if raw is not None:
+            raw_for_hash = raw
+        elif structured is None:
+            # Preserve ids of pre-structured sources when they are reimported.
+            raw_for_hash = json.dumps(sections, ensure_ascii=False,
+                                      sort_keys=True).encode("utf-8")
+        else:
+            raw_for_hash = json.dumps(
+                {"sections": sections, "structured": structured}, ensure_ascii=False,
+                sort_keys=True).encode("utf-8")
         digest = hashlib.sha256(raw_for_hash).hexdigest()
         source_id = _stable_id("atlas_src", digest, title)
         path = self._path(slug, f"system_sources/{source_id}.json")
@@ -760,26 +773,53 @@ class SmartGuideStore:
         if existing:
             existing.pop("sections", None)
             existing.pop("text", None)
+            existing.pop("structured", None)
+            existing.pop("markdown", None)
             return {**existing, "duplicate": True}
+        metadata = deepcopy(metadata or {})
+        source_format = _clean_text(metadata.get("source_format") or "", 100)
         value = {
             "schema_version": SCHEMA_VERSION, "id": source_id,
             "title": _clean_text(title or "Fonte do Atlas", 500), "kind": kind,
             "hash": digest, "captured_at": _now(), "url": _clean_text(
-                (metadata or {}).get("url") or "", 2_000),
-            "filename": _clean_text((metadata or {}).get("filename") or "", 500),
-            "metadata": deepcopy(metadata or {}), "sections": sections,
+                metadata.get("url") or "", 2_000),
+            "filename": _clean_text(metadata.get("filename") or "", 500),
+            "metadata": metadata, "sections": sections,
             "text": str(text or "")[:5_000_000], "system_id": "",
         }
+        if source_format:
+            value["source_format"] = source_format
+        if structured is not None:
+            value["structured"] = deepcopy(structured)
+        if markdown:
+            value["markdown"] = str(markdown)[:10_000_000]
         if raw is not None:
             if len(raw) > 50 * 1024 * 1024:
                 raise SmartGuideError("O arquivo excede o limite de 50 MB.")
             raw_name = f"system_sources/files/{source_id}.pdf"
             _atomic_bytes(self._path(slug, raw_name), raw)
             value["raw_file"] = raw_name
+        if raw_pages:
+            raw_files = []
+            for page in raw_pages:
+                if not isinstance(page, dict):
+                    continue
+                number = max(1, _safe_int(page.get("number"), len(raw_files) + 1))
+                html = page.get("html")
+                if not isinstance(html, str) or not html:
+                    continue
+                if len(html.encode("utf-8")) > 15 * 1024 * 1024:
+                    raise SmartGuideError("Uma página do FAQ excede o limite de 15 MB.")
+                raw_name = f"system_sources/files/{source_id}-page-{number}.html"
+                _atomic_bytes(self._path(slug, raw_name), html.encode("utf-8"))
+                raw_files.append({"page": number, "path": raw_name,
+                                  "url": _clean_text(page.get("url") or "", 2_000)})
+            if raw_files:
+                value["raw_files"] = raw_files
         _atomic_json(path, value)
         return {key: value.get(key) for key in (
             "schema_version", "id", "title", "kind", "hash", "captured_at",
-            "url", "filename", "raw_file", "system_id",
+            "url", "filename", "raw_file", "raw_files", "source_format", "system_id",
         )}
 
     def system_source(self, slug: str, source_id: str, include_sections: bool = False) -> dict:
@@ -788,6 +828,8 @@ class SmartGuideStore:
         if not include_sections:
             value.pop("sections", None)
             value.pop("text", None)
+            value.pop("structured", None)
+            value.pop("markdown", None)
         return value
 
     @_serialized
@@ -799,13 +841,16 @@ class SmartGuideStore:
             raise SmartGuideError("Fonte exclusiva do Atlas não encontrada.")
         for key in ("status", "stage", "message", "error", "error_kind",
                     "error_code", "system_id", "replace_system_id", "job_id",
-                    "provider", "model"):
+                    "provider", "model", "source_format", "edition_warning"):
             if key in changes:
                 limit = 2_000 if key in {"error", "message"} else 200
                 value[key] = _clean_text(changes[key], limit)
         if "error_details" in changes:
             details = changes.get("error_details")
             value["error_details"] = deepcopy(details) if isinstance(details, dict) else {}
+        for key in ("selection", "source_review"):
+            if key in changes:
+                value[key] = deepcopy(changes[key]) if isinstance(changes[key], (dict, list)) else {}
         for key in ("analysis_done", "analysis_total", "checkpoint_count"):
             if key in changes:
                 value[key] = max(0, _safe_int(changes[key]))
@@ -870,7 +915,8 @@ class SmartGuideStore:
         validate_system_references({"systems": normalized}, source.get("sections") or [])
         draft = {"system": normalized[0], "source_id": source_id, "job_id": job_id,
                  "created_at": _now(), "base_revision": self.current(slug).get("revision_id", ""),
-                 "diagnostics": deepcopy(diagnostics or {})}
+                 "diagnostics": deepcopy(diagnostics or {}),
+                 "approval_blocked": bool((diagnostics or {}).get("pending_table_ids")),}
         _atomic_json(self._path(slug, f"atlas_drafts/{source_id}.json"), draft)
         self.update_system_source(slug, source_id, status="suggested", error="")
         return draft
@@ -881,6 +927,11 @@ class SmartGuideStore:
         draft = self.atlas_draft(slug, source_id)
         if source.get("status") != "suggested" or not draft:
             raise SmartGuideError("Não há prévia pronta para aprovação.")
+        if draft.get("approval_blocked"):
+            raise SmartGuideError(
+                "Há tabelas ou linhas pendentes de interpretação. Resolva as pendências "
+                "ou exclua explicitamente essas tabelas na revisão da fonte antes de publicar."
+            )
         system = deepcopy(candidate or draft["system"])
         system.update(source_id=source_id, status="approved")
         if source.get("replace_system_id"):
@@ -903,6 +954,8 @@ class SmartGuideStore:
             if value:
                 value.pop("sections", None)
                 value.pop("text", None)
+                value.pop("structured", None)
+                value.pop("markdown", None)
                 output.append(value)
         return output
 

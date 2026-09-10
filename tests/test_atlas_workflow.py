@@ -49,6 +49,22 @@ def test_draft_preserves_extraction_diagnostics(store):
     assert draft['diagnostics'] == {"batches": 6, "nodes": 42, "edges": 70}
 
 
+def test_source_estrutura_e_capturas_brutas_ficam_locais(tmp_path):
+    local = smart_guide.SmartGuideStore(tmp_path)
+    local.ensure_source("game", "Game", SECTIONS)
+    table = {"schema_version": 1, "format": "gamefaqs-json-v1", "pages": [], "stats": {"tables": 1}}
+    saved = local.add_system_source(
+        "game", "FAQ", "gamefaqs", SECTIONS,
+        {"url": "https://gamefaqs.gamespot.com/psp/1/faqs/2", "source_format": "gamefaqs-json-v1"},
+        structured=table, markdown="# FAQ\n", raw_pages=[{"number": 1, "url": "https://example.test", "html": "<p>local</p>"}],
+    )
+    full = local.system_source("game", saved["id"], include_sections=True)
+    assert full["structured"]["format"] == "gamefaqs-json-v1"
+    assert full["markdown"].startswith("# FAQ")
+    assert full["raw_files"][0]["path"].endswith("page-1.html")
+    assert local.system_source("game", saved["id"])["id"] == saved["id"]
+
+
 def test_cancelled_draft_cannot_accept_media(store):
     sid = pending(store)
     draft = store.save_atlas_draft('game', sid, system(), 'job1')
@@ -65,6 +81,13 @@ def test_draft_does_not_publish_and_approval_does(store):
     assert store.system_source("game", sid)["status"] == "suggested"
     store.approve_atlas_draft("game", sid)
     assert store.current("game")["systems"][0]["status"] == "approved"
+
+
+def test_pendencia_de_extracao_bloqueia_aprovacao(store):
+    sid = pending(store)
+    store.save_atlas_draft("game", sid, system(), "job1", {"pending_table_ids": ["p001-e0001"]})
+    with pytest.raises(smart_guide.SmartGuideError, match="pendentes"):
+        store.approve_atlas_draft("game", sid)
 
 
 def test_cancelled_and_old_workers_cannot_publish(store):
@@ -305,6 +328,55 @@ def test_checkpoint_is_invalidated_when_model_changes(monkeypatch):
         checkpoint=checkpoint)
     assert len(calls) == result['_analysis']['batches']
     assert result['_analysis']['resumed_batches'] == 0
+
+
+def test_gamefaqs_json_mapeia_tabela_e_materializa_todas_as_linhas(monkeypatch):
+    table_id = "p001-e0001"
+    rows = [
+        {"id": f"{table_id}-r0001", "index": 0, "cells": [
+            {"tag": "th", "column": 0, "text": "Evolution", "colspan": 1, "rowspan": 1},
+            {"tag": "th", "column": 1, "text": "Weight", "colspan": 1, "rowspan": 1},
+            {"tag": "th", "column": 2, "text": "Quota", "colspan": 1, "rowspan": 1},
+        ]},
+        {"id": f"{table_id}-r0002", "index": 1, "cells": [
+            {"tag": "td", "column": 0, "text": "Greymon", "colspan": 1, "rowspan": 1},
+            {"tag": "td", "column": 1, "text": "25 or more", "colspan": 1, "rowspan": 1},
+            {"tag": "td", "column": 2, "text": "3", "colspan": 1, "rowspan": 1},
+        ]},
+        {"id": f"{table_id}-r0003", "index": 2, "cells": [
+            {"tag": "td", "column": 0, "text": "Tyrannomon", "colspan": 1, "rowspan": 1},
+            {"tag": "td", "column": 1, "text": "25 or more", "colspan": 1, "rowspan": 1},
+            {"tag": "td", "column": 2, "text": "3", "colspan": 1, "rowspan": 1},
+        ]},
+    ]
+    source = {
+        "id": "source-structured", "hash": "hash", "source_format": "gamefaqs-json-v1",
+        "selection": {"table_ids": [table_id]},
+        "sections": [{"title": "Página 1", "page": 1, "blocks": [
+            {"table_id": table_id, "row_id": row["id"], "text": " | ".join(c["text"] for c in row["cells"]), "page": 1}
+            for row in rows
+        ]}],
+        "structured": {"format": "gamefaqs-json-v1", "pages": [{"page": 1, "elements": [{
+            "id": table_id, "type": "table", "title": "Agumon", "path": ["Rookie Digimon", "Agumon"],
+            "headers": [{"text": "Evolution", "column": 0}, {"text": "Weight", "column": 1}, {"text": "Quota", "column": 2}],
+            "columns": 3, "rows": rows,
+        }]}]},
+    }
+    provider = guide_ai.DEFAULT_PROVIDER
+    monkeypatch.setitem(guide_ai._CALLERS, provider, lambda *_args: {"tables": [{
+        "table_id": table_id, "kind": "evolution", "source_column": -1, "target_column": 0,
+        "condition_columns": [1, 2], "source_from_context": True, "target_from_context": False,
+        "confidence": 1, "note": "",
+    }]})
+    result = guide_ai.generate_system_from_source(
+        source, "Evoluções", {"title": "Digimon"},
+        {"provider": provider, "api_key": "test", "model": "model-a"})
+    assert {node["label"] for node in result["nodes"]} == {"Agumon", "Greymon", "Tyrannomon"}
+    assert len(result["edges"]) == 2
+    requirements = result["edges"][0]["requirements"]
+    assert {item["field"] for item in requirements} == {"Weight", "Quota"}
+    assert next(item for item in requirements if item["field"] == "Quota")["operator"] == "unknown"
+    assert result["_analysis"]["audited_rows"] == 2
 
 
 def test_atlas_checkpoint_is_atomic_and_owned_by_active_worker(tmp_path):

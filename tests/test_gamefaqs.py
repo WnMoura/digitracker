@@ -257,7 +257,8 @@ class TestListFaqs:
 class TestFetchFaq:
     def test_middle_page_url_restarts_and_preserves_query(self):
         body = 'Contents of the guide. ' * 40
-        s = FakeSession({'71975': FakeResponse('<div class="faqtext">' + body + '</div><a href="?page=1">Next</a>')})
+        s = FakeSession({'page=1': FakeResponse('<div class="faqtext">Page two. ' + body + '</div>'),
+                         '71975': FakeResponse('<div class="faqtext">' + body + '</div><a href="?page=1">Next</a>')})
         faq = gamefaqs.fetch_faq(s, f'{BASE}/71975?lang=en&page=1#section')
         assert s.pedidos == [f'{BASE}/71975?lang=en', f'{BASE}/71975?lang=en&page=1']
         assert faq['pages'] == 2
@@ -284,7 +285,8 @@ class TestFetchFaq:
     def test_avisa_o_progresso_das_paginas(self):
         corpo = "texto suficiente para passar do minimo. " * 20
         s = FakeSession({
-            "page=": FakeResponse(f'<div class="faqtext">{corpo}</div>'),
+            "page=1": FakeResponse(f'<div class="faqtext">PAGINA2 {corpo}</div>'),
+            "page=2": FakeResponse(f'<div class="faqtext">PAGINA3 {corpo}</div>'),
             "37854": FakeResponse(PAGINADO.replace("pagina 1", corpo)),
         })
         vistos = []
@@ -295,6 +297,42 @@ class TestFetchFaq:
         s = FakeSession({"38057": FakeResponse('<div class="faqtext">oi</div>')})
         with pytest.raises(gamefaqs.GameFAQsError, match="sem o texto do guia"):
             gamefaqs.fetch_faq(s, f"{BASE}/38057")
+
+    def test_repeticao_de_pagina_nao_e_salva(self):
+        corpo = "texto suficiente para passar do minimo. " * 20
+        first = f'<div class="faqtext">PAGINA {corpo}</div><a href="?page=1">2</a>'
+        second = f'<div class="faqtext">PAGINA {corpo}</div>'
+        with pytest.raises(gamefaqs.GameFAQsError, match="repetiu uma página"):
+            gamefaqs.fetch_faq(FakeSession({"71975": FakeResponse(first), "page=1": FakeResponse(second)}), f"{BASE}/71975")
+
+
+class TestStructuredDocument:
+    def test_preserva_hierarquia_tabela_links_e_celulas_mescladas(self):
+        html = '''<html><head><title>Guide</title></head><body><nav>menu</nav>
+        <div id="faqwrap"><h2>Table of Contents</h2><a href="#skip">Skip</a>
+        <h2>Rookie Digimon</h2><h3 id="agumon">Agumon</h3>
+        <p>Evolves from <a href="/psp/foo">Koromon</a></p>
+        <table><tr><th>Evolution</th><th>Weight</th></tr>
+        <tr><td rowspan="2">Greymon</td><td>25 or more</td></tr>
+        <tr><td>30</td></tr></table></div></body></html>'''
+        document = gamefaqs.parse_faq_document(html, page_number=1, url=BASE + "/1")
+        assert document["stats"] == {"elements": 4, "headings": 2, "tables": 1, "table_rows": 3, "images": 0}
+        assert [item["title"] for item in document["elements"] if item["type"] == "heading"] == ["Rookie Digimon", "Agumon"]
+        table = next(item for item in document["elements"] if item["type"] == "table")
+        assert table["path"] == ["Rookie Digimon", "Agumon"]
+        assert table["rows"][1]["cells"][0]["rowspan"] == 2
+        assert table["rows"][2]["cells"][0]["column"] == 1
+        assert table["rows"][1]["cells"][1]["links"] == []
+        assert document["elements"][2]["links"][0]["href"].endswith("/psp/foo")
+
+    def test_fetch_faq_guarda_documento_markdown_html_e_contagem(self):
+        body = "conteudo editorial. " * 40
+        html = f'<div class="faqtext"><h2>Evolution</h2><table><tr><th>Evolution</th><th>Weight</th></tr><tr><td>Greymon</td><td>25</td></tr></table><p>{body}</p></div>'
+        faq = gamefaqs.fetch_faq(FakeSession({"38057": FakeResponse(html)}), f"{BASE}/38057")
+        assert faq["structured_pages"][0]["stats"]["tables"] == 1
+        assert faq["stats"]["table_rows"] == 2
+        assert "| Evolution | Weight |" in faq["markdown"]
+        assert faq["page_records"][0]["html"] == html
 
 
 class TestErrosDeRede:

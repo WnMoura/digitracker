@@ -2255,12 +2255,31 @@ class Api(ExperienceApi, DataToolsApi):
         }
 
     def _queue_atlas_source(self, slug: str, source: dict, title: str,
-                            replace_system_id: str = "") -> dict:
+                            replace_system_id: str = "", *, start: bool = True,
+                            selection: dict | None = None) -> dict:
+        if not start:
+            review = self._atlas_source_review(
+                self._guides.system_source(slug, source["id"], include_sections=True))
+            selected = selection if isinstance(selection, dict) else review.get("selection") or {}
+            saved = self._guides.update_system_source(
+                slug, source["id"], status="awaiting_source_review", error="",
+                replace_system_id=replace_system_id, selection=selected,
+                source_review={"version": review.get("schema_version", 1),
+                               "table_count": len(review.get("tables") or []),
+                               "selected_count": len(selected.get("table_ids") or [])})
+            review["selection"] = {
+                "table_ids": list(selected.get("table_ids") or [])
+            }
+            self._refresh_smart_bundle(slug)
+            return {"ok": True, "phase": "awaiting_source_review", "source": saved,
+                    "review": review,
+                    "message": "Revise a captura estruturada antes de iniciar a análise."}
         if not (self.settings.get("smart_guide_consent", False) and self._ai_key()):
             phase = "awaiting_configuration" if not self._ai_key() else "awaiting_consent"
             saved = self._guides.update_system_source(
                 slug, source["id"], status=phase, error="",
-                replace_system_id=replace_system_id)
+                replace_system_id=replace_system_id,
+                selection=selection or source.get("selection") or {})
             self._refresh_smart_bundle(slug)
             return {"ok": True, "phase": phase, "source": saved,
                     "message": "Fonte salva. Configure a IA ou use o editor manual."}
@@ -2285,6 +2304,7 @@ class Api(ExperienceApi, DataToolsApi):
             self._atlas_ai_status[f"{slug}:{source['id']}"] = task
             self._guides.update_system_source(slug, source["id"], status="running", error="",
                                               job_id=job_id, replace_system_id=replace_system_id,
+                                              selection=selection or source.get("selection") or {},
                                               analysis_done=0, analysis_total=0,
                                               checkpoint_count=checkpoint_count,
                                               stage="queued", message=task["message"],
@@ -2293,7 +2313,7 @@ class Api(ExperienceApi, DataToolsApi):
         self._refresh_smart_bundle(slug)
         threading.Thread(target=self._atlas_source_worker,
                          args=(slug, source["id"], title, replace_system_id, job_id), daemon=True).start()
-        return {**task, "source": source}
+        return {**task, "source": self._guides.system_source(slug, source["id"])}
 
     def _atlas_source_worker(self, slug: str, source_id: str, title: str,
                              replace_system_id: str = "", job_id: str = "") -> None:
@@ -2378,13 +2398,54 @@ class Api(ExperienceApi, DataToolsApi):
         except smart_guide.SmartGuideError as exc:
             return {"ok": False, "error": str(exc)}
 
+    def get_atlas_source_review(self, slug: str, source_id: str) -> dict:
+        try:
+            source = self._guides.system_source(slug, source_id, include_sections=True)
+            if not source:
+                return {"ok": False, "error": "Fonte não encontrada."}
+            return {"ok": True, "source": self._guides.system_source(slug, source_id),
+                    "review": self._atlas_source_review(source),
+                    "structured": source.get("structured") or {},
+                    "markdown": source.get("markdown") or ""}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def start_atlas_source(self, slug: str, source_id: str,
+                           selection: dict | None = None) -> dict:
+        try:
+            source = self._guides.system_source(slug, source_id, include_sections=True)
+            if not source:
+                return {"ok": False, "error": "Fonte não encontrada."}
+            review = self._atlas_source_review(source)
+            available = {item.get("id") for item in review.get("tables") or []}
+            requested = selection if isinstance(selection, dict) else {}
+            table_ids = [item for item in requested.get("table_ids") or [] if item in available]
+            if isinstance(selection, dict) and "table_ids" in selection and not table_ids:
+                return {"ok": False, "error": "Selecione ao menos uma tabela para analisar."}
+            if not table_ids:
+                table_ids = [item.get("id") for item in review.get("tables") or []]
+            chosen = {"table_ids": table_ids}
+            self._guides.update_system_source(slug, source_id,
+                                              selection=chosen,
+                                              edition_warning=review.get("edition_warning") or "")
+            replace_system_id = source.get("replace_system_id") or ""
+            return self._queue_atlas_source(slug, source, source.get("title") or "Sistema visual",
+                                            replace_system_id, start=True, selection=chosen)
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+
     def retry_atlas_job(self, slug: str, source_id: str) -> dict:
         source = self.get_atlas_job(slug, source_id)
         if not source.get("ok"):
             return source
         value = source["source"]
+        if source.get("phase") == "awaiting_source_review":
+            review = self.get_atlas_source_review(slug, source_id)
+            return {**review, "phase": "awaiting_source_review", "source_id": source_id,
+                    "source": value}
         return self._queue_atlas_source(slug, value, value.get("title") or "Sistema visual",
-                                        value.get("replace_system_id") or "")
+                                        value.get("replace_system_id") or "",
+                                        selection=value.get("selection") or {})
 
     def cancel_atlas_job(self, slug: str, source_id: str) -> dict:
         try:
@@ -2429,6 +2490,53 @@ class Api(ExperienceApi, DataToolsApi):
 
     @staticmethod
     def _atlas_faq_sections(faq: dict) -> list:
+        """Converte a captura editorial em referências compatíveis.
+
+        Cada linha de tabela vira um bloco próprio. O conteúdo estruturado é
+        salvo em paralelo e usa ``table_id``/``row_id`` para a revisão; estes
+        blocos fornecem a ponte estável que o validador legado entende.
+        """
+        documents = faq.get("structured_pages") or []
+        if documents:
+            sections = []
+            for document in documents:
+                page = max(1, int(document.get("page") or 1))
+                blocks = []
+                for element in document.get("elements") or []:
+                    kind = element.get("type")
+                    path = " › ".join(element.get("path") or [])
+                    if kind == "table":
+                        rows = element.get("rows") or []
+                        for row in rows or [{}]:
+                            values = [cell.get("text", "") for cell in row.get("cells", [])]
+                            text = " | ".join(values).strip()
+                            if not text:
+                                continue
+                            blocks.append({
+                                "type": "table", "text": text,
+                                "title": element.get("title") or path,
+                                "page": page,
+                                "table_id": element.get("id", ""),
+                                "row_id": row.get("id", ""),
+                                "path": list(element.get("path") or []),
+                            })
+                    elif kind == "heading":
+                        text = str(element.get("title") or "").strip()
+                        if text:
+                            blocks.append({"type": "subhead", "text": text,
+                                           "title": text, "page": page,
+                                           "element_id": element.get("id", ""),
+                                           "path": list(element.get("path") or [])})
+                    elif element.get("text"):
+                        blocks.append({"type": "text", "text": element.get("text", ""),
+                                       "title": path, "page": page,
+                                       "element_id": element.get("id", ""),
+                                       "path": list(element.get("path") or [])})
+                if blocks:
+                    sections.append({"title": f"Página {page}", "page": page,
+                                     "blocks": blocks})
+            if sections:
+                return sections
         pages = faq.get('page_records') or [{'number': 1, 'text': faq.get('text', '')}]
         sections = []
         for page in pages:
@@ -2442,6 +2550,95 @@ class Api(ExperienceApi, DataToolsApi):
                 sections.append(section)
         return sections
 
+    @staticmethod
+    def _atlas_faq_structured(faq: dict) -> dict:
+        documents = faq.get("structured_pages") or []
+        return {
+            "schema_version": getattr(gamefaqs, "STRUCTURED_SCHEMA_VERSION", 1),
+            "format": "gamefaqs-json-v1",
+            "pages": copy.deepcopy(documents),
+            "stats": copy.deepcopy(faq.get("stats") or {}),
+            "edition_signals": list(faq.get("edition_signals") or []),
+        }
+
+    @staticmethod
+    def _atlas_source_review(source: dict) -> dict:
+        """Resumo seguro para confirmar tabelas antes do envio à IA."""
+        structured = source.get("structured") or {}
+        pages = structured.get("pages") if isinstance(structured, dict) else []
+        pages = pages if isinstance(pages, list) else []
+        tables = []
+        headings = []
+        row_refs = {}
+        for section_index, section in enumerate(source.get("sections") or [], 1):
+            for block_index, block in enumerate(section.get("blocks") or [], 1):
+                table_id = str(block.get("table_id") or "")
+                row_id = str(block.get("row_id") or "")
+                if table_id and row_id:
+                    row_refs[(table_id, row_id)] = {
+                        "section": section_index, "block": block_index,
+                        "page": max(0, int(block.get("page") or section.get("page") or 0)),
+                    }
+        for document in pages:
+            page = max(1, int(document.get("page") or 1))
+            for element in document.get("elements") or []:
+                if element.get("type") == "heading":
+                    headings.append({"id": element.get("id", ""), "page": page,
+                                     "level": element.get("level", 2),
+                                     "title": element.get("title", ""),
+                                     "path": element.get("path") or []})
+                if element.get("type") != "table":
+                    continue
+                sample = []
+                for row in (element.get("rows") or [])[:3]:
+                    sample.append({"id": row.get("id", ""),
+                                   "cells": [cell.get("text", "") for cell in row.get("cells", [])],
+                                   "ref": row_refs.get((element.get("id", ""), row.get("id", "")), {})})
+                rows = [{"id": row.get("id", ""),
+                         "cells": [cell.get("text", "") for cell in row.get("cells", [])],
+                         "ref": row_refs.get((element.get("id", ""), row.get("id", "")), {})}
+                        for row in (element.get("rows") or [])]
+                tables.append({
+                    "id": element.get("id", ""),
+                    "page": page,
+                    "title": element.get("title", ""),
+                    "path": element.get("path") or [],
+                    "headers": [item.get("text", "") for item in element.get("headers") or []],
+                    "columns": element.get("columns", 0),
+                    "rows": len(element.get("rows") or []),
+                    "sample": sample,
+                    "row_refs": rows,
+                    "selected": True,
+                })
+        metadata = source.get("metadata") or {}
+        signals = structured.get("edition_signals") if isinstance(structured, dict) else []
+        signals = list(signals or [])
+        warning = source.get("edition_warning") or ""
+        if not warning and "3DS/Decode" in signals:
+            warning = "Este FAQ declara 3DS/Decode; confirme a edição antes de publicar no jogo selecionado."
+        selection = source.get("selection") or {}
+        selected_ids = set(selection.get("table_ids") or []) if isinstance(selection, dict) else set()
+        if selected_ids:
+            for table in tables:
+                table["selected"] = table["id"] in selected_ids
+        stats = structured.get("stats") if isinstance(structured, dict) else {}
+        return {
+            "schema_version": 1,
+            "source_id": source.get("id", ""),
+            "title": source.get("title", ""),
+            "kind": source.get("kind", ""),
+            "url": source.get("url") or metadata.get("url", ""),
+            "pages": len(pages),
+            "page_numbers": [document.get("page") for document in pages],
+            "stats": stats or {"tables": len(tables), "table_rows": sum(t["rows"] for t in tables)},
+            "tables": tables,
+            "headings": headings,
+            "edition_signals": signals,
+            "edition_warning": warning,
+            "markdown": source.get("markdown", ""),
+            "selection": {"table_ids": [t["id"] for t in tables if t.get("selected")]},
+        }
+
     def create_guide_system_from_gamefaqs(self, slug: str, title: str,
                                           url: str) -> dict:
         game = load_game_file(GAMES_DIR / f"{slug}.json")
@@ -2454,10 +2651,14 @@ class Api(ExperienceApi, DataToolsApi):
             source = self._guides.add_system_source(
                 slug, title or faq.get("title") or "Sistema visual", "gamefaqs",
                 self._atlas_faq_sections(faq), {"filename": faq.get("title") or "", "url": url,
-                    "pages": faq.get('pages', 1), "page_urls": [p['url'] for p in faq.get('page_records') or []]},
-                text=faq.get("text") or "")
+                    "pages": faq.get('pages', 1), "page_urls": [p['url'] for p in faq.get('page_records') or []],
+                    "source_format": "gamefaqs-json-v1"},
+                text=faq.get("text") or "",
+                structured=self._atlas_faq_structured(faq),
+                markdown=faq.get("markdown") or "",
+                raw_pages=faq.get("page_records") or [])
             return self._queue_atlas_source(
-                slug, source, title or faq.get("title") or "Sistema visual")
+                slug, source, title or faq.get("title") or "Sistema visual", start=False)
         except (gamefaqs.GameFAQsError, smart_guide.SmartGuideError) as exc:
             info = self._atlas_error_info(exc)
             return {"ok": False, "error": info["message"],
@@ -2517,13 +2718,17 @@ class Api(ExperienceApi, DataToolsApi):
                 saved = self._guides.add_system_source(
                     slug, title, "gamefaqs", self._atlas_faq_sections(faq),
                     {"filename": faq.get("title") or "", "url": url, "pages": faq.get('pages', 1),
-                     "page_urls": [p['url'] for p in faq.get('page_records') or []]},
-                    text=faq.get("text") or "")
+                     "page_urls": [p['url'] for p in faq.get('page_records') or []],
+                     "source_format": "gamefaqs-json-v1"},
+                    text=faq.get("text") or "",
+                    structured=self._atlas_faq_structured(faq),
+                    markdown=faq.get("markdown") or "",
+                    raw_pages=faq.get("page_records") or [])
             else:
                 return {"ok": False, "error": "Escolha PDF ou GameFAQs."}
             self._guides.update_system_source(
                 slug, saved["id"], replace_system_id=system_id)
-            return self._queue_atlas_source(slug, saved, title, system_id)
+            return self._queue_atlas_source(slug, saved, title, system_id, start=False)
         except (gamefaqs.GameFAQsError, smart_guide.SmartGuideError) as exc:
             info = self._atlas_error_info(exc)
             return {"ok": False, "error": info["message"],

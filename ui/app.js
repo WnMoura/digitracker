@@ -151,7 +151,7 @@ const S = {
   guideChapter: 0,
   guideQuery: "",
   guideFilter: "all",
-  guideAtlas: { systemId: "", nodeId: "", group: "all", tag: "all", availability: "all", spoilers: false, zoom: 1, panX: 24, panY: 24 },
+  guideAtlas: { systemId: "", nodeId: "", group: "all", tag: "all", availability: "all", spoilers: false, search: "", mode: "focus", zoom: 1, panX: 24, panY: 24 },
   smartGuideAuto: true,
   smartGuideConsent: false,
   guideDensity: "comfortable",
@@ -450,6 +450,12 @@ const backend = {
   },
   async guideSystemSource(slug, systemId) {
     return window.pywebview.api.get_guide_system_source(slug, systemId);
+  },
+  async atlasSourceReview(slug, sourceId) {
+    return window.pywebview.api.get_atlas_source_review(slug, sourceId);
+  },
+  async startAtlasSource(slug, sourceId, selection) {
+    return window.pywebview.api.start_atlas_source(slug, sourceId, selection || {});
   },
   async replaceGuideSystemSource(slug, systemId, source) {
     return window.pywebview.api.replace_guide_system_source(slug, systemId, source);
@@ -1566,11 +1572,11 @@ function guideSystemLayout(system, visibleNodes) {
   });
   const positions = new Map();
   [...columns.entries()].sort((a, b) => a[0] - b[0]).forEach(([level, nodes]) => {
-    nodes.forEach((node, row) => positions.set(node.id, { x: 42 + level * 242, y: 42 + row * 154 }));
+    nodes.forEach((node, row) => positions.set(node.id, { x: 42 + level * 270, y: 42 + row * 218 }));
   });
   const maxLevel = Math.max(0, ...levels.values());
   const maxRows = Math.max(1, ...[...columns.values()].map((items) => items.length));
-  let width = Math.max(760, 260 + maxLevel * 242), height = Math.max(520, 82 + maxRows * 154);
+  let width = Math.max(760, 260 + maxLevel * 270), height = Math.max(520, 82 + maxRows * 218);
   if (system.layout === "vertical") {
     [...positions.entries()].forEach(([id, pos]) => positions.set(id, { x: pos.y, y: pos.x }));
     [width, height] = [Math.max(760, height), Math.max(520, width)];
@@ -1591,7 +1597,7 @@ function atlasSystems(game) {
 }
 
 function atlasJobsHTML(game) {
-  const labels = { running: "Processando a fonte", suggested: "Prévia pronta para revisão", error: "Falha na análise", interrupted: "Análise interrompida", cancelled: "Análise cancelada", awaiting_consent: "Aguardando consentimento", awaiting_configuration: "Aguardando configuração da IA" };
+  const labels = { running: "Processando a fonte", suggested: "Prévia pronta para revisão", error: "Falha na análise", interrupted: "Análise interrompida", cancelled: "Análise cancelada", awaiting_source_review: "Aguardando revisão da fonte", awaiting_consent: "Aguardando consentimento", awaiting_configuration: "Aguardando configuração da IA" };
   const errorMeta = (job) => {
     const raw = String(job.error || ""); let kind = job.error_kind || "";
     if (!kind && /(503|UNAVAILABLE|high demand)/i.test(raw)) kind = "api_service";
@@ -1613,7 +1619,7 @@ function atlasJobsHTML(game) {
       <div class="atlas-job-main"><div class="atlas-job-heading"><div><span>${esc(job.provider || "ATLAS")}${job.model ? ` · ${esc(job.model)}` : ""}</span><b>${esc(job.title)}</b></div><em>${esc(labels[job.status])}</em></div>
       ${job.status === "running" ? `<p>${esc(job.message || "Analisando relações e requisitos…")}</p><div class="atlas-job-progress"><i style="width:${pct}%"></i></div><small>${total ? `Lote ${done}/${total}` : "Preparando lotes"}${job.checkpoint_count ? ` · ${esc(job.checkpoint_count)} salvo(s)` : ""}</small>` : ""}
       ${meta ? `<div class="atlas-job-error"><b>${esc(meta.title)}</b><p>${esc(meta.message)}</p><small>${esc(meta.hint)}</small>${technical ? `<details><summary>Detalhes técnicos</summary><pre>${esc(technical)}</pre></details>` : ""}</div>` : ""}</div>
-      <div class="atlas-job-actions">${job.status === "suggested" ? `<button data-atlas-review-job="${esc(job.id)}">Revisar prévia</button>` : job.status === "running" ? `<button data-atlas-cancel-job="${esc(job.id)}">Cancelar</button>` : `<button data-atlas-retry-job="${esc(job.id)}">${job.checkpoint_count ? "Retomar" : "Tentar novamente"}</button>${["api_limit","api_service","api_configuration"].includes(meta?.kind) ? `<button data-atlas-settings>Trocar modelo</button>` : ""}<button data-atlas-manual-job="${esc(job.id)}">Criar manualmente</button>`}</div>
+      <div class="atlas-job-actions">${job.status === "suggested" ? `<button data-atlas-review-job="${esc(job.id)}">Revisar prévia</button>` : job.status === "awaiting_source_review" ? `<button data-atlas-review-source="${esc(job.id)}">Revisar fonte</button>` : job.status === "running" ? `<button data-atlas-cancel-job="${esc(job.id)}">Cancelar</button>` : `<button data-atlas-retry-job="${esc(job.id)}">${job.checkpoint_count ? "Retomar" : "Tentar novamente"}</button>${["api_limit","api_service","api_configuration"].includes(meta?.kind) ? `<button data-atlas-settings>Trocar modelo</button>` : ""}<button data-atlas-manual-job="${esc(job.id)}">Criar manualmente</button>`}</div>
     </article>`;
   }).join("");
   return `<div class="atlas-jobs">${cards}</div>`;
@@ -1638,6 +1644,7 @@ function guideSystemsHTML(game) {
     if (node.spoiler && !A.spoilers) return false;
     if (A.group !== "all" && node.group !== A.group) return false;
     if (A.tag !== "all" && !(node.tags || []).includes(A.tag)) return false;
+    if (A.search && !`${node.label} ${node.subtitle} ${node.stage} ${node.group} ${(node.tags || []).join(" ")}`.toLocaleLowerCase("pt-BR").includes(A.search.toLocaleLowerCase("pt-BR"))) return false;
     if (A.availability === "available" && !available(node)) return false;
     if (A.availability === "blocked" && available(node)) return false;
     return true;
@@ -1646,7 +1653,13 @@ function guideSystemsHTML(game) {
     ? A.nodeId : (visibleNodes.find(node => node.id === (state.goals || {})[system.id])?.id || visibleNodes[0]?.id || "");
   A.nodeId = selectedId;
   const selected = (system.nodes || []).find((node) => node.id === selectedId) || null;
-  const layout = guideSystemLayout(system, visibleNodes);
+  const mode = A.mode || "focus";
+  const focusedIds = new Set(selectedId ? [selectedId] : []);
+  if (mode === "focus" && selectedId) {
+    (system.edges || []).forEach((edge) => { if (edge.from === selectedId || edge.to === selectedId) { focusedIds.add(edge.from); focusedIds.add(edge.to); } });
+  }
+  const mapNodes = mode === "focus" ? visibleNodes.filter((node) => focusedIds.has(node.id)) : visibleNodes;
+  const layout = guideSystemLayout(system, mapNodes);
   const routeEdges = new Set();
   const trace = (nodeId, seen = new Set()) => {
     if (seen.has(nodeId)) return; seen.add(nodeId);
@@ -1656,11 +1669,11 @@ function guideSystemsHTML(game) {
   const path = (edge) => {
     const from = layout.positions.get(edge.from), to = layout.positions.get(edge.to);
     if (!from || !to) return "";
-    const x1 = from.x + 168, y1 = from.y + 53, x2 = to.x, y2 = to.y + 53, bend = Math.max(45, (x2 - x1) * .5);
+    const x1 = from.x + 204, y1 = from.y + 96, x2 = to.x, y2 = to.y + 96, bend = Math.max(45, (x2 - x1) * .5);
     return `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}`;
   };
   const refsHTML = (refs) => (refs || []).map((ref) => ref.page ? `p.${ref.page}` : `§${ref.section}.${ref.block}`).join(" · ");
-  const nodeHTML = visibleNodes.map((node) => {
+  const nodeHTML = mapNodes.map((node) => {
     const pos = layout.positions.get(node.id), mediaId = (system._draftMedia || {})[node.id] ?? (state.node_media || {})[`${system.id}:${node.id}`];
     const media = (bundle.media || []).find((item) => item.id === mediaId);
     const goal = (state.goals || {})[system.id] === node.id;
@@ -1682,22 +1695,24 @@ function guideSystemsHTML(game) {
     <small>${esc(selected.stage || selected.group || "SISTEMA")}</small><h3>${esc(selected.label)}</h3><p>${esc(selected.subtitle || "Selecione uma imagem e acompanhe os requisitos deste objetivo.")}</p>
     ${(selected.tags || []).length ? `<div class="atlas-tags">${selected.tags.map((tag) => `<span>${esc(tag)}</span>`).join("")}</div>` : ""}
     ${Object.keys(selected.attributes || {}).length ? `<dl>${Object.entries(selected.attributes).map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>` : ""}
-    <div class="atlas-requirements"><b>REQUISITOS</b>${requirements.length ? requirements.map((req) => `<label class="${req.missable ? "missable" : ""}"><input type="checkbox" data-atlas-requirement="${esc(req.id)}" data-edge="${esc(req.edge_id)}" ${completed.has(req.id) ? "checked" : ""}><span>${esc(req.text)}</span></label>`).join("") : `<p>Nenhum requisito documentado.</p>`}</div>
+    <div class="atlas-requirements"><b>REQUISITOS</b>${requirements.length ? requirements.map((req) => `<label class="${req.missable ? "missable" : ""} ${req.operator === "unknown" ? "unknown" : ""}"><input type="checkbox" data-atlas-requirement="${esc(req.id)}" data-edge="${esc(req.edge_id)}" ${req.operator === "unknown" ? "disabled" : ""} ${completed.has(req.id) ? "checked" : ""}><span>${req.operator === "unknown" ? "? " : ""}${esc(req.text)}</span></label>`).join("") : `<p>Nenhum requisito documentado.</p>`}</div>
     ${system.source_id ? `<button class="atlas-source" data-atlas-source="${esc(selected.id)}">Fonte exclusiva: ${esc(system.source_id === "legacy-main" ? "guia migrado" : refsHTML(selected.source_refs || system.source_refs || []))}</button>` : ""}
     <div class="atlas-inspector-actions"><button class="primary" id="atlas-goal">${(state.goals || {})[system.id] === selected.id ? "✓ Objetivo fixado" : "◎ Fixar como objetivo"}</button><button id="atlas-media">▧ Trocar imagem</button><button id="atlas-edit">✎ Editar sistema</button><button id="atlas-replace-source">↺ Trocar fonte</button></div>
   </aside>` : `<aside class="atlas-inspector empty">Selecione um nó para ver seus detalhes.</aside>`;
   const diagnostics = system._draftDiagnostics || {};
-  const coverage = diagnostics.batches ? `${(system.nodes || []).length} nós · ${(system.edges || []).length} caminhos · ${diagnostics.batches} lotes${diagnostics.source_pages ? ` · ${diagnostics.referenced_pages}/${diagnostics.source_pages} páginas citadas` : ""}${diagnostics.table_blocks ? ` · ${diagnostics.covered_table_blocks}/${diagnostics.table_blocks} linhas de tabela cobertas` : ""}` : "";
-  const review = system.status === "suggested" ? `<div class="atlas-review"><span>REVISÃO NECESSÁRIA</span><p>Confira nomes, caminhos, requisitos, spoilers e perdíveis antes de publicar.${coverage ? `<strong>${esc(coverage)}</strong>` : ""}</p><button id="atlas-approve">Aprovar sistema</button><button id="atlas-edit">Revisar e editar</button><button id="atlas-reject">Rejeitar</button></div>` : "";
-  return `${jobs}<section class="atlas-shell ${A.list ? "list-view" : ""}" style="--atlas-zoom:${A.zoom};--atlas-x:${A.panX}px;--atlas-y:${A.panY}px">
+  const pendingCount = (diagnostics.pending_table_ids || []).length;
+  const coverage = diagnostics.batches ? `${(system.nodes || []).length} nós · ${(system.edges || []).length} caminhos · ${diagnostics.batches} lotes${diagnostics.source_pages ? ` · ${diagnostics.referenced_pages}/${diagnostics.source_pages} páginas citadas` : ""}${diagnostics.table_blocks ? ` · ${diagnostics.covered_table_blocks}/${diagnostics.table_blocks} linhas de tabela cobertas` : ""}${pendingCount ? ` · ${pendingCount} pendência(s)` : ""}` : "";
+  const review = system.status === "suggested" ? `<div class="atlas-review"><span>REVISÃO NECESSÁRIA</span><p>Confira nomes, caminhos, requisitos, spoilers e perdíveis antes de publicar.${coverage ? `<strong>${esc(coverage)}</strong>` : ""}${pendingCount ? `<small class="atlas-pending-warning">Resolva as pendências da extração antes de aprovar.</small>` : ""}</p><button id="atlas-approve" ${pendingCount ? "disabled" : ""}>Aprovar sistema</button><button id="atlas-edit">Revisar e editar</button><button id="atlas-reject">Rejeitar</button></div>` : "";
+  return `${jobs}<section class="atlas-shell ${mode === "list" ? "list-view" : ""}" style="--atlas-zoom:${A.zoom};--atlas-x:${A.panX}px;--atlas-y:${A.panY}px">
     <header class="atlas-toolbar"><div><span>ATLAS DE SISTEMAS</span><h2>${esc(system.title)}</h2><p>${esc(system.description)}</p></div><button id="atlas-create">＋ Novo sistema</button></header>
     ${review}<div class="atlas-filters">
       <select id="atlas-system">${systems.map((item) => `<option value="${esc(item.id)}" ${item.id === system.id ? "selected" : ""}>${esc(item.title)}${item.status === "suggested" ? " · revisar" : ""}</option>`).join("")}</select>
       <select id="atlas-group"><option value="all">Todos os ${esc(system.group_label || "grupos")}</option>${groups.map((group) => `<option value="${esc(group)}" ${A.group === group ? "selected" : ""}>${esc(group)}</option>`).join("")}</select>
       <select id="atlas-tag"><option value="all">Todas as tags</option>${tags.map((tag) => `<option value="${esc(tag)}" ${A.tag === tag ? "selected" : ""}>${esc(tag)}</option>`).join("")}</select>
       <select id="atlas-availability"><option value="all">Toda disponibilidade</option><option value="available" ${A.availability === "available" ? "selected" : ""}>Disponíveis</option><option value="blocked" ${A.availability === "blocked" ? "selected" : ""}>Bloqueados</option></select>
+      <input id="atlas-search" value="${esc(A.search || "")}" placeholder="Buscar no mapa" aria-label="Buscar no mapa">
       <label><input id="atlas-spoilers" type="checkbox" ${A.spoilers ? "checked" : ""}> Spoilers</label>
-      <div class="atlas-zoom"><button data-atlas-zoom="out">−</button><button data-atlas-zoom="fit">Ajustar</button><button data-atlas-zoom="in">＋</button><button id="atlas-list-toggle">${A.list ? "Mapa" : "Lista"}</button>${A.draftSource ? '<button id="atlas-back-published">Voltar ao publicado</button>' : ""}</div>
+      <div class="atlas-zoom"><button class="${mode === "focus" ? "active" : ""}" data-atlas-mode="focus">Foco</button><button class="${mode === "map" ? "active" : ""}" data-atlas-mode="map">Mapa</button><button class="${mode === "list" ? "active" : ""}" data-atlas-mode="list">Lista</button><button data-atlas-zoom="out">−</button><button data-atlas-zoom="fit">Ajustar</button><button data-atlas-zoom="in">＋</button>${A.draftSource ? '<button id="atlas-back-published">Voltar ao publicado</button>' : ""}</div>
     </div>
     <div class="atlas-layout"><div class="atlas-viewport" id="atlas-viewport"><div class="atlas-world" style="width:${layout.width}px;height:${layout.height}px"><svg width="${layout.width}" height="${layout.height}" aria-hidden="true">${edgeHTML}</svg>${nodeHTML}</div>${!visibleNodes.length ? `<p class="atlas-no-results">Nenhum nó corresponde aos filtros.</p>` : ""}</div>${inspector}</div>
   </section>`;
@@ -1979,6 +1994,44 @@ function updateAtlasImportProgress(step, message, result = null) {
 
 function closeAtlasImportProgress() { $("#atlas-processing")?.remove(); }
 
+async function openAtlasSourceReview(sourceId, initialReview = null, title = "Fonte do Atlas") {
+  if (!sourceId) return toast("Fonte não encontrada.", true);
+  const loaded = await backend.atlasSourceReview(S.activeSlug, sourceId).catch((error) => ({ ok: false, error: String(error) }));
+  if (!loaded?.ok) return toast(loaded?.error || "Não foi possível abrir a revisão da fonte.", true);
+  const review = loaded.review || initialReview || {};
+  const selected = new Set(review.selection?.table_ids || (review.tables || []).filter((table) => table.selected).map((table) => table.id));
+  $("#atlas-source-review")?.remove();
+  const modal = document.createElement("div"); modal.id = "atlas-source-review"; modal.className = "modal-bg";
+  const hierarchy = (review.headings || []).slice(0, 160).map((heading) => `<span style="--heading-depth:${Math.max(0, Number(heading.level || 2) - 2)}">${esc(heading.title || "")}</span>`).join("");
+  const rows = (review.tables || []).map((table) => `<label class="atlas-source-table-row"><input type="checkbox" data-source-table="${esc(table.id)}" ${selected.has(table.id) ? "checked" : ""}><span><b>${esc(table.title || table.path?.join(" › ") || "Tabela sem título")}</b><small>p. ${esc(table.page)} · ${esc(table.rows)} linhas · ${esc((table.headers || []).join(" · ") || "sem cabeçalho")}</small><em>${(table.sample || []).slice(0, 2).map((row) => esc((row.cells || []).join(" | "))).join("  •  ")}</em></span></label>`).join("");
+  modal.innerHTML = `<div class="atlas-source-review-panel" role="dialog" aria-modal="true" aria-label="Revisão da fonte do Atlas">
+    <header><div><span>ATLAS / REVISÃO DA FONTE</span><h2>${esc(review.title || title)}</h2><p>Confirme as tabelas que serão interpretadas. O HTML original permanece local e não é executado.</p></div><button id="atlas-source-review-close">×</button></header>
+    ${review.edition_warning ? `<div class="atlas-source-warning"><b>⚠ Edição da fonte</b><p>${esc(review.edition_warning)}</p></div>` : ""}
+    <div class="atlas-source-review-stats"><b>${esc(review.pages || 0)} páginas</b><b>${esc(review.stats?.tables || review.tables?.length || 0)} tabelas</b><b>${esc(review.stats?.table_rows || 0)} linhas de tabela</b>${review.edition_signals?.length ? `<span>${review.edition_signals.map((signal) => esc(signal)).join(" · ")}</span>` : ""}</div>
+    <div class="atlas-source-review-actions"><button id="atlas-source-select-all">Selecionar tudo</button><button id="atlas-source-select-none">Limpar seleção</button><button id="atlas-source-export-json">Exportar JSON</button><button id="atlas-source-export-md">Exportar Markdown</button></div>
+    ${hierarchy ? `<details class="atlas-source-hierarchy"><summary>Árvore editorial (${esc(review.headings?.length || 0)} títulos)</summary><div>${hierarchy}</div></details>` : ""}
+    <div class="atlas-source-table-list">${rows || `<p>Não foram encontradas tabelas nesta captura.</p>`}</div>
+    <footer><p>Objetivo: <b>${esc(title || review.title || "Sistema visual")}</b>. Cabeçalhos e notas do contexto acompanham as tabelas selecionadas.</p><button id="atlas-source-review-cancel">Cancelar</button><button class="primary" id="atlas-source-review-start">Confirmar e analisar</button></footer>
+  </div>`;
+  document.body.appendChild(modal);
+  const close = () => modal.remove();
+  $("#atlas-source-review-close", modal).onclick = close;
+  $("#atlas-source-review-cancel", modal).onclick = close;
+  const inputs = () => [...modal.querySelectorAll("[data-source-table]")];
+  $("#atlas-source-select-all", modal).onclick = () => inputs().forEach((input) => { input.checked = true; });
+  $("#atlas-source-select-none", modal).onclick = () => inputs().forEach((input) => { input.checked = false; });
+  const download = (name, content, type) => { const url = URL.createObjectURL(new Blob([content], { type })); const link = document.createElement("a"); link.href = url; link.download = name; link.click(); setTimeout(() => URL.revokeObjectURL(url), 0); };
+  $("#atlas-source-export-json", modal).onclick = () => download(`${(review.title || "atlas-fonte").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.json`, JSON.stringify(loaded.structured || review, null, 2), "application/json");
+  $("#atlas-source-export-md", modal).onclick = () => download(`${(review.title || "atlas-fonte").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.md`, loaded.markdown || "", "text/markdown;charset=utf-8");
+  $("#atlas-source-review-start", modal).onclick = async () => {
+    const button = $("#atlas-source-review-start", modal); button.disabled = true; button.textContent = "Iniciando…";
+    const selection = { table_ids: inputs().filter((input) => input.checked).map((input) => input.dataset.sourceTable) };
+    const result = await backend.startAtlasSource(S.activeSlug, sourceId, selection).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" }));
+    if (!result?.ok) { button.disabled = false; button.textContent = "Confirmar e analisar"; return toast(result?.error || "Não foi possível iniciar a análise.", true); }
+    close(); atlasImportProgress(title || review.title, "gamefaqs"); await finishAtlasSourceImport(result, title || review.title);
+  };
+}
+
 function openAtlasSourceWizard(replaceSystem = null) {
   closeAtlasSourceWizard();
   const modal = document.createElement("div");
@@ -2032,6 +2085,10 @@ async function finishAtlasSourceImport(result, title) {
     return toast(result?.error || "Não foi possível importar a fonte do Atlas.", true);
   }
   const sourceId = result.source?.id || result.source_id;
+  if (result.phase === "awaiting_source_review") {
+    closeAtlasImportProgress();
+    return openAtlasSourceReview(sourceId, result.review, title);
+  }
   if (["awaiting_configuration", "awaiting_consent"].includes(result.phase)) {
     closeAtlasImportProgress();
     toast(result.message || "Fonte anexada. Complete o sistema manualmente.");
@@ -2062,11 +2119,17 @@ async function acompanharAtlasJob(slug, sourceId) {
   } finally { S.atlasPolling.delete(key); }
 }
 
-async function viewAtlasSource(systemId) {
+async function viewAtlasSource(systemId, nodeId = "") {
   const result = await backend.guideSystemSource(S.activeSlug, systemId).catch((error) => ({ ok: false, error: String(error) }));
   if (!result?.ok) return toast(result?.error || "Fonte não encontrada.", true);
   const source = result.source || {};
-  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="atlas-source-view"><div class="gf-panel atlas-source-view"><h3>Fonte exclusiva do Atlas</h3><p><b>${esc(source.title || "Fonte do sistema")}</b></p><dl><div><dt>Tipo</dt><dd>${esc(source.kind || "legacy")}</dd></div><div><dt>Arquivo</dt><dd>${esc(source.filename || "—")}</dd></div><div><dt>URL</dt><dd>${esc(source.url || "—")}</dd></div>${source.metadata?.pages ? `<div><dt>Páginas importadas</dt><dd>${esc(source.metadata.pages)}</dd></div>` : ""}</dl><p>Esta fonte não participa da consolidação da Jornada.</p><button class="btn-primary" id="atlas-source-view-close">Fechar</button></div></div>`);
+  const review = source.id ? await backend.atlasSourceReview(S.activeSlug, source.id).catch(() => ({ ok: false })) : { ok: false };
+  const system = atlasSystems(S.dashboardGame || {}).find((item) => item.id === systemId);
+  const node = system?.nodes?.find((item) => item.id === nodeId);
+  const refs = new Set((node?.source_refs || []).map((ref) => `${ref.section}:${ref.block}`));
+  const matches = (review.review?.tables || []).flatMap((table) => (table.row_refs || []).filter((row) => refs.has(`${row.ref?.section}:${row.ref?.block}`)).map((row) => ({ ...row, table })));
+  const excerpt = matches.slice(0, 12).map((item) => `<div class="atlas-source-excerpt-row"><small>p. ${esc(item.table.page)} · ${esc(item.table.title || "Tabela")}</small><span>${esc((item.cells || []).join(" | "))}</span></div>`).join("");
+  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="atlas-source-view"><div class="gf-panel atlas-source-view"><h3>Fonte exclusiva do Atlas</h3><p><b>${esc(source.title || "Fonte do sistema")}</b></p><dl><div><dt>Tipo</dt><dd>${esc(source.kind || "legacy")}</dd></div><div><dt>Arquivo</dt><dd>${esc(source.filename || "—")}</dd></div><div><dt>URL</dt><dd>${source.url ? `<a href="${esc(source.url)}" target="_blank" rel="noreferrer">Abrir GameFAQs</a>` : "—"}</dd></div>${source.metadata?.pages ? `<div><dt>Páginas importadas</dt><dd>${esc(source.metadata.pages)}</dd></div>` : ""}</dl>${excerpt ? `<h4>Trechos referenciados</h4><div class="atlas-source-excerpts">${excerpt}</div>` : `<p>Esta fonte não contém um trecho estruturado para o nó selecionado.</p>`}<button class="btn-primary" id="atlas-source-view-close">Fechar</button></div></div>`);
   $("#atlas-source-view-close").onclick = () => $("#atlas-source-view")?.remove();
 }
 
@@ -2134,21 +2197,32 @@ function bindGuideAtlas(game) {
   const rerender = () => renderDashboard({ force: true });
   $("#atlas-path")?.addEventListener("change", async event => { const r = await appCall("set_guide_system_path", game.slug, system.id, event.target.value); if (!r.ok) toast(r.error,true); await rerender(); });
   root.querySelectorAll("[data-atlas-review-job]").forEach((b) => b.onclick = () => { S.guideAtlas.draftSource = b.dataset.atlasReviewJob; S.guideAtlas.systemId = ""; rerender(); });
+  root.querySelectorAll("[data-atlas-review-source]").forEach((b) => b.onclick = async () => {
+    const review = await backend.atlasSourceReview(game.slug, b.dataset.atlasReviewSource).catch((error) => ({ ok: false, error: String(error) }));
+    if (!review?.ok) return toast(review?.error || "Não foi possível abrir a revisão da fonte.", true);
+    openAtlasSourceReview(b.dataset.atlasReviewSource, review.review, review.source?.title || "Fonte do Atlas");
+  });
   root.querySelectorAll("[data-atlas-manual-job]").forEach((b) => b.onclick = () => openGuideSystemEditor(null, b.dataset.atlasManualJob));
   root.querySelectorAll("[data-atlas-settings]").forEach((b) => b.onclick = () => enterSettings("ai", { slug: game.slug, tab: "atlas" }));
   for (const [attr, method] of [["atlasCancelJob", "cancel_atlas_job"], ["atlasRetryJob", "retry_atlas_job"]]) {
     root.querySelectorAll(attr === "atlasCancelJob" ? "[data-atlas-cancel-job]" : "[data-atlas-retry-job]").forEach((b) => b.onclick = async () => {
       b.disabled = true; const r = await appCall(method, game.slug, b.dataset[attr]);
       if (!r.ok) { b.disabled = false; toast(r.error, true); }
-      else { await rerender(); if (method === "retry_atlas_job") acompanharAtlasJob(game.slug, r.source_id || b.dataset[attr]); }
+      else {
+        await rerender();
+        if (method === "retry_atlas_job" && r.phase === "awaiting_source_review") openAtlasSourceReview(r.source_id || b.dataset[attr], r.review, r.source?.title || "Fonte do Atlas");
+        else if (method === "retry_atlas_job") acompanharAtlasJob(game.slug, r.source_id || b.dataset[attr]);
+      }
     });
   }
   $("#atlas-back-published")?.addEventListener("click", () => { S.guideAtlas.draftSource = ""; rerender(); });
-  $("#atlas-list-toggle")?.addEventListener("click", () => { S.guideAtlas.list = !S.guideAtlas.list; rerender(); });
+  root.querySelectorAll("[data-atlas-mode]").forEach((button) => button.addEventListener("click", () => { S.guideAtlas.mode = button.dataset.atlasMode; rerender(); }));
+  $("#atlas-list-toggle")?.addEventListener("click", () => { S.guideAtlas.mode = S.guideAtlas.mode === "list" ? "map" : "list"; rerender(); });
   $("#atlas-system")?.addEventListener("change", (event) => { S.guideAtlas.systemId = event.target.value; S.guideAtlas.nodeId = ""; S.guideAtlas.group = "all"; S.guideAtlas.tag = "all"; rerender(); });
   $("#atlas-group")?.addEventListener("change", (event) => { S.guideAtlas.group = event.target.value; rerender(); });
   $("#atlas-tag")?.addEventListener("change", (event) => { S.guideAtlas.tag = event.target.value; rerender(); });
   $("#atlas-availability")?.addEventListener("change", (event) => { S.guideAtlas.availability = event.target.value; rerender(); });
+  $("#atlas-search")?.addEventListener("change", (event) => { S.guideAtlas.search = event.target.value; rerender(); });
   $("#atlas-spoilers")?.addEventListener("change", (event) => { S.guideAtlas.spoilers = event.target.checked; rerender(); });
   root.querySelectorAll("[data-atlas-node]").forEach((button) => {
     button.onclick = () => { S.guideAtlas.nodeId = button.dataset.atlasNode; rerender(); };
@@ -2187,7 +2261,7 @@ function bindGuideAtlas(game) {
   root.querySelectorAll("[data-atlas-requirement]").forEach((input) => input.onchange = async () => { const result = await backend.updateGuideRequirement(S.activeSlug, system.id, input.dataset.edge, input.dataset.atlasRequirement, input.checked); if (!result?.ok) { input.checked = !input.checked; return toast(result?.error || "Falha ao salvar requisito.", true); } await rerender(); });
   $("#atlas-media")?.addEventListener("click", () => selected && openGuideMedia(selected.media_query || `${game.title} ${selected.label}`, { systemId: system.id, nodeId: selected.id, sourceId: system._draftSource || "" }));
   $("#atlas-replace-source")?.addEventListener("click", () => openAtlasSourceWizard(system));
-  $("[data-atlas-source]")?.addEventListener("click", () => viewAtlasSource(system.id));
+  $("[data-atlas-source]")?.addEventListener("click", () => viewAtlasSource(system.id, selected?.id || ""));
   if (system?._draftSource) root.querySelectorAll('#atlas-goal,#atlas-image,#atlas-path,[data-atlas-requirement]').forEach(el => {el.disabled=true;el.title='Aprove o sistema antes de alterar progresso.';});
 }
 
