@@ -8,10 +8,18 @@
 
 App desktop **pywebview** (Python + HTML/CSS/JS vanilla) que acompanha conquistas do **RetroAchievements** reordenadas pela ordem de um guia, com um **overlay que gruda por cima da janela do emulador**. Uso pessoal, single-user, offline-first.
 
-- Repositório: **WnMoura/digitracker** (privado), branch `main`, última release **v0.5.0**.
-- Backend: `engine.py` (janela + `js_api` + sync 30s + estado + overlay). Módulos: `ra_api.py`, `gamefaqs.py`, `guide_ai.py`, `guide_parser.py`, `emulator_tracker.py`, `steamgriddb.py`, `rawg.py`, `igdb.py`, `image_fetch.py`.
+- Repositório: **WnMoura/digitracker** (privado), branch `main`, código em preparação para a release **v0.10.5**.
+- Backend: `engine.py` (janela + `js_api` + sincronização + estado + overlay). Módulos principais: `ra_api.py`, `gamefaqs.py`, `guide_ai.py`, `guide_parser.py`, `smart_guide.py`, `guide_media.py`, `experience.py`, `experience_api.py`, `companion.py`, `emulator_tracker.py`, `updater.py` e provedores de imagem.
 - Frontend: `ui/index.html`, `ui/app.js`, `ui/style.css`, fontes locais (`ui/fonts/`).
-- Testes: `tests/` (pytest) — **374 passando** na última medição.
+- Testes: `tests/` (pytest) — **569 passando** na última validação local.
+
+### Estado da release v0.10.5
+
+- O Atlas agora processa a fonte em lotes auditáveis, salva checkpoints atômicos e retoma após falhas ou rate limits.
+- Gemini é serializado, respeita `Retry-After`/`RetryInfo` e usa fallback automático quando o modelo padrão não está disponível.
+- A importação do GameFAQs separa navegação/anúncios do conteúdo e preserva tabelas e paginação.
+- PDF, GameFAQs e Atlas exibem estado de processamento e erros classificados; a área de IA mostra telemetria local sem chaves, prompts ou respostas.
+- `version.py` aponta para `0.10.5`; a tag deve corresponder exatamente a esse valor para o workflow publicar.
 
 ## Como rodar / buildar no Windows
 
@@ -27,18 +35,20 @@ App desktop **pywebview** (Python + HTML/CSS/JS vanilla) que acompanha conquista
 - **Arraste do overlay no Windows:** o drag-region nativo do pywebview **não funciona no WinForms** (ele chama `window.move` na thread do bridge js_api, que não surte efeito). Por isso existe um arraste próprio: `makeDraggable` (ui/app.js) → `move_window` → `_window_op` (roda numa thread própria, igual fechar/minimizar/dockar). Se o arraste falhar no Windows, é aqui que se investiga.
 - **Fullscreen exclusivo (D3D):** nenhum overlay aparece por cima. O app detecta (`SHQueryUserNotificationState`) e, com o interruptor ligado nas Configurações, pode mandar **Alt+Enter** ou levar o overlay para o **segundo monitor**. Sem interruptor, só avisa.
 
-## O que validar no Windows (novidades da v0.5.0 e recentes)
+## O que validar no Windows (v0.10.5)
 
 1. **Overlay grudando no emulador (o principal):** abrir Dolphin/PCSX2/ePSXe em **janela ou borderless** → o app deve entrar em compacto, **dimensionar proporcional** à janela do emulador (~26%×44%) e **grudar no canto superior-direito de dentro**; seguir se a janela mover/redimensionar; **restaurar** ao fechar. Toggle "Ajustar ao tamanho do emulador" nas Configurações (ligado por padrão).
 2. **Arraste do overlay** pela faixa de cima (o `makeDraggable`).
 3. **Download de imagem corrigido:** o bug era o token da API indo pro CDN (403). Abrir um jogo → **Trocar arte** → escolher uma capa → deve **baixar e aplicar** (era o caso que falhava).
 4. **Fontes de imagem:** Configurações → **Fontes de imagem** — SteamGridDB, **RAWG** (chave), **IGDB** (Client ID + Secret da Twitch), e **Colar URL**. No seletor, alternar as abas.
-5. **IA nas dicas:** importar um guia do GameFAQs num jogo salvo → aba Dicas → **✨ Refinar dicas** e **🌐 Traduzir (PT-BR)** (precisa de chave de IA em Configurações → Inteligência artificial). Refina/traduz **só as dicas**, sem mexer na ordem das conquistas.
+5. **IA/Atlas nas dicas:** importar um guia do GameFAQs ou PDF num jogo salvo → iniciar o processamento na aba Guia Inteligente/Atlas; confirmar tela de progresso, retomada após falha e aprovação explícita da revisão. Refinamento/tradução não deve alterar a ordem nem os IDs das conquistas.
+6. **Experiência e companion:** conferir jornada, sessões, notificações e pareamento/revogação do companion local.
 
 ## Build/Release
 
-- CI: `.github/workflows/build-windows.yml` dispara em **push de tag `v*`** e publica o `.exe` como Release. Actions já estão em v7 (Node 24).
+- CI: `.github/workflows/build-windows.yml` dispara em **push de tag `v*`**, roda os 569 testes, gera o `.exe` e o checksum SHA-256, e publica o Release. Actions já estão em v7 (Node 24).
 - **Gotcha conhecido:** às vezes o push da tag **não dispara** o build (hiccup do GitHub Actions). Fallback confiável: `gh workflow run build-windows.yml --ref <tag>` — como a `ref` é a própria tag, o passo de Release roda e publica o `.exe` igual.
+- Para validar a tag antes do push: `git show v0.10.5:version.py` e confirmar `APP_VERSION = "0.10.5"`.
 
 ## Itens em aberto
 
@@ -47,5 +57,6 @@ App desktop **pywebview** (Python + HTML/CSS/JS vanilla) que acompanha conquista
 
 ## Convenções do repo
 
+- O repositório Git correto é a pasta `digitracker` (há um Git vazio no diretório pai `New project`).
 - Só commitar/pushar quando o autor pedir. Histórico usa trailers `Co-Authored-By:` e `Claude-Session:` (cada sessão tem o seu próprio link).
 - Tudo verde: `python -m pytest tests/ -q` antes de commitar.
