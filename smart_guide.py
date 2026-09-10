@@ -236,6 +236,10 @@ def _validate_systems(document: dict) -> list[dict]:
                 attributes = raw_attributes if isinstance(raw_attributes, dict) else {}
             nodes.append({
                 "id": node_id, "label": label,
+                # Derived from the normalized order so every Atlas card has a
+                # compact numeric reference for review diagnostics. The
+                # stable string id remains the identity across revisions.
+                "card_number": len(nodes) + 1,
                 "subtitle": _clean_text(raw_node.get("subtitle"), 500),
                 "stage": _clean_text(raw_node.get("stage"), 100),
                 "group": _clean_text(raw_node.get("group"), 150),
@@ -1098,6 +1102,7 @@ class SmartGuideStore:
         )
         return {"revision": revision, "system": saved}
 
+    @_serialized
     def delete_system(self, slug: str, system_id: str) -> dict:
         current = self.current(slug)
         system_id = _clean_text(system_id, 100)
@@ -1127,6 +1132,32 @@ class SmartGuideStore:
         }
         state["preferences"].pop(system_id, None)
         self._save_system_state(slug, state)
+        # Preserve the captured source and raw HTML for audit/reimport, but
+        # hide completed Atlas jobs after their materialized system is deleted.
+        # This is archival at the source level, not destructive file removal.
+        source_folder = self._path(slug, "system_sources")
+        for source_path in source_folder.glob("*.json") if source_folder.exists() else []:
+            source = _read_json(source_path, {})
+            if not isinstance(source, dict):
+                continue
+            if source.get("system_id") != system_id and source.get("replace_system_id") != system_id:
+                continue
+            source["status"] = "archived"
+            source["stage"] = "archived"
+            source["message"] = (
+                "Sistema removido pelo usuário; fonte preservada para reimportação."
+            )
+            _atomic_json(source_path, source)
+            # A draft/checkpoint is derived work, so it must not leave a stale
+            # preview that can be reopened after the materialized system is gone.
+            for artifact in (
+                self._path(slug, f"atlas_drafts/{source_path.stem}.json"),
+                self._path(slug, f"atlas_checkpoints/{source_path.stem}.json"),
+            ):
+                try:
+                    artifact.unlink(missing_ok=True)
+                except OSError:
+                    pass
         return revision
 
     @_serialized

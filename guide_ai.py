@@ -2147,7 +2147,72 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
                 "group_label": "Grupo", "layout": "layered", "origin": "ai",
                 "status": "suggested", "source_refs": [], "nodes": [], "edges": []}
     node_by_key, edge_keys = {}, set()
-    pending, relation_rows, selected_rows = [], 0, 0
+    pending, pending_items, warning_items = [], [], []
+    issue_keys, relation_rows, selected_rows = set(), 0, 0
+
+    def table_title(table: dict) -> str:
+        path = table.get("path") or []
+        return str(path[-1] if path else table.get("title") or "Tabela sem título").strip()
+
+    def table_page(table: dict) -> int:
+        try:
+            return max(0, int(table.get("page") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def add_issue(table: dict, kind: str, message: str, action: str,
+                  row: dict | None = None, ref: dict | None = None,
+                  severity: str = "blocking", card_numbers: list[int] | None = None,
+                  row_number: int | None = None,
+                  **extra) -> None:
+        """Record an actionable extraction issue without losing the raw row.
+
+        ``pending_table_ids`` remains for backwards compatibility, while the
+        richer item lets the UI point to the exact table, row and affected
+        cards. Warnings (for example an undocumented quota meaning) are
+        reviewable but do not block publication.
+        """
+        table_id = str(table.get("table_id") or "")
+        row_id = str((row or {}).get("id") or "")
+        try:
+            row_number = (max(0, int(row_number)) if row_number is not None else
+                          (max(0, int((row or {}).get("index") or 0)) + 1 if row else 0))
+        except (TypeError, ValueError):
+            row_number = 0
+        key = (severity, kind, table_id, row_id, row_number, str(extra.get("field") or ""))
+        if key in issue_keys:
+            return
+        issue_keys.add(key)
+        cells = _structured_row_values(table, row) if row else []
+        source_ref = dict(ref or {
+            "source_id": source.get("id", ""), "section": 0,
+            "block": 0, "page": table_page(table),
+        })
+        normalized_cards = []
+        for value in card_numbers or []:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                normalized_cards.append(number)
+        item = {
+            "id": f"atlas-issue-{len(pending_items) + len(warning_items) + 1:04d}",
+            "severity": severity, "kind": kind, "table_id": table_id,
+            "table_title": table_title(table), "page": table_page(table),
+            "row_id": row_id, "row_number": row_number,
+            "row_preview": " | ".join(cells)[:700],
+            "message": str(message)[:700], "action": str(action)[:700],
+            "source_ref": source_ref,
+            "card_numbers": sorted(set(normalized_cards)),
+        }
+        item.update({key: value for key, value in extra.items()
+                    if value not in (None, "", [], {})})
+        if severity == "blocking":
+            pending.append(table_id)
+            pending_items.append(item)
+        else:
+            warning_items.append(item)
 
     def node_for(label: str, ref: dict) -> str:
         label = str(label or "").strip()
@@ -2158,6 +2223,7 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
             node_by_key[key]["source_refs"] = _merge_refs(node_by_key[key].get("source_refs") or [], [ref])
             return node_by_key[key]["id"]
         node = {"id": f"node-{len(fragment['nodes']) + 1}", "label": label,
+                "card_number": len(fragment["nodes"]) + 1,
                 "subtitle": "", "stage": "", "group": "", "tags": [],
                 "attributes": [], "media_query": f"{game.get('title', '')} {label}".strip(),
                 "spoiler": False, "source_refs": [ref]}
@@ -2173,7 +2239,11 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
         kind = str(mapping.get("kind") or "unknown")
         if kind in {"unrelated", "reference", "note", "unknown"}:
             if kind == "unknown":
-                pending.append(table_id)
+                add_issue(
+                    table, "table_unmapped",
+                    "A tabela selecionada não recebeu um tipo de relação válido da IA.",
+                    "Classifique a tabela na revisão da fonte, exclua-a se for apenas referência ou tente outro modelo.",
+                )
             continue
         headers = table.get("headers") or []
         source_col = int(mapping.get("source_column", -1))
@@ -2187,13 +2257,22 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
         context_path = table.get("path") or []
         context_label = str(context_path[-1] if context_path else table.get("title") or "").strip()
         for row_index, row in enumerate(table.get("rows") or []):
+            if not isinstance(row, dict):
+                add_issue(table, "invalid_row", "A linha estruturada não tem formato válido.",
+                          "Reimporte a fonte para reconstruir esta linha.", row_number=row_index + 1)
+                continue
             cells = _structured_row_values(table, row)
             if row_index == 0 and any(cell.get("tag") == "th" for cell in row.get("cells") or []):
                 continue
             selected_rows += 1
             row_ref = refs.get((table_id, str(row.get("id") or "")))
             if not row_ref:
-                pending.append(table_id)
+                add_issue(
+                    table, "missing_source_ref",
+                    "A linha não pôde ser ligada ao trecho original da fonte.",
+                    "Reimporte/reprocesse a tabela; cada linha precisa conservar sua referência estável.",
+                    row=row,
+                )
                 continue
             ref = dict(row_ref)
             if kind == "reverse_origin":
@@ -2205,11 +2284,23 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
                     cells[source_col] if 0 <= source_col < len(cells) else "")
                 target_label = cells[target_col] if 0 <= target_col < len(cells) else ""
             if _structured_value_is_empty(source_label) or _structured_value_is_empty(target_label):
-                pending.append(table_id)
+                add_issue(
+                    table, "missing_endpoint",
+                    "A linha não informa uma origem e um destino de entidade completos.",
+                    "Confirme as colunas de origem/destino ou exclua a tabela se ela não representar relações.",
+                    row=row, ref=ref, source_label=source_label, target_label=target_label,
+                )
                 continue
             from_id, to_id = node_for(source_label, ref), node_for(target_label, ref)
             if not from_id or not to_id or from_id == to_id:
-                pending.append(table_id)
+                add_issue(
+                    table, "invalid_relation",
+                    "A linha não produziu duas entidades diferentes para formar um caminho.",
+                    "Revise os nomes da origem/destino ou exclua a linha/tabela da seleção.",
+                    row=row, ref=ref, source_label=source_label, target_label=target_label,
+                    card_numbers=[node_by_key.get(_atlas_identity(source_label), {}).get("card_number", 0),
+                                  node_by_key.get(_atlas_identity(target_label), {}).get("card_number", 0)],
+                )
                 continue
             requirements = []
             columns = condition_cols or [index for index in range(len(cells))
@@ -2219,6 +2310,17 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
                     continue
                 header = headers[column] if column < len(headers) else f"Coluna {column + 1}"
                 requirements.append(_structured_requirement(header, cells[column], ref))
+            for requirement in requirements:
+                if requirement.get("operator") == "unknown":
+                    add_issue(
+                        table, "unknown_requirement",
+                        f"A condição {requirement.get('field') or 'desconhecida'} não tem semântica determinada na fonte.",
+                        "Confirme a regra no trecho original; não transforme a condição em obrigatória por suposição.",
+                        row=row, ref=ref, severity="warning",
+                        card_numbers=[node_by_key.get(_atlas_identity(source_label), {}).get("card_number", 0),
+                                      node_by_key.get(_atlas_identity(target_label), {}).get("card_number", 0)],
+                        field=requirement.get("field"), value=requirement.get("original"),
+                    )
             signature = tuple(sorted(_atlas_identity(item.get("text")) for item in requirements))
             edge_key = (from_id, to_id, kind, signature)
             if edge_key in edge_keys:
@@ -2235,6 +2337,7 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
             relation_rows += 1
     quality = {"selected_tables": len(selected), "selected_rows": selected_rows,
                "relation_rows": relation_rows, "pending_table_ids": sorted(set(pending)),
+               "pending_items": pending_items, "warning_items": warning_items,
                "complete": not pending}
     return fragment, quality
 
@@ -2305,6 +2408,31 @@ def _generate_system_from_structured_source(source: dict, system_title: str, gam
     fragment, quality = _materialize_structured_atlas(source, system_title, game, mappings)
     quality["unmapped_table_ids"] = sorted(set(pending_mapping))
     quality["pending_table_ids"] = sorted(set(quality.get("pending_table_ids") or []) | set(pending_mapping))
+    pending_items = list(quality.get("pending_items") or [])
+    known_issue_tables = {item.get("table_id") for item in pending_items}
+    table_by_id = {str(table.get("table_id") or ""): table for table in tables}
+    for table_id in sorted(set(pending_mapping)):
+        if table_id in known_issue_tables:
+            continue
+        table = table_by_id.get(table_id, {"table_id": table_id})
+        try:
+            page = max(0, int(table.get("page") or 0))
+        except (TypeError, ValueError):
+            page = 0
+        pending_items.append({
+            "id": f"atlas-issue-map-{len(pending_items) + 1:04d}",
+            "severity": "blocking", "kind": "table_mapping_missing",
+            "table_id": table_id,
+            "table_title": str((table.get("path") or [table.get("title") or "Tabela sem título"])[-1]),
+            "page": page, "row_id": "",
+            "row_number": 0, "row_preview": "",
+            "message": "A IA não devolveu um mapeamento para esta tabela.",
+            "action": "Retome a análise com outro modelo ou exclua explicitamente esta tabela na revisão da fonte.",
+            "source_ref": {"source_id": source.get("id", ""), "section": 0,
+                           "block": 0, "page": page},
+            "card_numbers": [],
+        })
+    quality["pending_items"] = pending_items
     if len(fragment.get("nodes") or []) < 2 or not fragment.get("edges"):
         raise GuideAIError("As tabelas selecionadas não produziram relações suficientes.", code="empty_source")
     sections = [{**section, "_source_id": source.get("id", ""), "_source_section": index}
@@ -2325,14 +2453,33 @@ def _generate_system_from_structured_source(source: dict, system_title: str, gam
         for requirement in edge.get("requirements") or []:
             for ref in requirement.get("source_refs") or []:
                 ref["source_id"] = source.get("id", "")
+    def page_number(value) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+    selected_table_ids = {str(table.get("table_id") or "") for table in tables}
+    selected_pages = {page_number(table.get("page")) for table in tables
+                      if str(table.get("table_id") or "") in selected_table_ids
+                      and page_number(table.get("page")) > 0}
+    referenced_pages = {page_number(ref.get("page")) for item in
+                       [system] + list(system.get("nodes") or []) + list(system.get("edges") or [])
+                       for ref in item.get("source_refs") or [] if page_number(ref.get("page")) > 0}
+    source_pages = {page_number(section.get("page")) for section in source.get("sections") or []
+                    if page_number(section.get("page")) > 0}
     if quality.get("pending_table_ids"):
         system["_atlas_pending"] = quality["pending_table_ids"]
     system["_analysis"] = {
         "batches": len(groups), "nodes": len(system.get("nodes") or []),
         "edges": len(system.get("edges") or []), "expected_rows": quality.get("selected_rows", 0),
         "audited_rows": quality.get("selected_rows", 0), "relation_rows": quality.get("relation_rows", 0),
+        "selected_tables": len(selected_table_ids), "source_pages": len(source_pages or selected_pages),
+        "referenced_pages": len(referenced_pages), "table_blocks": quality.get("selected_rows", 0),
+        "covered_table_blocks": quality.get("relation_rows", 0),
         "pending_table_ids": quality.get("pending_table_ids") or [],
         "unmapped_table_ids": quality.get("unmapped_table_ids") or [],
+        "pending_items": quality.get("pending_items") or [],
+        "warning_items": quality.get("warning_items") or [],
         "protocol_version": "gamefaqs-json-v1", "provider": provider, "model": cfg["model"],
         "resumed_batches": sum(1 for value in saved_groups.values() if isinstance(value, dict)),
     }

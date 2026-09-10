@@ -90,6 +90,21 @@ def test_pendencia_de_extracao_bloqueia_aprovacao(store):
         store.approve_atlas_draft("game", sid)
 
 
+def test_delete_system_archives_its_source_but_keeps_capture(store):
+    sid = pending(store)
+    draft = store.save_atlas_draft("game", sid, system(), "job1")
+    published = store.approve_atlas_draft("game", sid)
+    system_id = published["system"]["id"]
+    assert store.system_source("game", sid)["system_id"] == system_id
+    store.delete_system("game", system_id)
+    assert not store.current("game")["systems"]
+    archived = store.system_source("game", sid)
+    assert archived["status"] == "archived"
+    assert "reimportação" in archived["message"]
+    assert not store.atlas_draft("game", sid)
+    assert store.system_source("game", sid, include_sections=True)["sections"]
+
+
 def test_cancelled_and_old_workers_cannot_publish(store):
     sid = pending(store)
     store.update_system_source("game", sid, status="cancelled", job_id="")
@@ -372,11 +387,18 @@ def test_gamefaqs_json_mapeia_tabela_e_materializa_todas_as_linhas(monkeypatch):
         source, "Evoluções", {"title": "Digimon"},
         {"provider": provider, "api_key": "test", "model": "model-a"})
     assert {node["label"] for node in result["nodes"]} == {"Agumon", "Greymon", "Tyrannomon"}
+    assert [node["card_number"] for node in result["nodes"]] == [1, 2, 3]
     assert len(result["edges"]) == 2
     requirements = result["edges"][0]["requirements"]
     assert {item["field"] for item in requirements} == {"Weight", "Quota"}
     assert next(item for item in requirements if item["field"] == "Quota")["operator"] == "unknown"
+    assert any(item["kind"] == "unknown_requirement" for item in result["_analysis"]["warning_items"])
     assert result["_analysis"]["audited_rows"] == 2
+    assert result["_analysis"]["selected_tables"] == 1
+    assert result["_analysis"]["table_blocks"] == 2
+    assert result["_analysis"]["covered_table_blocks"] == 2
+    assert result["_analysis"]["source_pages"] == 1
+    assert result["_analysis"]["referenced_pages"] == 1
 
 
 def test_atlas_checkpoint_is_atomic_and_owned_by_active_worker(tmp_path):
