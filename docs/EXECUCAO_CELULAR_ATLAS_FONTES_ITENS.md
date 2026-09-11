@@ -1,8 +1,8 @@
 # Execução — Celular, Atlas, fontes e itens
 
 Data da rodada: 11/09/2026  
-Base de código: `v0.11.4` (`b8cdc31`)  
-Estado: implementação local concluída e validada; publicação Git ainda não foi solicitada nesta rodada.
+Base de código: `v0.11.5` (implementação `26fc247` + bump de versão)
+Estado: implementação local concluída e tag de release autorizada nesta rodada.
 
 ## Entregas verificadas
 
@@ -36,7 +36,8 @@ de dependências opcionais ausentes (`pycparser`/`tzdata`) e não falhou.
 - A captura genérica de outro site ainda captura uma página por chamada; a lista de descoberta é retornada para seleção/retomada. O adapter GameFAQs continua responsável pela paginação conhecida.
 - Playwright/Edge é opcional no ambiente de desenvolvimento e precisa ser instalado no ambiente de build para incluir a integração; o navegador Edge do usuário continua sendo requisito para páginas dinâmicas.
 - Teste visual físico em WebView2, Android/iOS e smoke com uma chave real de provedor não foi executado nesta rodada. Capturas sintéticas versionadas permanecem em `docs/screenshots/`.
-- Nenhum commit, push ou tag foi criado nesta rodada.
+- O commit de implementação já foi publicado; o bump de versão e a tag
+  `v0.11.5` serão publicados nesta rodada.
 
 ## Próximo passo exato
 

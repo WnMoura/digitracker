@@ -2,7 +2,7 @@
 
 ## Estado atual — rodada 11/09/2026
 
-O código local está na linha `v0.11.4` e recebeu a implementação do Atlas
+O código local está na linha `v0.11.5` e recebeu a implementação do Atlas
 estruturado, fontes GameFAQs/Wayback/HTML, itens e companion detalhado. A
 extração preserva JSON editorial e Markdown derivado; tabelas com células
 mescladas/cabeçalhos repetidos, marcadores `Evolution Item` e requisitos por
@@ -19,8 +19,9 @@ leitura autenticados para capítulos, Atlas, itens, conquistas e referências.
 Validação local desta rodada: **599 testes passaram**, `compileall`, `node
 --check` dos dois companions e `git diff --check` passaram. O build físico
 Windows foi concluído em `dist/DigiTracker.exe`; ainda falta abrir e validar
-o WebView2, além do smoke com provedor real. Não houve commit, push ou tag
-nesta rodada; fazer isso somente após autorização explícita do autor.
+o WebView2, além do smoke com provedor real. O commit de implementação já foi
+publicado em `26fc247`; a tag `v0.11.5` será publicada após este ajuste de
+versão.
 
 O registro detalhado está em
 [`docs/EXECUCAO_CELULAR_ATLAS_FONTES_ITENS.md`](EXECUCAO_CELULAR_ATLAS_FONTES_ITENS.md).
@@ -33,7 +34,7 @@ O registro detalhado está em
 
 App desktop **pywebview** (Python + HTML/CSS/JS vanilla) que acompanha conquistas do **RetroAchievements** reordenadas pela ordem de um guia, com um **overlay que gruda por cima da janela do emulador**. Uso pessoal, single-user, offline-first.
 
-- Repositório: **WnMoura/digitracker** (privado), branch `main`, código em preparação para a release **v0.11.4**.
+- Repositório: **WnMoura/digitracker** (privado), branch `main`, código em preparação para a release **v0.11.5**.
 - Backend: `engine.py` (janela + `js_api` + sincronização + estado + overlay). Módulos principais: `ra_api.py`, `gamefaqs.py`, `guide_ai.py`, `guide_parser.py`, `smart_guide.py`, `guide_media.py`, `experience.py`, `experience_api.py`, `companion.py`, `emulator_tracker.py`, `updater.py` e provedores de imagem.
 - Frontend: `ui/index.html`, `ui/app.js`, `ui/style.css`, fontes locais (`ui/fonts/`).
 - Testes: `tests/` (pytest) — **599 passando** na validação integrada atual
@@ -46,7 +47,7 @@ App desktop **pywebview** (Python + HTML/CSS/JS vanilla) que acompanha conquista
 - Relações alternativas do Atlas entre os mesmos nós preservam rótulo, tipo de rota e requisitos, sem serem rejeitadas como duplicatas.
 - A importação do GameFAQs separa navegação/anúncios do conteúdo e preserva tabelas e paginação.
 - PDF, GameFAQs e Atlas exibem estado de processamento e erros classificados; a área de IA mostra telemetria local sem chaves, prompts ou respostas.
-- A release histórica usava `0.10.6`; o estado local atual aponta para `0.11.4` em
+- A release histórica usava `0.10.6`; o estado local atual aponta para `0.11.5` em
   `version.py`. Antes de publicar, a tag planejada deve corresponder exatamente
   ao valor atual para o workflow aceitar o build.
 
@@ -64,7 +65,7 @@ App desktop **pywebview** (Python + HTML/CSS/JS vanilla) que acompanha conquista
 - **Arraste do overlay no Windows:** o drag-region nativo do pywebview **não funciona no WinForms** (ele chama `window.move` na thread do bridge js_api, que não surte efeito). Por isso existe um arraste próprio: `makeDraggable` (ui/app.js) → `move_window` → `_window_op` (roda numa thread própria, igual fechar/minimizar/dockar). Se o arraste falhar no Windows, é aqui que se investiga.
 - **Fullscreen exclusivo (D3D):** nenhum overlay aparece por cima. O app detecta (`SHQueryUserNotificationState`) e, com o interruptor ligado nas Configurações, pode mandar **Alt+Enter** ou levar o overlay para o **segundo monitor**. Sem interruptor, só avisa.
 
-## O que validar no Windows (aplicável ao v0.11.4)
+## O que validar no Windows (aplicável ao v0.11.5)
 
 1. **Overlay grudando no emulador (o principal):** abrir Dolphin/PCSX2/ePSXe em **janela ou borderless** → o app deve entrar em compacto, **dimensionar proporcional** à janela do emulador (~26%×44%) e **grudar no canto superior-direito de dentro**; seguir se a janela mover/redimensionar; **restaurar** ao fechar. Toggle "Ajustar ao tamanho do emulador" nas Configurações (ligado por padrão).
 2. **Arraste do overlay** pela faixa de cima (o `makeDraggable`).
