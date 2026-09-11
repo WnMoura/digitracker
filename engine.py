@@ -2629,6 +2629,12 @@ class Api(ExperienceApi, DataToolsApi):
                     "rows": len(element.get("rows") or []),
                     "sample": sample,
                     "row_refs": rows,
+                    "semantic_role": guide_ai._structured_table_semantic_role({
+                        "title": element.get("title", ""),
+                        "path": element.get("path") or [],
+                        "headers": [item.get("text", "") for item in element.get("headers") or []],
+                        "rows": element.get("rows") or [],
+                    }),
                     "selected": True,
                 })
         metadata = source.get("metadata") or {}

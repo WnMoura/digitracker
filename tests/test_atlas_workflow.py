@@ -401,6 +401,179 @@ def test_gamefaqs_json_mapeia_tabela_e_materializa_todas_as_linhas(monkeypatch):
     assert result["_analysis"]["referenced_pages"] == 1
 
 
+def _structured_atlas_source(table_specs):
+    """Monta uma captura mínima com referências estáveis para os testes do Atlas."""
+    elements, blocks = [], []
+    for table_id, path, headers, values in table_specs:
+        rows = [{
+            "id": f"{table_id}-r0001", "index": 0,
+            "cells": [{"tag": "th", "column": index, "text": header,
+                       "colspan": 1, "rowspan": 1}
+                      for index, header in enumerate(headers)],
+        }]
+        for row_index, row_values in enumerate(values, 2):
+            row_id = f"{table_id}-r{row_index:04d}"
+            rows.append({
+                "id": row_id, "index": row_index - 1,
+                "cells": [{"tag": "td", "column": index, "text": value,
+                           "colspan": 1, "rowspan": 1}
+                          for index, value in enumerate(row_values)],
+            })
+        elements.append({
+            "id": table_id, "type": "table", "title": path[-1] if path else "",
+            "path": path, "headers": [{"text": header, "column": index}
+                                       for index, header in enumerate(headers)],
+            "columns": len(headers), "rows": rows,
+        })
+        blocks.extend({"table_id": table_id, "row_id": row["id"],
+                       "text": " | ".join(cell["text"] for cell in row["cells"]),
+                       "page": 1} for row in rows)
+    return {
+        "id": "source-item-rules", "hash": "item-rules", "source_format": "gamefaqs-json-v1",
+        "selection": {"table_ids": [spec[0] for spec in table_specs]},
+        "sections": [{"title": "Página 1", "page": 1, "blocks": blocks}],
+        "structured": {"format": "gamefaqs-json-v1", "pages": [{
+            "page": 1, "elements": elements,
+        }]},
+    }
+
+
+def _structured_mapping_caller(payload):
+    import json
+
+    result = []
+    for table in json.loads(payload)["tables_to_map"]:
+        table_id = table["table_id"]
+        if table_id.startswith("evo"):
+            result.append({
+                "table_id": table_id, "kind": "evolution", "source_column": -1,
+                "target_column": 0, "condition_columns": [1],
+                "source_from_context": True, "target_from_context": False,
+                "confidence": 1, "note": "",
+            })
+        elif table_id.startswith("ref"):
+            result.append({
+                "table_id": table_id, "kind": "unknown", "source_column": -1,
+                "target_column": -1, "condition_columns": [],
+                "source_from_context": False, "target_from_context": False,
+                "confidence": 1, "note": "",
+            })
+        else:
+            # Simula uma resposta antiga que classificava Requirements como
+            # evolução: a guarda local deve corrigir isso antes de criar cards.
+            result.append({
+                "table_id": table_id, "kind": "evolution", "source_column": -1,
+                "target_column": -1, "condition_columns": [],
+                "source_from_context": False, "target_from_context": False,
+                "confidence": .4, "note": "",
+            })
+    return {"tables": result}
+
+
+def test_requirement_item_table_is_attached_without_item_cards(monkeypatch):
+    source = _structured_atlas_source([
+        ("evo-agumon", ["Rookie Digimon", "Agumon"],
+         ["Evolution", "Requirements"],
+         [["Examon", "Special Digivolution (via Evolution Item)"]]),
+        ("req-examon", ["Special Digivolution (via Evolution Item)", "Examon"],
+         ["Requirements"],
+         [["Use Emperor Dragon's Great Spear on ANY Mega"]]),
+    ])
+    provider = guide_ai.DEFAULT_PROVIDER
+    monkeypatch.setitem(guide_ai._CALLERS, provider,
+                        lambda _cfg, _system, payload, _schema:
+                        _structured_mapping_caller(payload))
+    result = guide_ai.generate_system_from_source(
+        source, "Evoluções", {"title": "Digimon"},
+        {"provider": provider, "api_key": "test", "model": "model-a"})
+    assert {node["label"] for node in result["nodes"]} == {"Agumon", "Examon"}
+    assert len(result["edges"]) == 1
+    requirement = result["edges"][0]["requirements"][-1]
+    assert requirement["mode"] == "item"
+    assert requirement["field"] == "Requirements"
+    assert requirement["original"] == "Use Emperor Dragon's Great Spear on ANY Mega"
+    assert "Emperor Dragon" in requirement["text"]
+    assert result["_analysis"]["pending_items"] == []
+    assert result["_analysis"]["covered_table_blocks"] == result["_analysis"]["table_blocks"] == 2
+    assert result["edges"][0]["label"] == "Especial · Item"
+
+
+def test_jogress_requirement_keeps_partner_as_condition(monkeypatch):
+    source = _structured_atlas_source([
+        ("evo-bancho", ["Mega", "BanchoLeomon"],
+         ["Evolution", "Requirements"],
+         [["Chaosmon", "Special Digivolution (via Jogress/DigiMemory)"]]),
+        ("req-chaosmon", ["Special Digivolution (via Jogress/DigiMemory)", "Chaosmon"],
+         ["Digimemory", "+", "Partner Digimon"],
+         [["BanchoLeomon", "+", "Darkdramon"],
+          ["Darkdramon", "+", "BanchoLeomon"]]),
+    ])
+    provider = guide_ai.DEFAULT_PROVIDER
+    monkeypatch.setitem(guide_ai._CALLERS, provider,
+                        lambda _cfg, _system, payload, _schema:
+                        _structured_mapping_caller(payload))
+    result = guide_ai.generate_system_from_source(
+        source, "Evoluções", {"title": "Digimon"},
+        {"provider": provider, "api_key": "test", "model": "model-a"})
+    assert {node["label"] for node in result["nodes"]} == {"BanchoLeomon", "Chaosmon"}
+    edge = result["edges"][0]
+    assert edge["label"] == "Especial · Jogress/DigiMemory"
+    requirement = next(item for item in edge["requirements"] if "Darkdramon" in item.get("text", ""))
+    assert "BanchoLeomon" in requirement["text"]
+    assert "Darkdramon" in requirement["text"]
+    assert sum(item.get("mode") == "jogress" and "Darkdramon" in item.get("text", "")
+               for item in edge["requirements"]) == 1
+    assert "+" not in {node["label"] for node in result["nodes"]}
+    assert result["_analysis"]["pending_items"] == []
+
+
+def test_item_location_is_reference_not_an_atlas_endpoint(monkeypatch):
+    source = _structured_atlas_source([
+        ("evo-agumon", ["Rookie Digimon", "Agumon"],
+         ["Evolution", "Requirements"], [["Greymon", "25 or more"]]),
+        ("ref-location", ["Evolution Item Location"], ["Item", "Location"],
+         [["Sacred wings", "File City Shop"]]),
+    ])
+    provider = guide_ai.DEFAULT_PROVIDER
+    monkeypatch.setitem(guide_ai._CALLERS, provider,
+                        lambda _cfg, _system, payload, _schema:
+                        _structured_mapping_caller(payload))
+    result = guide_ai.generate_system_from_source(
+        source, "Evoluções", {"title": "Digimon"},
+        {"provider": provider, "api_key": "test", "model": "model-a"})
+    assert {node["label"] for node in result["nodes"]} == {"Agumon", "Greymon"}
+    assert result["_analysis"]["pending_items"] == []
+    assert result["_analysis"]["excluded_rows"] == 1
+
+
+def test_requirement_without_relation_has_specific_pending_issue():
+    source = _structured_atlas_source([
+        ("req-orphan", ["Special Digivolution (via Evolution Item)", "Missingmon"],
+         ["Requirements"], [["Use X-Program on Missingmon"]]),
+    ])
+    fragment, quality = guide_ai._materialize_structured_atlas(
+        source, "Evoluções", {"title": "Digimon"}, {
+            "req-orphan": {"kind": "requirement", "source_column": -1,
+                            "target_column": -1, "condition_columns": [],
+                            "source_from_context": False, "target_from_context": False},
+        })
+    assert fragment["nodes"] == []
+    assert quality["pending_items"][0]["kind"] == "requirement_without_relation"
+    assert quality["pending_items"][0]["kind"] != "missing_endpoint"
+
+
+def test_attribute_table_and_dash_placeholders_are_not_requirements():
+    table = {
+        "title": "Examon", "path": ["Special Digivolution (via Evolution Item)", "Examon"],
+        "headers": [], "rows": [
+            {"index": 0, "cells": [{"column": 0, "text": "Attribute"}, {"column": 1, "text": "Vaccine"}]},
+            {"index": 1, "cells": [{"column": 0, "text": "Nature"}, {"column": 1, "text": "Air, Fighting"}]},
+        ],
+    }
+    assert guide_ai._structured_table_semantic_role(table, "evolution") == "reference"
+    assert guide_ai._structured_value_is_empty("---")
+
+
 def test_atlas_checkpoint_is_atomic_and_owned_by_active_worker(tmp_path):
     store = smart_guide.SmartGuideStore(tmp_path)
     store.ensure_source("game", "Game", SECTIONS)

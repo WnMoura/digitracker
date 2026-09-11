@@ -2551,6 +2551,13 @@ button, input, select, summary { outline: none; }
 .atlas-inspector-actions .danger { color: #ffaaa5; border-color: rgba(255,111,102,.4); background: rgba(116,30,32,.24); }
 .atlas-inspector-actions .danger:hover, .atlas-inspector-actions .danger:focus-visible { border-color: #ff8c82; background: rgba(144,34,35,.45); }
 .atlas-source-table-row.is-pending { border-color: rgba(255,132,104,.7); box-shadow: inset 3px 0 #ff7969; background: rgba(103,30,27,.32); }
+.atlas-source-table-row.is-requirement { border-color: rgba(91,198,255,.28); }
+.atlas-source-table-row.is-reference { opacity: .78; }
+.atlas-source-table-row.is-requirement em:nth-of-type(1) { color: #78d2ff; }
+.atlas-source-table-row.is-reference em:nth-of-type(1) { color: #8ba5b8; }
+.atlas-requirement-mode { display: inline-block; margin: 0 5px 3px 0; padding: 2px 4px; border: 1px solid rgba(92,201,255,.34); border-radius: 4px; color: #8bd9ff; background: rgba(10,84,128,.28); font-size: 7px; letter-spacing: .06em; }
+.atlas-requirement-mode.jogress { color: #c8b7ff; border-color: rgba(163,137,255,.4); background: rgba(74,43,132,.28); }
+.atlas-requirement-mode.reincarnation { color: #ffcf7d; border-color: rgba(238,170,66,.4); background: rgba(116,69,15,.28); }
 .atlas-source-table-row.is-pending strong { display: block; margin-top: 5px; color: #ffb6a5; font-size: 8px; font-weight: 850; }
 .atlas-source-warning.blocking { border-left-color: #ff7768; background: rgba(113,31,28,.28); }
 .atlas-diagnostics-panel { width: min(760px, calc(100vw - 30px)); max-height: calc(100vh - 30px); display: grid; grid-template-rows: auto minmax(0,1fr) auto; overflow: hidden; border: 1px solid rgba(94,181,239,.4); border-radius: 15px; color: #eaf5ff; background: linear-gradient(145deg,#0b2339,#061526); box-shadow: 0 25px 80px rgba(0,0,0,.58); }
