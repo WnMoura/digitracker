@@ -546,6 +546,50 @@ def test_item_location_is_reference_not_an_atlas_endpoint(monkeypatch):
     assert result["_analysis"]["excluded_rows"] == 1
 
 
+def test_item_and_location_columns_keep_item_identity_separate(monkeypatch):
+    source = _structured_atlas_source([
+        ("evo-item", ["Special Digivolution", "Examon"],
+         ["Evolution", "Requirements"], [["Examon X", "Evolution Item"]]),
+        ("req-item", ["Special Digivolution", "Examon X"],
+         ["Item", "Location"], [["3x Sacred Wings", "File City Shop"]]),
+    ])
+    provider = guide_ai.DEFAULT_PROVIDER
+    monkeypatch.setitem(guide_ai._CALLERS, provider,
+                        lambda _cfg, _system, payload, _schema:
+                        _structured_mapping_caller(payload))
+    result = guide_ai.generate_system_from_source(
+        source, "Evoluções", {"title": "Digimon"},
+        {"provider": provider, "api_key": "test", "model": "model-a"})
+    edge = result["edges"][0]
+    requirement = next(item for item in edge["requirements"]
+                       if item.get("mode") == "item" and item.get("condition"))
+    assert requirement["condition"]["item_name"] == "Sacred Wings"
+    assert requirement["condition"]["quantity"] == 3
+    assert requirement["location"] == "File City Shop"
+    assert "File City Shop" in requirement["text"]
+    assert all(item.get("text") != "Requirements: Evolution Item"
+               for item in edge["requirements"])
+
+
+def test_structured_numeric_requirement_is_typed_and_evaluable(monkeypatch):
+    source = _structured_atlas_source([
+        ("evo-numeric", ["Rookie Digimon", "Agumon"],
+         ["Evolution", "Weight"], [["Greymon", "25 or more"]]),
+    ])
+    provider = guide_ai.DEFAULT_PROVIDER
+    monkeypatch.setitem(guide_ai._CALLERS, provider,
+                        lambda _cfg, _system, payload, _schema:
+                        _structured_mapping_caller(payload))
+    result = guide_ai.generate_system_from_source(
+        source, "Evoluções", {"title": "Digimon"},
+        {"provider": provider, "api_key": "test", "model": "model-a"})
+    requirement = result["edges"][0]["requirements"][0]
+    assert requirement["value"] == 25
+    assert requirement["operator"] == ">="
+    assert requirement["condition"]["op"] == "compare"
+    assert requirement["condition"]["value"] == 25
+
+
 def test_requirement_without_relation_has_specific_pending_issue():
     source = _structured_atlas_source([
         ("req-orphan", ["Special Digivolution (via Evolution Item)", "Missingmon"],

@@ -133,6 +133,220 @@ class CompanionServer:
         def state():
             return jsonify(self.snapshot(request.args.get("slug", "")))
 
+        # Read-only projections for the detailed mobile experience.  The
+        # callback intentionally returns the already-sanitised companion
+        # snapshot: no route ever reads the guide/source files directly or
+        # exposes raw HTML, private notes, drafts or session credentials.
+        def public_state():
+            value = self.snapshot(request.args.get("slug", ""))
+            if not isinstance(value, dict) or not value.get("ok"):
+                return None, (jsonify(value if isinstance(value, dict) else
+                                      {"ok": False, "error": "Estado indisponível."}), 404)
+            return value, None
+
+        def bounded_int(name, default, minimum, maximum):
+            try:
+                return max(minimum, min(maximum, int(request.args.get(name, default))))
+            except (TypeError, ValueError):
+                return default
+
+        @app.get("/api/games")
+        def games():
+            value, error = public_state()
+            if error:
+                return error
+            # A companion session is scoped to the PC's active library.  A
+            # slug query may select another permitted game for consultation,
+            # but it never changes the compact game's active session.
+            return jsonify(ok=True, games=[value.get("game") or {}],
+                           active_slug=(value.get("game") or {}).get("slug", ""))
+
+        @app.get("/api/guide")
+        def guide():
+            value, error = public_state()
+            if error:
+                return error
+            chapters = value.get("chapters") or []
+            return jsonify(ok=True, chapters=chapters,
+                           progress=value.get("progress") or {},
+                           content_revision=value.get("content_revision", ""),
+                           progress_revision=value.get("progress_revision", ""))
+
+        @app.get("/api/guide/chapter")
+        def guide_chapter():
+            value, error = public_state()
+            if error:
+                return error
+            chapters = value.get("chapters") or []
+            requested = str(request.args.get("chapter", "")).strip()
+            chapter = None
+            if requested:
+                chapter = next((item for item in chapters if str(item.get("id")) == requested), None)
+                if chapter is None:
+                    try:
+                        index = int(requested)
+                    except (TypeError, ValueError):
+                        index = -1
+                    if 0 <= index < len(chapters):
+                        chapter = chapters[index]
+            if chapter is None and chapters:
+                chapter = chapters[0]
+            if chapter is None:
+                return jsonify(ok=False, error="Capítulo não encontrado."), 404
+            return jsonify(ok=True, chapter=chapter,
+                           progress=value.get("progress") or {},
+                           content_revision=value.get("content_revision", ""),
+                           progress_revision=value.get("progress_revision", ""))
+
+        @app.get("/api/atlas/systems")
+        def atlas_systems():
+            value, error = public_state()
+            if error:
+                return error
+            return jsonify(ok=True, systems=value.get("systems") or [],
+                           system_state=value.get("system_state") or {},
+                           content_revision=value.get("content_revision", ""),
+                           progress_revision=value.get("progress_revision", ""))
+
+        @app.get("/api/atlas/nodes")
+        def atlas_nodes():
+            value, error = public_state()
+            if error:
+                return error
+            system_id = str(request.args.get("system_id", "")).strip()
+            nodes = []
+            for system in value.get("systems") or []:
+                if system_id and system.get("id") != system_id:
+                    continue
+                for node in system.get("nodes") or []:
+                    nodes.append({**node, "system_id": system.get("id", ""),
+                                  "system_title": system.get("title", "")})
+            return jsonify(ok=True, nodes=nodes,
+                           content_revision=value.get("content_revision", ""))
+
+        @app.get("/api/atlas/node")
+        def atlas_node():
+            value, error = public_state()
+            if error:
+                return error
+            system_id = str(request.args.get("system_id", "")).strip()
+            node_id = str(request.args.get("node_id", "")).strip()
+            system = next((item for item in value.get("systems") or []
+                           if item.get("id") == system_id), None)
+            node = next((item for item in (system or {}).get("nodes") or []
+                         if item.get("id") == node_id), None)
+            if not system or not node:
+                return jsonify(ok=False, error="Nó do Atlas não encontrado."), 404
+            incoming = [edge for edge in system.get("edges") or [] if edge.get("to") == node_id]
+            outgoing = [edge for edge in system.get("edges") or [] if edge.get("from") == node_id]
+            return jsonify(ok=True, system={"id": system.get("id", ""),
+                                             "title": system.get("title", "")},
+                           node=node, incoming=incoming, outgoing=outgoing,
+                           content_revision=value.get("content_revision", ""),
+                           progress_revision=value.get("progress_revision", ""))
+
+        @app.get("/api/atlas/graph")
+        def atlas_graph():
+            value, error = public_state()
+            if error:
+                return error
+            system_id = str(request.args.get("system_id", "")).strip()
+            systems = [item for item in value.get("systems") or []
+                       if not system_id or item.get("id") == system_id]
+            if system_id and not systems:
+                return jsonify(ok=False, error="Sistema do Atlas não encontrado."), 404
+            return jsonify(ok=True, systems=systems,
+                           content_revision=value.get("content_revision", ""),
+                           progress_revision=value.get("progress_revision", ""))
+
+        @app.get("/api/items")
+        def items():
+            value, error = public_state()
+            if error:
+                return error
+            allowed = {"all", "owned", "missing"}
+            possessed = str(request.args.get("possessed", "all")).strip().lower()
+            if possessed not in allowed:
+                return jsonify(ok=False, error="Filtro de posse inválido."), 400
+            query = str(request.args.get("q", request.args.get("query", "")))[:250].casefold()
+            rows = value.get("items") or []
+            if query:
+                rows = [item for item in rows if query in " ".join(
+                    [str(item.get("name") or ""), str(item.get("id") or ""),
+                     *[str(alias) for alias in item.get("aliases") or []]]).casefold()]
+            if possessed == "owned":
+                rows = [item for item in rows if item.get("quantity") is not None and item.get("quantity", 0) > 0]
+            elif possessed == "missing":
+                rows = [item for item in rows if item.get("quantity") in (None, 0)]
+            offset = bounded_int("offset", 0, 0, 100_000)
+            limit = bounded_int("limit", 50, 1, 100)
+            return jsonify(ok=True, items=rows[offset:offset + limit], total=len(rows),
+                           offset=offset, limit=limit,
+                           items_revision=value.get("items_revision", 0))
+
+        @app.get("/api/items/detail")
+        def item_detail():
+            value, error = public_state()
+            if error:
+                return error
+            item_id = str(request.args.get("item_id", "")).strip()
+            item = next((row for row in value.get("items") or [] if row.get("id") == item_id), None)
+            if not item:
+                return jsonify(ok=False, error="Item não encontrado."), 404
+            return jsonify(ok=True, item=item, items_revision=value.get("items_revision", 0))
+
+        @app.get("/api/achievements")
+        def achievements():
+            value, error = public_state()
+            if error:
+                return error
+            rows = list(value.get("achievements") or [])
+            query = str(request.args.get("q", ""))[:250].casefold()
+            status = str(request.args.get("status", "all")).strip().lower()
+            if query:
+                rows = [item for item in rows if query in " ".join(
+                    [str(item.get("name") or ""), str(item.get("desc") or ""),
+                     str(item.get("id") or "")]).casefold()]
+            if status == "pending":
+                rows = [item for item in rows if not item.get("earned")]
+            elif status == "earned":
+                rows = [item for item in rows if item.get("earned")]
+            elif status not in {"all", "pending", "earned", "missable"}:
+                return jsonify(ok=False, error="Filtro de conquista inválido."), 400
+            if status == "missable":
+                rows = [item for item in rows if item.get("achievement_type") == "missable"]
+            offset = bounded_int("offset", 0, 0, 100_000)
+            limit = bounded_int("limit", 50, 1, 100)
+            return jsonify(ok=True, achievements=rows[offset:offset + limit], total=len(rows),
+                           offset=offset, limit=limit,
+                           content_revision=value.get("content_revision", ""))
+
+        @app.get("/api/reference")
+        def reference():
+            value, error = public_state()
+            if error:
+                return error
+            ref_id = str(request.args.get("id", request.args.get("block_id", ""))).strip()
+            page = str(request.args.get("page", "")).strip()
+            matches = []
+            for chapter in value.get("chapters") or []:
+                for block in chapter.get("blocks") or []:
+                    if ref_id and ref_id not in {str(block.get("id", "")), str(block.get("element_id", ""))}:
+                        continue
+                    refs = block.get("source_refs") or []
+                    if page and not any(str(ref.get("page", "")) == page for ref in refs if isinstance(ref, dict)):
+                        continue
+                    matches.append({"chapter_id": chapter.get("id", ""),
+                                   "chapter_title": chapter.get("title", ""),
+                                   "block": block})
+            if ref_id and not matches:
+                for system in value.get("systems") or []:
+                    for node in system.get("nodes") or []:
+                        if ref_id in {str(node.get("id", "")), str(node.get("entity_id", ""))}:
+                            matches.append({"system_id": system.get("id", ""), "system_title": system.get("title", ""), "node": node})
+            return jsonify(ok=True, references=matches[:100], total=len(matches),
+                           content_revision=value.get("content_revision", ""))
+
         @app.post("/api/action")
         def action():
             body = request.get_json()

@@ -152,6 +152,7 @@ const S = {
   guideQuery: "",
   guideFilter: "all",
   guideAtlas: { systemId: "", nodeId: "", group: "all", tag: "all", availability: "all", spoilers: false, search: "", mode: "focus", zoom: 1, panX: 24, panY: 24 },
+  guideImageFill: {},
   smartGuideAuto: true,
   smartGuideConsent: false,
   guideDensity: "comfortable",
@@ -392,8 +393,20 @@ const backend = {
   async addWalkthroughPdf(slug, data, filename) {
     return window.pywebview.api.add_walkthrough_pdf(slug, data, filename);
   },
-  async addWalkthroughGameFaqs(slug, url) {
-    return window.pywebview.api.add_walkthrough_gamefaqs(slug, url);
+  async addWalkthroughGameFaqs(slug, url, title = "") {
+    return window.pywebview.api.add_walkthrough_gamefaqs(slug, url, title);
+  },
+  async captureWebSource(slug, title, url, mode = "http") {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.capture_web_source(slug, title, url, mode);
+  },
+  async listSourceCaptures(slug) {
+    if (S.mode === "demo") return { ok: true, sources: [] };
+    return window.pywebview.api.list_source_captures(slug);
+  },
+  async sourceCapture(slug, sourceId, captureId = "") {
+    if (S.mode === "demo") return { ok: false, error: "Disponível só no app real." };
+    return window.pywebview.api.get_source_capture(slug, sourceId, captureId);
   },
   async addWalkthroughText(slug, title, value) {
     return window.pywebview.api.add_walkthrough_text(slug, title, value);
@@ -448,6 +461,9 @@ const backend = {
   async createGuideSystemGameFaqs(slug, title, url) {
     return window.pywebview.api.create_guide_system_from_gamefaqs(slug, title, url);
   },
+  async createGuideSystemWeb(slug, title, url, mode = "http") {
+    return window.pywebview.api.create_guide_system_from_web(slug, title, url, mode);
+  },
   async guideSystemSource(slug, systemId) {
     return window.pywebview.api.get_guide_system_source(slug, systemId);
   },
@@ -490,6 +506,22 @@ const backend = {
   async searchGuideSystemMedia(slug, systemId, nodeId, query, page = 0, sourceId = '') {
     if (S.mode === "demo") return { ok: true, results: [], query, provider: "demo" };
     return window.pywebview.api.search_guide_system_media(slug, systemId, nodeId, query || "", page, sourceId);
+  },
+  async startGuideSystemImageFill(slug, systemId, sourceId = '') {
+    if (S.mode === "demo") return { ok: true, phase: "complete", total: 0, completed: 0, filled: 0, empty: 0, failed: 0 };
+    return window.pywebview.api.start_guide_system_image_fill(slug, systemId, sourceId);
+  },
+  async guideSystemImageFillStatus(slug, systemId, sourceId = '') {
+    if (S.mode === "demo") return { ok: true, phase: "complete", total: 0, completed: 0, filled: 0, empty: 0, failed: 0 };
+    return window.pywebview.api.get_guide_system_image_fill(slug, systemId, sourceId);
+  },
+  async undoGuideSystemImageFill(slug, systemId, sourceId = '', jobId = '') {
+    if (S.mode === "demo") return { ok: true, reverted: 0, preserved: 0 };
+    return window.pywebview.api.undo_guide_system_image_fill(slug, systemId, sourceId, jobId);
+  },
+  async cancelGuideSystemImageFill(slug, systemId, sourceId = '') {
+    if (S.mode === "demo") return { ok: true, phase: "cancelled" };
+    return window.pywebview.api.cancel_guide_system_image_fill(slug, systemId, sourceId);
   },
   async setGuideSystemMedia(slug, systemId, nodeId, mediaId, sourceId = '') {
     if (S.mode === "demo") {
@@ -1499,7 +1531,7 @@ function achievementsHTML(game) {
     if (filter === "missable") return block.type === "missable";
     if (filter === "softcore") return false;
     return true;
-  }).map((block) => `<div class="guide-step-row type-${esc(block.type)} ${guideCompleted.has(block.id) ? "done" : ""}" data-guide-block="${esc(block.id)}"><button class="smart-check" data-guide-action="complete" data-value="${!guideCompleted.has(block.id)}">${guideCompleted.has(block.id) ? "✓" : block.type === "missable" ? "◆" : block.type === "warning" ? "!" : "→"}</button><div><span>${block.type === "missable" ? "AVISO DO GUIA · PERDÍVEL" : esc(block.type)}</span><b>${esc(block.title || block.text)}</b>${block.title && block.text ? `<small>${esc(block.text)}</small>` : ""}</div></div>`).join("");
+  }).map((block, index) => `<div class="guide-step-row type-${esc(block.type)} ${guideCompleted.has(block.id) ? "done" : ""}" data-guide-block="${esc(block.id)}" data-card-number="${String(index + 1)}"><button class="smart-check" data-testid="guide-complete" data-block-id="${esc(block.id)}" data-guide-action="complete" data-value="${!guideCompleted.has(block.id)}">${guideCompleted.has(block.id) ? "✓" : block.type === "missable" ? "◆" : block.type === "warning" ? "!" : "→"}</button><div><span>${block.type === "missable" ? "AVISO DO GUIA · PERDÍVEL" : esc(block.type)}</span><b>${esc(block.title || block.text)}</b>${block.title && block.text ? `<small>${esc(block.text)}</small>` : ""}</div></div>`).join("");
   let rows = "", lastStep = null;
   const renderedGuideSteps = new Set();
   for (const a of visible) {
@@ -1708,26 +1740,26 @@ function guideSystemsHTML(game) {
       return `M${start.x},${start.y} Q${(start.x + end.x) / 2},${(start.y + end.y) / 2} ${end.x},${end.y}`;
     }
     if (layout.direction === "vertical") {
-      const x1 = from.x + width / 2, y1 = from.y + height;
-      const x2 = to.x + width / 2, y2 = to.y;
+      const x1 = from.x + width / 2, y1 = from.y + height - 4;
+      const x2 = to.x + width / 2, y2 = to.y + 4;
       if (y2 > y1 + 10) {
         const bend = Math.max(36, (y2 - y1) * .45);
         return `M${x1},${y1} C${x1},${y1 + bend} ${x2},${y2 - bend} ${x2},${y2}`;
       }
-      const channelX = Math.max(from.x + width, to.x + width) + 30;
+      const channelX = Math.min(layout.width - 16, Math.max(from.x + width, to.x + width) + 30);
       return `M${x1},${y1} C${x1},${y1 + 28} ${channelX},${y1 + 28} ${channelX},${y1 + 56} L${channelX},${y2 - 56} C${channelX},${y2 - 28} ${x2},${y2 - 28} ${x2},${y2}`;
     }
-    const x1 = from.x + width, y1 = from.y + height / 2;
-    const x2 = to.x, y2 = to.y + height / 2;
+    const x1 = from.x + width - 4, y1 = from.y + height / 2;
+    const x2 = to.x + 4, y2 = to.y + height / 2;
     if (x2 > x1 + 10) {
       const bend = Math.max(42, (x2 - x1) * .45);
       return `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}`;
     }
     // Backward/cyclic links use a reserved lower channel so they never cut
     // through a card or leave the bounded SVG world.
-    const channelY = Math.max(from.y + height, to.y + height) + 30;
-    const laneStart = Math.min(layout.width - 16, x1 + 30);
-    const laneEnd = Math.max(16, x2 + width / 2);
+    const channelY = Math.min(layout.height - 16, Math.max(from.y + height, to.y + height) + 30);
+    const laneStart = Math.min(layout.width - 16, Math.max(16, x1 + 30));
+    const laneEnd = Math.min(layout.width - 16, Math.max(16, x2 + width / 2));
     return `M${x1},${y1} C${laneStart},${y1} ${laneStart},${channelY} ${laneStart},${channelY} L${laneEnd},${channelY} C${laneEnd},${channelY} ${x2},${y2 - 28} ${x2},${y2}`;
   };
   const refsHTML = (refs) => (refs || []).map((ref) => ref.page ? `p.${ref.page}` : `§${ref.section}.${ref.block}`).join(" · ");
@@ -1766,11 +1798,14 @@ function guideSystemsHTML(game) {
     <div class="atlas-inspector-card-id">CARD #${String(selectedCardNumber).padStart(3, "0")}</div><small>${esc(selected.stage || selected.group || "SISTEMA")}</small><h3>${esc(selected.label)}</h3><p>${esc(selected.subtitle || "Selecione uma imagem e acompanhe os requisitos deste objetivo.")}</p>
     ${(selected.tags || []).length ? `<div class="atlas-tags">${selected.tags.map((tag) => `<span>${esc(tag)}</span>`).join("")}</div>` : ""}
     ${Object.keys(selected.attributes || {}).length ? `<dl>${Object.entries(selected.attributes).map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>` : ""}
-    <div class="atlas-requirements"><b>REQUISITOS</b>${requirements.length ? requirements.map((req) => `<label class="${req.missable ? "missable" : ""} ${req.operator === "unknown" ? "unknown" : ""}"><input type="checkbox" data-atlas-requirement="${esc(req.id)}" data-edge="${esc(req.edge_id)}" ${req.operator === "unknown" ? "disabled" : ""} ${completed.has(req.id) ? "checked" : ""}><span>${requirementBadge(req)}${req.operator === "unknown" ? "? " : ""}${esc(req.text)}</span></label>`).join("") : `<p>Nenhum requisito documentado.</p>`}</div>
+    <div class="atlas-requirements"><b>REQUISITOS</b>${requirements.length ? requirements.map((req) => `<label class="${req.missable ? "missable" : ""} ${req.operator === "unknown" ? "unknown" : ""}"><input type="checkbox" data-testid="atlas-requirement" data-atlas-requirement="${esc(req.id)}" data-condition-id="${esc(req.id)}" data-edge="${esc(req.edge_id)}" ${req.operator === "unknown" ? "disabled" : ""} ${completed.has(req.id) ? "checked" : ""}><span>${requirementBadge(req)}${req.operator === "unknown" ? "? " : ""}${esc(req.text)}</span></label>`).join("") : `<p>Nenhum requisito documentado.</p>`}</div>
     ${system.source_id ? `<button class="atlas-source" data-atlas-source="${esc(selected.id)}">Fonte exclusiva: ${esc(system.source_id === "legacy-main" ? "guia migrado" : refsHTML(selected.source_refs || system.source_refs || []))}</button>` : ""}
     <div class="atlas-inspector-actions"><button class="primary" id="atlas-goal">${(state.goals || {})[system.id] === selected.id ? "✓ Objetivo fixado" : "◎ Fixar como objetivo"}</button><button id="atlas-media">▧ Trocar imagem</button><button id="atlas-edit">✎ Editar sistema</button><button id="atlas-replace-source">↺ Trocar fonte</button>${!system._draftSource ? `<button class="danger wide" id="atlas-delete">⌫ Excluir sistema</button>` : ""}</div>
   </aside>` : `<aside class="atlas-inspector empty">Selecione um nó para ver seus detalhes.</aside>`;
   const diagnostics = system._draftDiagnostics || {};
+  const imageFillStatus = S.guideImageFill[`${game.slug}:${system.id}:${system._draftSource || ""}`] || {};
+  const imageFillRunning = ["running", "queued"].includes(imageFillStatus.phase);
+  const imageFillUndo = !system._draftSource && imageFillStatus.phase === "complete" && (imageFillStatus.changes || []).length;
   const pendingItems = diagnostics.pending_items || [];
   const warningItems = diagnostics.warning_items || [];
   const pendingCount = pendingItems.length || (diagnostics.pending_table_ids || []).length;
@@ -1778,7 +1813,7 @@ function guideSystemsHTML(game) {
   const coverage = diagnostics.batches ? `${(system.nodes || []).length} cartões · ${(system.edges || []).length} caminhos · ${diagnostics.batches} lotes${diagnostics.source_pages ? ` · ${diagnostics.referenced_pages}/${diagnostics.source_pages} páginas citadas` : ""}${diagnostics.table_blocks ? ` · ${diagnostics.covered_table_blocks}/${diagnostics.table_blocks} linhas de tabela cobertas` : ""}${pendingCount ? ` · ${pendingCount} pendência${pendingCount === 1 ? "" : "s"}` : ""}${warningCount ? ` · ${warningCount} aviso${warningCount === 1 ? "" : "s"}` : ""}` : "";
   const review = system.status === "suggested" ? `<div class="atlas-review"><span>REVISÃO NECESSÁRIA</span><p>Confira nomes, caminhos, requisitos, spoilers e perdíveis antes de publicar.${coverage ? `<strong>${esc(coverage)}</strong>` : ""}${pendingCount ? `<small class="atlas-pending-warning">A aprovação está bloqueada até cada pendência ser resolvida ou excluída na seleção da fonte.</small>` : warningCount ? `<small class="atlas-review-warning">Há avisos de interpretação para confirmar; eles não bloqueiam a publicação.</small>` : ""}</p><div class="atlas-review-actions">${pendingCount ? `<button class="atlas-review-secondary" id="atlas-open-diagnostics">Ver detalhes (${pendingCount})</button>${system._draftSource ? `<button class="atlas-review-secondary" id="atlas-review-pending-source">Revisar tabelas</button>` : ""}` : warningCount ? `<button class="atlas-review-secondary" id="atlas-open-diagnostics">Ver avisos (${warningCount})</button>` : ""}<button id="atlas-approve" ${pendingCount ? "disabled" : ""}>Aprovar sistema</button><button id="atlas-edit">Revisar e editar</button><button id="atlas-reject">Rejeitar</button></div></div>` : "";
   return `${jobs}<section class="atlas-shell ${mode === "list" ? "list-view" : ""}" style="--atlas-zoom:${A.zoom};--atlas-x:${A.panX}px;--atlas-y:${A.panY}px">
-    <header class="atlas-toolbar"><div><span>ATLAS DE SISTEMAS</span><h2>${esc(system.title)}</h2><p>${esc(system.description)}</p></div><div class="atlas-toolbar-actions"><button id="atlas-create">＋ Novo sistema</button>${!system._draftSource ? `<button class="danger" id="atlas-delete-header">⌫ Excluir sistema</button>` : ""}</div></header>
+    <header class="atlas-toolbar"><div><span>ATLAS DE SISTEMAS</span><h2>${esc(system.title)}</h2><p>${esc(system.description)}</p></div><div class="atlas-toolbar-actions"><button id="atlas-create">＋ Novo sistema</button><button id="atlas-fill-images" data-testid="atlas-image-fill" ${imageFillRunning ? "data-image-fill-running=\"true\"" : ""} title="Buscar e associar uma imagem por card, usando apenas o nome da entidade">${imageFillRunning ? `⏳ ${imageFillStatus.completed || 0}/${imageFillStatus.total || 0} · Cancelar` : "▧ Preencher imagens"}</button>${imageFillUndo ? `<button id="atlas-undo-images" title="Desfazer somente as associações deste lote">↶ Desfazer imagens</button>` : ""}${!system._draftSource ? `<button class="danger" id="atlas-delete-header">⌫ Excluir sistema</button>` : ""}</div></header>
     ${review}<div class="atlas-filters">
       <select id="atlas-system">${systems.map((item) => `<option value="${esc(item.id)}" ${item.id === system.id ? "selected" : ""}>${esc(item.title)}${item.status === "suggested" ? " · revisar" : ""}</option>`).join("")}</select>
       <select id="atlas-group"><option value="all">Todos os ${esc(system.group_label || "grupos")}</option>${groups.map((group) => `<option value="${esc(group)}" ${A.group === group ? "selected" : ""}>${esc(group)}</option>`).join("")}</select>
@@ -1823,14 +1858,14 @@ function guideHTML(game) {
     return true;
   };
   const blocks = (chapter.blocks || []).filter(visible);
-  const renderBlock = (block) => {
+  const renderBlock = (block, index) => {
     const done = completed.has(block.id), favorite = favorites.has(block.id);
     const hiddenSpoiler = block.type === "spoiler" && !revealed.has(block.id);
     const visual = mediaById.get(block.visual_id);
     const items = (block.items || []).length ? `<ul>${block.items.map((item) => `<li>${esc(item.text)}</li>`).join("")}</ul>` : "";
     const table = (block.rows || []).length ? `<div class="smart-table">${block.rows.map((row) => `<div>${row.map((cell) => `<span>${esc(cell)}</span>`).join("")}</div>`).join("")}</div>` : "";
-    return `<article class="smart-block type-${esc(block.type)} ${done ? "done" : ""}" id="guide-${esc(block.id)}" data-guide-block="${esc(block.id)}">
-      <button class="smart-check" data-guide-action="complete" data-value="${!done}" aria-label="${done ? "Marcar pendente" : "Concluir"}">${done ? "✓" : icons[block.type] || "·"}</button>
+    return `<article class="smart-block type-${esc(block.type)} ${done ? "done" : ""}" id="guide-${esc(block.id)}" data-guide-block="${esc(block.id)}" data-card-number="${String(index + 1)}">
+      <button class="smart-check" data-testid="guide-complete" data-block-id="${esc(block.id)}" data-guide-action="complete" data-value="${!done}" aria-label="${done ? "Marcar pendente" : "Concluir"}">${done ? "✓" : icons[block.type] || "·"}</button>
       <div class="smart-content"><div class="smart-block-head"><span class="smart-type">${esc(block.type)}</span>${block.estimated_minutes ? `<span>◷ ${block.estimated_minutes} min</span>` : ""}</div>
         ${block.title ? `<h4>${esc(block.title)}</h4>` : ""}
         ${hiddenSpoiler ? `<button class="spoiler-cover" data-guide-action="reveal" data-value="true">Revelar spoiler</button>` : `<p>${esc(block.text)}</p>${items}${table}${visual ? `<figure><img src="${esc(visual.url)}" alt="${esc(visual.title || "Imagem do guia")}"><figcaption>${esc(visual.attribution || visual.source_name || "")}</figcaption></figure>` : ""}`}
@@ -2035,7 +2070,7 @@ function atlasImportProgress(title, kind) {
   $("#atlas-processing")?.remove();
   const modal = document.createElement("div");
   modal.id = "atlas-processing"; modal.className = "modal-bg";
-  modal.innerHTML = `<div class="atlas-processing" role="dialog" aria-modal="true" aria-live="polite">
+  modal.innerHTML = `<div class="atlas-processing" role="dialog" aria-modal="true" aria-live="polite" data-testid="source-import-progress">
     <div class="atlas-processing-orbit"><i></i><span>◇</span></div>
     <span class="atlas-processing-kicker">ATLAS / ${kind === "pdf" ? "PDF" : "GAMEFAQS"}</span>
     <h2>${esc(title || "Novo sistema visual")}</h2>
@@ -2059,8 +2094,8 @@ function updateAtlasImportProgress(step, message, result = null) {
   if (result && result.ok === false) {
     modal.querySelector(".atlas-processing")?.classList.add("failed");
     const error = $("#atlas-processing-error"), kind = result.error_kind || "source_import";
-    const titles = { source_import: "Não consegui ler a fonte", source_validation: "A fonte não pôde ser validada", network: "Falha de conexão", api_limit: "Limite da API", api_service: "Serviço de IA indisponível", api_configuration: "Configuração da IA", ai_response: "Resposta da IA inválida", storage: "Armazenamento local bloqueado", internal: "Falha interna" };
-    const hint = result.error_details?.hint || "Confira os dados e tente novamente.";
+    const titles = { source_import: "Não consegui ler a fonte", content_insufficient: "A página está incompleta", browser_missing: "Captura dinâmica indisponível", source_validation: "A fonte não pôde ser validada", network: "Falha de conexão", api_limit: "Limite da API", api_service: "Serviço de IA indisponível", api_configuration: "Configuração da IA", ai_response: "Resposta da IA inválida", storage: "Armazenamento local bloqueado", internal: "Falha interna" };
+    const hint = result.error_details?.hint || (kind === "content_insufficient" ? "Escolha Página dinâmica / Edge para carregar tabelas que dependem de JavaScript." : "Confira os dados e tente novamente.");
     error.hidden = false; error.innerHTML = `<b>${esc(titles[kind] || "Falha no processamento")}</b><p>${esc(result.error || "Não foi possível continuar.")}</p><small>${esc(hint)}</small>${result.error_code ? `<code>${esc(result.error_code)}</code>` : ""}`;
     const close = $("#atlas-processing-close"); close.hidden = false; close.onclick = () => modal.remove();
   }
@@ -2120,8 +2155,8 @@ function openAtlasSourceWizard(replaceSystem = null) {
   modal.innerHTML = `<div class="atlas-source-wizard" role="dialog" aria-modal="true" aria-label="Nova fonte exclusiva do Atlas">
     <header><div><span>ATLAS / ${replaceSystem ? "TROCAR FONTE" : "NOVO SISTEMA"}</span><h2>${replaceSystem ? "Escolha a nova fonte exclusiva" : "Qual estrutura deseja mapear?"}</h2><p>A fonte anterior continuará no histórico de revisões.</p></div><button id="atlas-source-close">×</button></header>
     <label>Nome do sistema<input id="atlas-source-title" value="${esc(replaceSystem?.title || "")}" placeholder="Ex.: Árvore de habilidades, crafting, relacionamentos"></label>
-    <div class="atlas-source-options"><button id="atlas-source-pdf"><span>▤</span><b>Importar PDF</b><small>Analisa texto, relações e requisitos deste arquivo.</small></button><button id="atlas-source-gamefaqs"><span>◎</span><b>Usar GameFAQs / Web Archive</b><small>Cole o endereço direto ou uma captura arquivada.</small></button></div>
-    <div class="atlas-source-url" id="atlas-source-url-row" hidden><input id="atlas-source-url" placeholder="https://gamefaqs.gamespot.com/... ou https://web.archive.org/web/..."><button id="atlas-source-url-submit">Analisar guia</button></div>
+    <div class="atlas-source-options"><button id="atlas-source-pdf"><span>▤</span><b>Importar PDF</b><small>Analisa texto, relações e requisitos deste arquivo.</small></button><button id="atlas-source-gamefaqs"><span>◎</span><b>Usar GameFAQs / Web Archive</b><small>Cole o endereço direto ou uma captura arquivada.</small></button><button id="atlas-source-web"><span>⌁</span><b>Outro site</b><small>HTML estático ou captura dinâmica com Edge.</small></button></div>
+    <div class="atlas-source-url" id="atlas-source-url-row" hidden><input id="atlas-source-url" placeholder="https://site-do-guia.example/..." ><select id="atlas-source-mode" aria-label="Modo de captura"><option value="http">HTML estático</option><option value="browser">Página dinâmica / Edge</option></select><button id="atlas-source-url-submit">Analisar guia</button></div>
     <p class="atlas-source-foot">A IA não poderá inventar relações ausentes. Fontes longas serão processadas em vários lotes e podem gerar custo no provedor. Sem IA configurada, a fonte será anexada ao editor manual.</p>
   </div>`;
   document.body.appendChild(modal);
@@ -2148,14 +2183,18 @@ function openAtlasSourceWizard(replaceSystem = null) {
     };
     input.click();
   };
-  $("#atlas-source-gamefaqs", modal).onclick = () => { $("#atlas-source-url-row", modal).hidden = false; $("#atlas-source-url", modal).focus(); };
+  let sourceKind = "gamefaqs";
+  const showUrl = (kind) => { sourceKind = kind; $("#atlas-source-url-row", modal).hidden = false; $("#atlas-source-url", modal).placeholder = kind === "gamefaqs" ? "https://gamefaqs.gamespot.com/... ou https://web.archive.org/web/..." : "https://site-do-guia.example/..."; $("#atlas-source-mode", modal).hidden = kind === "gamefaqs"; $("#atlas-source-url", modal).focus(); };
+  $("#atlas-source-gamefaqs", modal).onclick = () => showUrl("gamefaqs");
+  $("#atlas-source-web", modal).onclick = () => showUrl("web");
   $("#atlas-source-url-submit", modal).onclick = async () => {
     const url = ($("#atlas-source-url", modal)?.value || "").trim();
     if (!title() || !url) return toast("Informe o nome e o endereço do guia.", true);
-    const systemTitle = title(); closeAtlasSourceWizard(); atlasImportProgress(systemTitle, "gamefaqs");
-    updateAtlasImportProgress("source", "Baixando e conferindo todas as páginas do GameFAQs…");
-    const payload = { kind: "gamefaqs", title: systemTitle, url };
-    const result = replaceSystem ? await backend.replaceGuideSystemSource(S.activeSlug, replaceSystem.id, payload).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" })) : await backend.createGuideSystemGameFaqs(S.activeSlug, systemTitle, url).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" }));
+    const systemTitle = title(); closeAtlasSourceWizard(); atlasImportProgress(systemTitle, sourceKind);
+    updateAtlasImportProgress("source", sourceKind === "gamefaqs" ? "Baixando e conferindo todas as páginas do GameFAQs…" : "Capturando a estrutura editorial do site…");
+    const mode = $("#atlas-source-mode", modal)?.value || "http";
+    const payload = { kind: sourceKind, title: systemTitle, url, mode };
+    const result = replaceSystem ? await backend.replaceGuideSystemSource(S.activeSlug, replaceSystem.id, payload).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" })) : sourceKind === "gamefaqs" ? await backend.createGuideSystemGameFaqs(S.activeSlug, systemTitle, url).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" })) : await backend.createGuideSystemWeb(S.activeSlug, systemTitle, url, mode).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" }));
     await finishAtlasSourceImport(result, systemTitle);
   };
 }
@@ -2336,6 +2375,23 @@ function bindGuideAtlas(game) {
   const system = systems.find((item) => item.id === S.guideAtlas.systemId) || systems.find((item) => item.status !== "rejected");
   const selected = system?.nodes?.find((node) => node.id === S.guideAtlas.nodeId);
   const rerender = () => renderDashboard({ force: true });
+  const imageFillKey = `${game.slug}:${system?.id || ""}:${system?._draftSource || ""}`;
+  const acompanharPreenchimentoImagens = async () => {
+    while (S.view === "dashboard" && S.tab === "atlas") {
+      const status = await backend.guideSystemImageFillStatus(
+        game.slug, system.id, system._draftSource || ""
+      ).catch((error) => ({ ok: false, phase: "error", error: String(error) }));
+      S.guideImageFill[imageFillKey] = status;
+      await rerender();
+      if (!["running", "queued"].includes(status.phase)) {
+        if (status.phase === "complete") toast(`Imagens preenchidas: ${status.filled || 0} associada(s), ${status.empty || 0} sem resultado.`);
+        else if (status.phase === "cancelled") toast("Preenchimento de imagens cancelado.");
+        else if (status.phase === "error") toast(status.error || "Falha ao preencher imagens.", true);
+        break;
+      }
+      await esperar(900);
+    }
+  };
   $("#atlas-path")?.addEventListener("change", async event => { const r = await appCall("set_guide_system_path", game.slug, system.id, event.target.value); if (!r.ok) toast(r.error,true); await rerender(); });
   root.querySelectorAll("[data-atlas-review-job]").forEach((b) => b.onclick = () => { S.guideAtlas.draftSource = b.dataset.atlasReviewJob; S.guideAtlas.systemId = ""; rerender(); });
   root.querySelectorAll("[data-atlas-review-source]").forEach((b) => b.onclick = async () => {
@@ -2405,12 +2461,45 @@ function bindGuideAtlas(game) {
     viewport.onwheel = (event) => { event.preventDefault(); S.guideAtlas.zoom = Math.max(.1, Math.min(1.6, S.guideAtlas.zoom + (event.deltaY < 0 ? .08 : -.08))); viewport.closest(".atlas-shell")?.style.setProperty("--atlas-zoom", S.guideAtlas.zoom); };
   }
   $("#atlas-create")?.addEventListener("click", () => openAtlasSourceWizard());
+  $("#atlas-fill-images")?.addEventListener("click", async (event) => {
+    if (!system?.id) return;
+    const status = S.guideImageFill[imageFillKey] || {};
+    if (["running", "queued"].includes(status.phase)) {
+      event.currentTarget.disabled = true;
+      const result = await backend.cancelGuideSystemImageFill(game.slug, system.id, system._draftSource || "");
+      if (!result?.ok) toast(result?.error || "Não foi possível cancelar.", true);
+      return;
+    }
+    event.currentTarget.disabled = true;
+    const result = await backend.startGuideSystemImageFill(game.slug, system.id, system._draftSource || "");
+    if (!result?.ok) { event.currentTarget.disabled = false; return toast(result?.error || "Não foi possível iniciar o preenchimento.", true); }
+    S.guideImageFill[imageFillKey] = result;
+    toast("Preenchimento iniciado. Você pode continuar revisando o Atlas.");
+    acompanharPreenchimentoImagens();
+  });
+  $("#atlas-undo-images")?.addEventListener("click", async (event) => {
+    if (!system?.id) return;
+    event.currentTarget.disabled = true;
+    const status = S.guideImageFill[imageFillKey] || {};
+    const result = await backend.undoGuideSystemImageFill(
+      game.slug, system.id, system._draftSource || "", status.job_id || ""
+    ).catch((error) => ({ ok: false, error: String(error) }));
+    if (!result?.ok) {
+      event.currentTarget.disabled = false;
+      return toast(result?.error || "Não foi possível desfazer as imagens.", true);
+    }
+    S.guideImageFill[imageFillKey] = {
+      ...status, undo: { reverted: result.reverted || 0, preserved: result.preserved || 0 },
+    };
+    toast(`Imagens desfeitas: ${result.reverted || 0}; ${result.preserved || 0} alteração(ões) preservada(s).`);
+    await rerender();
+  });
   root.querySelectorAll("#atlas-edit").forEach((button) => button.onclick = () => openGuideSystemEditor(system));
   $("#atlas-approve")?.addEventListener("click", async () => { const result = system._draftSource ? await appCall("approve_atlas_job", game.slug, system._draftSource) : await backend.saveGuideSystem(game.slug, { ...system, status: "approved" }); if (!result?.ok) return toast(result?.error || "Falha ao aprovar.", true); S.guideAtlas.draftSource = ""; toast("Sistema aprovado."); await rerender(); });
   $("#atlas-reject")?.addEventListener("click", async () => { const result = system._draftSource ? await appCall("cancel_atlas_job", game.slug, system._draftSource) : await backend.saveGuideSystem(game.slug, { ...system, status: "rejected" }); if (!result?.ok) return toast(result?.error || "Falha ao rejeitar.", true); S.guideAtlas.draftSource = ""; S.guideAtlas.systemId = ""; toast("Sugestão rejeitada; a fonte permanece intacta."); await rerender(); });
   $("#atlas-goal")?.addEventListener("click", async () => { if (!selected || system._draftSource) return; const current = game.smart_guide?.system_state?.goals?.[system.id]; const result = await backend.setGuideSystemGoal(S.activeSlug, system.id, current === selected.id ? "" : selected.id); if (!result?.ok) return toast(result?.error || "Falha ao fixar objetivo.", true); toast(current === selected.id ? "Objetivo removido." : "Objetivo enviado ao overlay."); await rerender(); });
   root.querySelectorAll("[data-atlas-requirement]").forEach((input) => input.onchange = async () => { const result = await backend.updateGuideRequirement(S.activeSlug, system.id, input.dataset.edge, input.dataset.atlasRequirement, input.checked); if (!result?.ok) { input.checked = !input.checked; return toast(result?.error || "Falha ao salvar requisito.", true); } await rerender(); });
-  $("#atlas-media")?.addEventListener("click", () => selected && openGuideMedia(selected.media_query || `${game.title} ${selected.label}`, { systemId: system.id, nodeId: selected.id, sourceId: system._draftSource || "" }));
+  $("#atlas-media")?.addEventListener("click", () => selected && openGuideMedia(selected.media_query || selected.label, { systemId: system.id, nodeId: selected.id, sourceId: system._draftSource || "" }));
   $("#atlas-replace-source")?.addEventListener("click", () => openAtlasSourceWizard(system));
   const deleteSystem = async () => {
     if (system._draftSource) return toast("Rejeite a prévia antes de excluir um sistema.", true);
@@ -2745,7 +2834,7 @@ function guideSourcesSettingsHTML() {
   const phaseText = { idle: "Nenhuma consolidação em andamento.", running: merge.message || "Consolidando as fontes…", awaiting_configuration: merge.message || "Aguardando configuração da IA.", awaiting_consent: merge.message || "Aguardando consentimento para uso da IA.", awaiting_review: merge.message || "Prévia pronta para revisão.", published: "Walkthrough consolidado publicado.", error: merge.error || "Falha na consolidação." }[merge.phase] || merge.message || "";
   return `<div class="settings-card guide-sources-card"><div class="guide-sources-head"><div><h3>Fontes dos guias</h3><p class="set-hint">Combine até dez fontes. O conteúdo original permanece separado e só muda a Jornada quando você publicar uma nova consolidação.</p></div><span>${sources.length}/10</span></div>
     ${sourceCards || `<div class="guide-sources-empty"><b>Nenhuma fonte adicionada</b><span>Importe um PDF, GameFAQs ou texto para começar.</span></div>`}
-    <div class="guide-source-add"><button id="guide-source-add-pdf">＋ PDF</button><button id="guide-source-add-gamefaqs">◎ GameFAQs</button><button id="guide-source-add-text">≡ Colar texto</button></div>
+    <div class="guide-source-add"><button id="guide-source-add-pdf">＋ PDF</button><button id="guide-source-add-gamefaqs">◎ GameFAQs</button><button id="guide-source-add-web">⌁ Outro site</button><button id="guide-source-add-text">≡ Colar texto</button></div>
     <div class="guide-merge-box ${merge.phase === "error" ? "error" : ""}"><div><span>WALKTHROUGH CONSOLIDADO</span><b>${selected.length} fonte(s) · ~${characters.toLocaleString("pt-BR")} caracteres</b><small>${esc(phaseText)}</small></div>${merge.phase === "running" ? `<i class="guide-merge-spinner">✦</i>` : `<button id="guide-merge-start" ${selected.length ? "" : "disabled"}>Criar walkthrough completo</button>`}</div>
     ${conflictHTML}
     ${merge.phase === "awaiting_review" ? `<div class="guide-merge-publish"><div><b>${unresolved ? `${unresolved} conflito(s) importante(s) pendente(s)` : "Prévia validada e pronta"}</b><span>A versão atual continua ativa até a publicação.</span></div><button id="guide-merge-publish" ${unresolved ? "disabled" : ""}>Publicar na Jornada</button></div>` : ""}
@@ -2762,14 +2851,15 @@ async function refreshGuideSources(slug = S.activeSlug) {
 function openGuideSourceDialog(kind) {
   $("#guide-source-dialog")?.remove();
   const game = S.library.find((item) => item.slug === S.activeSlug) || S.dashboardGame || {};
-  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="guide-source-dialog"><div class="gf-panel guide-source-dialog"><h3>${kind === "gamefaqs" ? "Adicionar GameFAQs / Web Archive" : "Adicionar texto"}</h3><p>Fonte para a Jornada de <b>${esc(game.title || "jogo atual")}</b>.</p><label>Título<input id="guide-source-dialog-title" placeholder="Nome que identifica esta fonte"></label>${kind === "gamefaqs" ? `<label>URL direta do guia<input id="guide-source-dialog-value" placeholder="https://gamefaqs.gamespot.com/... ou https://web.archive.org/web/..."></label>` : `<label>Conteúdo<textarea id="guide-source-dialog-value" placeholder="Cole o guia completo aqui"></textarea></label>`}<div class="settings-pending-actions"><button class="btn-primary" id="guide-source-dialog-save">Adicionar fonte</button><button class="btn-ghost" id="guide-source-dialog-close">Cancelar</button></div></div></div>`);
+  const isUrl = kind === "gamefaqs" || kind === "web";
+  root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="guide-source-dialog"><div class="gf-panel guide-source-dialog"><h3>${kind === "gamefaqs" ? "Adicionar GameFAQs / Web Archive" : kind === "web" ? "Adicionar outro site" : "Adicionar texto"}</h3><p>Fonte para a Jornada de <b>${esc(game.title || "jogo atual")}</b>.</p><label>Título<input id="guide-source-dialog-title" placeholder="Nome que identifica esta fonte"></label>${isUrl ? `<label>URL direta do guia<input id="guide-source-dialog-value" placeholder="${kind === "gamefaqs" ? "https://gamefaqs.gamespot.com/... ou https://web.archive.org/web/..." : "https://site-do-guia.example/..."}"></label>${kind === "web" ? `<label>Captura<select id="guide-source-dialog-mode"><option value="http">HTML estático</option><option value="browser">Página dinâmica / Edge</option></select></label>` : ""}` : `<label>Conteúdo<textarea id="guide-source-dialog-value" placeholder="Cole o guia completo aqui"></textarea></label>`}<div class="settings-pending-actions"><button class="btn-primary" id="guide-source-dialog-save">Adicionar fonte</button><button class="btn-ghost" id="guide-source-dialog-close">Cancelar</button></div></div></div>`);
   $("#guide-source-dialog-close").onclick = () => $("#guide-source-dialog")?.remove();
   $("#guide-source-dialog-save").onclick = async () => {
     const title = ($("#guide-source-dialog-title")?.value || "").trim();
     const value = ($("#guide-source-dialog-value")?.value || "").trim();
     if (!value) return toast("Informe o conteúdo da fonte.", true);
     const button = $("#guide-source-dialog-save"); button.disabled = true; button.textContent = "Importando…";
-    const result = kind === "gamefaqs" ? await backend.addWalkthroughGameFaqs(S.activeSlug, value).catch((error) => ({ ok: false, error: String(error) })) : await backend.addWalkthroughText(S.activeSlug, title || "Texto colado", value).catch((error) => ({ ok: false, error: String(error) }));
+    const result = kind === "gamefaqs" ? await backend.addWalkthroughGameFaqs(S.activeSlug, value, title || "").catch((error) => ({ ok: false, error: String(error) })) : kind === "web" ? await backend.captureWebSource(S.activeSlug, title || "Fonte web", value, $("#guide-source-dialog-mode")?.value || "http").catch((error) => ({ ok: false, error: String(error) })) : await backend.addWalkthroughText(S.activeSlug, title || "Texto colado", value).catch((error) => ({ ok: false, error: String(error) }));
     if (!result?.ok) { button.disabled = false; button.textContent = "Adicionar fonte"; return toast(result?.error || "Falha ao importar.", true); }
     $("#guide-source-dialog")?.remove(); toast(result.duplicate ? "Esta fonte já estava na coleção." : "Fonte adicionada."); await refreshGuideSources();
   };
@@ -2908,6 +2998,7 @@ function bindGuideSourceSettings() {
     input.click();
   });
   $("#guide-source-add-gamefaqs")?.addEventListener("click", () => openGuideSourceDialog("gamefaqs"));
+  $("#guide-source-add-web")?.addEventListener("click", () => openGuideSourceDialog("web"));
   $("#guide-source-add-text")?.addEventListener("click", () => openGuideSourceDialog("text"));
   root.querySelectorAll("[data-guide-source-toggle]").forEach((input) => input.onchange = async () => {
     const result = await backend.updateWalkthroughSource(S.activeSlug, input.dataset.guideSourceToggle, null, input.checked).catch((error) => ({ ok: false, error: String(error) }));

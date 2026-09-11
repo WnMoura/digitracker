@@ -55,6 +55,17 @@ hiddenimports += collect_submodules("waitress")
 hiddenimports += collect_submodules("pyzipper")
 hiddenimports += collect_submodules("Cryptodome")
 
+# Captura dinâmica é opcional. Quando o ambiente de build tiver
+# requirements-browser.txt instalado, inclui o driver Python; o navegador
+# continua sendo o Microsoft Edge instalado na máquina do usuário.
+try:
+    d, b, h = collect_all("playwright")
+    datas += d
+    binaries += b
+    hiddenimports += h
+except Exception:
+    pass
+
 
 a = Analysis(
     ["engine.py"],

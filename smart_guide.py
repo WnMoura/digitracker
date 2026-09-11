@@ -21,14 +21,23 @@ from copy import deepcopy
 from functools import wraps
 from pathlib import Path
 
+import atlas_model
+
+# Keep the walkthrough document schema stable for existing installs. Typed
+# Atlas rules use the additive version below and remain readable by schema 3
+# consumers.
 SCHEMA_VERSION = 3
+ATLAS_SCHEMA_VERSION = 4
 MAX_REVISIONS = 10
 MAX_WALKTHROUGH_SOURCES = 10
 # A fonte continua sendo dividida em lotes pequenos para a IA. O limite maior
 # vale somente para o resultado já consolidado e permite Atlas extensos, com
 # grupos/filtros, sem descartar silenciosamente criaturas ou caminhos.
-MAX_SYSTEM_NODES = 240
-MAX_SYSTEM_EDGES = 720
+# The source plan allows large but bounded graphs.  These limits are explicit
+# validation errors (never silent truncation) and leave room for guides with
+# hundreds of entities while protecting the local WebView from unbounded JSON.
+MAX_SYSTEM_NODES = 1_000
+MAX_SYSTEM_EDGES = 3_000
 ATOMIC_REPLACE_ATTEMPTS = 7
 BLOCK_TYPES = {
     "text", "objective", "checklist", "warning", "missable", "achievement",
@@ -39,6 +48,16 @@ BLOCK_TYPES = {
 
 class SmartGuideError(ValueError):
     pass
+
+
+class SmartGuideConflict(SmartGuideError):
+    """Conflito de versão de um alvo específico, não do snapshot inteiro."""
+
+    def __init__(self, message: str, *, target: str = "", value=None, value_version: int = 0):
+        super().__init__(message)
+        self.target = target
+        self.value = value
+        self.value_version = value_version
 
 
 def _serialized(method):
@@ -152,9 +171,20 @@ def _source_refs(value: object, limit: int = 20) -> list[dict]:
                 "block": max(0, _safe_int(ref.get("block"))),
                 "page": max(0, _safe_int(ref.get("page"))),
             }
-            source_id = _clean_text(ref.get("source_id"), 100)
-            if source_id:
-                item["source_id"] = source_id
+            # Keep both the legacy section/block coordinates and the stable
+            # structured-source coordinates.  Older readers ignore additive
+            # keys; new review screens can jump to an exact table row/cell.
+            for key, limit_value in (
+                ("source_id", 100), ("capture_id", 160), ("page_id", 160),
+                ("element_id", 160), ("table_id", 160), ("row_id", 160),
+                ("cell_id", 160), ("anchor", 500),
+            ):
+                cleaned = _clean_text(ref.get(key), limit_value)
+                if cleaned:
+                    item[key] = cleaned
+            for key in ("start", "end", "char_start", "char_end"):
+                if key in ref and ref.get(key) not in (None, ""):
+                    item[key] = max(0, _safe_int(ref.get(key)))
             refs.append(item)
         except (TypeError, ValueError):
             continue
@@ -162,8 +192,11 @@ def _source_refs(value: object, limit: int = 20) -> list[dict]:
 
 
 def _has_source(refs: list[dict]) -> bool:
-    return any(int(ref.get("section") or 0) > 0 and int(ref.get("block") or 0) > 0
-               for ref in refs)
+    return any(
+        (int(ref.get("section") or 0) > 0 and int(ref.get("block") or 0) > 0)
+        or any(ref.get(key) for key in ("page_id", "element_id", "table_id", "row_id", "cell_id"))
+        for ref in refs if isinstance(ref, dict)
+    )
 
 
 def _stable_system_id(prefix: str, provided: object, *parts: object) -> str:
@@ -274,6 +307,11 @@ def _validate_systems(document: dict) -> list[dict]:
                 # compact numeric reference for review diagnostics. The
                 # stable string id remains the identity across revisions.
                 "card_number": len(nodes) + 1,
+                "entity_id": _clean_text(raw_node.get("entity_id"), 160) or node_id,
+                "entity_type": (_clean_text(raw_node.get("entity_type"), 40).lower()
+                                 if _clean_text(raw_node.get("entity_type"), 40).lower() in atlas_model.ENTITY_TYPES
+                                 else "other"),
+                "edition_key": _clean_text(raw_node.get("edition_key"), 120),
                 "subtitle": _clean_text(raw_node.get("subtitle"), 500),
                 "stage": _clean_text(raw_node.get("stage"), 100),
                 "group": _clean_text(raw_node.get("group"), 150),
@@ -338,15 +376,48 @@ def _validate_systems(document: dict) -> list[dict]:
                     "id": _stable_system_id("req", raw_req.get("id"), edge_id, ri, text, req_refs),
                     "text": text, "source_refs": req_refs,
                 }
-                for field in ("field", "operator", "value", "original", "group", "mode"):
+                for field in ("field", "operator", "original", "group", "mode",
+                              "location", "scope", "context", "acquisition"):
                     if isinstance(raw_req, dict) and raw_req.get(field) not in (None, ""):
                         requirement[field] = _clean_text(raw_req.get(field), 300)
+                # Preserve the typed value used by the declarative condition.
+                # Numeric thresholds (including zero), booleans, null and
+                # arrays must not be flattened into display text: the Atlas
+                # evaluator and the review UI use the value/operator pair.
+                if isinstance(raw_req, dict) and "value" in raw_req and raw_req.get("value") != "":
+                    def _clean_condition_value(value):
+                        if isinstance(value, (bool, int, float)) or value is None:
+                            return value
+                        if isinstance(value, list):
+                            return [_clean_condition_value(item) for item in value[:30]]
+                        if isinstance(value, dict):
+                            return {str(key)[:80]: _clean_condition_value(item)
+                                    for key, item in list(value.items())[:30]}
+                        return _clean_text(value, 300)
+                    requirement["value"] = _clean_condition_value(raw_req.get("value"))
+                if isinstance(raw_req, dict) and isinstance(raw_req.get("condition"), dict):
+                    requirement["condition"] = atlas_model.canonical_condition(
+                        raw_req.get("condition"), fallback_id=requirement["id"])
+                if isinstance(raw_req, dict) and raw_req.get("applies_to"):
+                    requirement["applies_to"] = [
+                        _clean_text(value, 300) for value in raw_req.get("applies_to") or []
+                        if _clean_text(value, 300)
+                    ][:20]
                 requirements.append(requirement)
             edges.append({
                 "id": edge_id, "from": from_id, "to": to_id,
                 "label": edge_label,
                 "path_kind": edge_path_kind,
-                "requirements": requirements[:30],
+                "rule_id": _clean_text(raw_edge.get("rule_id"), 160) or edge_id,
+                "kind": (_clean_text(raw_edge.get("kind"), 40).lower()
+                          if _clean_text(raw_edge.get("kind"), 40).lower() in atlas_model.RULE_KINDS
+                          else "transformation"),
+                "condition": (atlas_model.canonical_condition(raw_edge.get("condition"), fallback_id=edge_id + "-condition")
+                              if isinstance(raw_edge.get("condition"), dict) else {"id": edge_id + "-condition", "op": "all", "children": []}),
+                # Never discard the tail of a source table silently.  The
+                # outer system/edge limits protect malformed input; all
+                # requirements that passed validation remain reviewable.
+                "requirements": requirements,
                 "missable": bool(raw_edge.get("missable", False)),
                 "spoiler": bool(raw_edge.get("spoiler", False)),
                 "source_refs": refs,
@@ -354,7 +425,7 @@ def _validate_systems(document: dict) -> list[dict]:
         if not edges:
             continue
         clean_systems.append({
-            "id": system_id, "title": title,
+            "id": system_id, "atlas_schema_version": ATLAS_SCHEMA_VERSION, "title": title,
             "description": _clean_text(raw_system.get("description"), 2_000),
             "group_label": _clean_text(raw_system.get("group_label") or "Grupo", 100),
             "layout": (raw_system.get("layout") if raw_system.get("layout") in {"layered", "vertical", "radial"} else "layered"),
@@ -462,6 +533,24 @@ def validate_document(document: dict) -> dict:
 
 def validate_system_references(document: dict, sections: list) -> dict:
     """Recusa referências de IA fora da fonte que foi realmente enviada."""
+    stable_lookup = set()
+    stable_tables = set()
+    stable_pages = set()
+    for section in sections or []:
+        if isinstance(section, dict) and section.get("page_id"):
+            stable_pages.add(str(section.get("page_id")))
+        for block in (section or {}).get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            table_id = str(block.get("table_id") or "")
+            row_id = str(block.get("row_id") or "")
+            element_id = str(block.get("element_id") or "")
+            if table_id:
+                stable_tables.add(table_id)
+            if table_id and row_id:
+                stable_lookup.add((table_id, row_id))
+            if element_id:
+                stable_lookup.add(("element", element_id))
     for system in document.get("systems") or []:
         if system.get("origin") != "ai":
             continue
@@ -472,8 +561,23 @@ def validate_system_references(document: dict, sections: list) -> dict:
             groups.extend(req.get("source_refs") or [] for req in edge.get("requirements") or [])
         for refs in groups:
             for ref in refs:
-                section_index = int(ref.get("section") or 0) - 1
-                block_index = int(ref.get("block") or 0) - 1
+                section_number = int(ref.get("section") or 0)
+                block_number = int(ref.get("block") or 0)
+                # Structured captures may use stable page/element/table/row
+                # references without the legacy section/block coordinates.
+                # Validate those coordinates against the projected blocks and
+                # do not force them through a -1 section lookup.
+                table_id = str(ref.get("table_id") or "")
+                row_id = str(ref.get("row_id") or "")
+                element_id = str(ref.get("element_id") or "")
+                if section_number <= 0 or block_number <= 0:
+                    if ((table_id and ((not row_id and table_id in stable_tables) or
+                                       (table_id, row_id) in stable_lookup))
+                            or (element_id and ("element", element_id) in stable_lookup)
+                            or (ref.get("page_id") and str(ref.get("page_id")) in stable_pages)):
+                        continue
+                section_index = section_number - 1
+                block_index = block_number - 1
                 if section_index < 0 or section_index >= len(sections or []):
                     raise SmartGuideError(
                         f"Referência de sistema fora da fonte: seção {section_index + 1}."
@@ -535,7 +639,10 @@ def default_progress() -> dict:
     return {
         "schema_version": SCHEMA_VERSION, "completed": [], "favorites": [],
         "revealed_spoilers": [], "notes": {}, "checkpoint": "", "history": [],
-        "session_minutes": 30, "updated_at": 0,
+        # Per-target versions let the companion reject a stale toggle without
+        # making an unrelated guide checkbox conflict with it.  These fields
+        # are additive so schema-3 progress files remain readable.
+        "session_minutes": 30, "value_versions": {}, "receipts": {}, "updated_at": 0,
     }
 
 
@@ -543,6 +650,7 @@ def default_system_state() -> dict:
     return {
         "schema_version": SCHEMA_VERSION, "active_system": "", "goals": {},
         "completed_requirements": [], "node_media": {}, "preferences": {},
+        "value_versions": {}, "receipts": {},
         "updated_at": 0,
     }
 
@@ -630,15 +738,18 @@ class SmartGuideStore:
     def add_walkthrough_source(self, slug: str, title: str, kind: str,
                                sections: list, metadata: dict | None = None,
                                raw: bytes | None = None, text: str = "",
-                               source_id: str = "") -> dict:
+                               source_id: str = "", structured: dict | None = None,
+                               markdown: str = "", raw_pages: list[dict] | None = None) -> dict:
         sections = deepcopy(sections or [])
         if not sections:
             raise SmartGuideError("A fonte não contém conteúdo utilizável.")
         kind = str(kind or "text").lower()
-        if kind not in {"pdf", "gamefaqs", "text", "legacy"}:
+        if kind not in {"pdf", "gamefaqs", "web", "text", "legacy"}:
             raise SmartGuideError("Tipo de fonte não permitido.")
-        digest = hashlib.sha256(raw if raw is not None else
-                                json.dumps(sections, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        digest_input = raw if raw is not None else json.dumps(
+            {"sections": sections, "structured": structured}, ensure_ascii=False,
+            sort_keys=True).encode("utf-8")
+        digest = hashlib.sha256(digest_input).hexdigest()
         index = self._source_index(slug)
         duplicate = next((item for item in index if item.get("hash") == digest), None)
         if duplicate:
@@ -663,6 +774,11 @@ class SmartGuideStore:
                                    for section in sections
                                    for block in (section.get("blocks") or [])),
         }
+        if structured is not None:
+            data["structured"] = deepcopy(structured)
+            data["source_format"] = _clean_text(structured.get("format") or "digitracker-source-v1", 100)
+        if markdown:
+            data["markdown"] = str(markdown)[:10_000_000]
         if raw is not None:
             if len(raw) > 50 * 1024 * 1024:
                 raise SmartGuideError("O arquivo excede o limite de 50 MB.")
@@ -670,11 +786,25 @@ class SmartGuideStore:
             raw_name = f"walkthrough_sources/files/{sid}{suffix}"
             _atomic_bytes(self._path(slug, raw_name), raw)
             data["raw_file"] = raw_name
+        if raw_pages:
+            files = []
+            for page in raw_pages:
+                if not isinstance(page, dict) or not isinstance(page.get("html"), str):
+                    continue
+                content = page["html"].encode("utf-8")
+                if len(content) > 15 * 1024 * 1024:
+                    raise SmartGuideError("Uma página do guia excede o limite de 15 MB.")
+                number = max(1, _safe_int(page.get("number"), len(files) + 1))
+                name = f"walkthrough_sources/files/{sid}-page-{number}.html"
+                _atomic_bytes(self._path(slug, name), content)
+                files.append({"page": number, "path": name, "url": _clean_text(page.get("url"), 2_000)})
+            if files:
+                data["raw_pages"] = files
         _atomic_json(self._path(slug, f"walkthrough_sources/{sid}.json"), data)
         summary = {key: data.get(key) for key in (
             "schema_version", "id", "title", "kind", "hash", "captured_at",
-            "enabled", "language", "url", "filename", "raw_file",
-            "section_count", "character_count",
+            "enabled", "language", "url", "filename", "raw_file", "raw_pages",
+            "source_format", "section_count", "character_count",
         )}
         index.append(summary)
         _atomic_json(self._path(slug, "walkthrough_sources/index.json"), index)
@@ -706,8 +836,11 @@ class SmartGuideStore:
             raise SmartGuideError("Fonte não encontrada.")
         _atomic_json(self._path(slug, "walkthrough_sources/index.json"),
                      [item for item in index if item.get("id") != source_id])
-        for path in [self._path(slug, f"walkthrough_sources/{source_id}.json"),
-                     self._path(slug, removed.get("raw_file") or "")]:
+        paths = [self._path(slug, f"walkthrough_sources/{source_id}.json"),
+                 self._path(slug, removed.get("raw_file") or "")]
+        paths.extend(self._path(slug, item.get("path") or "")
+                     for item in removed.get("raw_pages") or [] if isinstance(item, dict))
+        for path in paths:
             try:
                 if path.is_file():
                     path.unlink()
@@ -792,8 +925,8 @@ class SmartGuideStore:
         if not sections:
             raise SmartGuideError("A fonte do Atlas não contém conteúdo utilizável.")
         kind = str(kind or "text").lower()
-        if kind not in {"pdf", "gamefaqs", "legacy"}:
-            raise SmartGuideError("O Atlas aceita PDF ou GameFAQs.")
+        if kind not in {"pdf", "gamefaqs", "web", "legacy"}:
+            raise SmartGuideError("O Atlas aceita PDF, GameFAQs ou fontes web.")
         if raw is not None:
             raw_for_hash = raw
         elif structured is None:
@@ -1037,6 +1170,16 @@ class SmartGuideStore:
         base = default_progress()
         if isinstance(value, dict):
             base.update(value)
+        base["value_versions"] = {
+            _clean_text(key, 180): max(0, _safe_int(version))
+            for key, version in dict(base.get("value_versions") or {}).items()
+            if _clean_text(key, 180)
+        }
+        base["receipts"] = {
+            _clean_text(key, 180): deepcopy(receipt)
+            for key, receipt in dict(base.get("receipts") or {}).items()
+            if _clean_text(key, 180)
+        }
         return base
 
     def system_state(self, slug: str) -> dict:
@@ -1055,6 +1198,16 @@ class SmartGuideStore:
             if _clean_text(key, 100) and _clean_text(media_id, 100)
         }
         base["preferences"] = dict(base.get("preferences") or {})
+        base["value_versions"] = {
+            _clean_text(key, 180): max(0, _safe_int(value))
+            for key, value in dict(base.get("value_versions") or {}).items()
+            if _clean_text(key, 180)
+        }
+        base["receipts"] = {
+            _clean_text(key, 180): deepcopy(value)
+            for key, value in dict(base.get("receipts") or {}).items()
+            if _clean_text(key, 180)
+        }
         return base
 
     def _save_system_state(self, slug: str, state: dict) -> dict:
@@ -1237,7 +1390,102 @@ class SmartGuideStore:
         else:
             items.discard(requirement_id)
         state["completed_requirements"] = sorted(items)
+        # Desktop writes use this legacy wrapper too.  Incrementing the same
+        # target version used by companion v2 keeps PC→phone changes visible
+        # as conflicts instead of allowing a stale mobile checkbox to win.
+        target = f"requirement:{system_id}:{edge_id}:{requirement_id}"
+        versions = state.setdefault("value_versions", {})
+        versions[target] = max(0, _safe_int(versions.get(target))) + 1
         return self._save_system_state(slug, state)
+
+    @_serialized
+    def update_requirement_versioned(self, slug: str, system_id: str, edge_id: str,
+                                     requirement_id: str, completed: bool,
+                                     *, request_id: str, expected_definition_revision: str = "",
+                                     expected_value_version: int | None = None) -> dict:
+        """Grava uma marcação mobile com versão por requisito e recibo idempotente."""
+        if not isinstance(completed, bool):
+            raise SmartGuideError("Valor do requisito deve ser booleano.")
+        request_id = _clean_text(request_id, 120)
+        if not request_id:
+            raise SmartGuideError("request_id é obrigatório no protocolo v2.")
+        current = self.current(slug)
+        definition_revision = _clean_text(current.get("revision_id"), 160)
+        if expected_definition_revision and expected_definition_revision != definition_revision:
+            raise SmartGuideConflict("A definição do Atlas mudou. Atualize o celular.", target=requirement_id)
+        system = next((item for item in current.get("systems") or [] if item.get("id") == system_id), None)
+        edge = next((item for item in (system or {}).get("edges") or [] if item.get("id") == edge_id), None)
+        requirement = next((item for item in (edge or {}).get("requirements") or [] if item.get("id") == requirement_id), None)
+        if not requirement:
+            raise SmartGuideError("Requisito visual não encontrado.")
+        state = self.system_state(slug); target = f"requirement:{system_id}:{edge_id}:{requirement_id}"
+        previous = (state.get("receipts") or {}).get(request_id)
+        payload_fingerprint = _json_hash({"target": target, "value": completed})
+        if previous:
+            if previous.get("fingerprint") != payload_fingerprint:
+                raise SmartGuideConflict("request_id já foi usado com outro comando.", target=target)
+            return {"state": state, "target": target, "value": previous.get("value"),
+                    "value_version": previous.get("value_version", 0), "request_id": request_id,
+                    "idempotent": True, "definition_revision": definition_revision}
+        versions = state.setdefault("value_versions", {})
+        value_version = int(versions.get(target) or 0)
+        if expected_value_version is not None and int(expected_value_version) != value_version:
+            actual = requirement_id in set(state.get("completed_requirements") or [])
+            raise SmartGuideConflict("Esta marcação mudou no PC ou em outro celular.", target=target,
+                                     value=actual, value_version=value_version)
+        items = set(state.get("completed_requirements") or [])
+        if completed: items.add(requirement_id)
+        else: items.discard(requirement_id)
+        state["completed_requirements"] = sorted(items)
+        value_version += 1; versions[target] = value_version
+        receipts = state.setdefault("receipts", {})
+        receipts[request_id] = {"fingerprint": payload_fingerprint, "target": target,
+                                "value": completed, "value_version": value_version}
+        # Limite fixo para não transformar o progresso em log infinito.
+        state["receipts"] = dict(list(receipts.items())[-256:])
+        state = self._save_system_state(slug, state)
+        return {"state": state, "target": target, "value": completed,
+                "value_version": value_version, "request_id": request_id,
+                "definition_revision": definition_revision, "idempotent": False}
+
+    @_serialized
+    def update_progress_versioned(self, slug: str, action: str, block_id: str,
+                                  value: bool, *, request_id: str,
+                                  expected_definition_revision: str = "",
+                                  expected_value_version: int | None = None) -> dict:
+        if action not in {"complete", "reveal", "checkpoint"} or not isinstance(value, bool):
+            raise SmartGuideError("Comando de progresso inválido.")
+        request_id = _clean_text(request_id, 120)
+        current = self.current(slug); definition_revision = _clean_text(current.get("revision_id"), 160)
+        if expected_definition_revision and expected_definition_revision != definition_revision:
+            raise SmartGuideConflict("O guia mudou. Atualize o celular.", target=block_id)
+        valid = {block.get("id") for chapter in current.get("chapters") or [] for block in chapter.get("blocks") or []}
+        if block_id not in valid: raise SmartGuideError("Etapa não encontrada.")
+        state = self.progress(slug); target = f"progress:{action}:{block_id}"
+        # Progress uses a sidecar version file in the guide directory because
+        # the legacy progress JSON did not carry per-target revisions.
+        versions = dict(state.get("value_versions") or {})
+        receipts = dict(state.get("receipts") or {})
+        previous = receipts.get(request_id); fingerprint = _json_hash({"target": target, "value": value})
+        if previous:
+            if previous.get("fingerprint") != fingerprint: raise SmartGuideConflict("request_id já foi usado com outro comando.", target=target)
+            return {"progress": state, "target": target, "value": previous.get("value"), "value_version": previous.get("value_version", 0), "request_id": request_id, "definition_revision": definition_revision, "idempotent": True}
+        version = int(versions.get(target) or 0)
+        if expected_value_version is not None and int(expected_value_version) != version:
+            key = {"complete": "completed", "reveal": "revealed_spoilers"}.get(action)
+            actual = block_id in set(state.get(key) or []) if key else state.get("checkpoint") == block_id
+            raise SmartGuideConflict("Esta marcação mudou no PC ou em outro celular.", target=target, value=actual, value_version=version)
+        if action == "checkpoint": state["checkpoint"] = block_id
+        else:
+            key = "completed" if action == "complete" else "revealed_spoilers"; values = set(state.get(key) or [])
+            if value: values.add(block_id)
+            else: values.discard(block_id)
+            state[key] = sorted(values)
+        version += 1; versions[target] = version; receipts[request_id] = {"fingerprint": fingerprint, "value": value, "value_version": version}
+        state["value_versions"] = versions; state["receipts"] = dict(list(receipts.items())[-256:]); state["updated_at"] = _now()
+        _atomic_json(self._path(slug, "progress.json"), state)
+        return {"progress": state, "target": target, "value": value, "value_version": version,
+                "request_id": request_id, "definition_revision": definition_revision, "idempotent": False}
 
     def media_system(self, slug: str, system_id: str, source_id: str = '') -> dict:
         if source_id:
@@ -1331,6 +1579,10 @@ class SmartGuideStore:
             progress["session_minutes"] = max(5, min(480, int(value or 30)))
         else:
             raise SmartGuideError("Atualização de progresso inválida.")
+        if action in {"complete", "reveal", "checkpoint"} and block_id:
+            target = f"progress:{action}:{block_id}"
+            versions = progress.setdefault("value_versions", {})
+            versions[target] = max(0, _safe_int(versions.get(target))) + 1
         progress["updated_at"] = _now()
         _atomic_json(self._path(slug, "progress.json"), progress)
         return progress

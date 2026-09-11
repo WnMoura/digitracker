@@ -262,7 +262,9 @@ def _table_grid(table, element_id: str, page_number: int, base_url: str = "") ->
     rows = []
     occupied: dict[tuple[int, int], bool] = {}
     max_columns = 0
-    html_rows = table.find_all("tr")
+    # Nested layout tables occur in a few archived FAQs.  Their rows belong
+    # to the inner table and must not consume columns in the outer grid.
+    html_rows = [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
     for row_index, tr in enumerate(html_rows):
         cells = []
         column = 0
@@ -310,10 +312,24 @@ def _table_grid(table, element_id: str, page_number: int, base_url: str = "") ->
                 "colspan": cell["colspan"],
                 "source_cell": cell["id"],
             })
+    header_rows = []
+    for row in rows:
+        cells = row.get("cells") or []
+        if cells and all(cell.get("tag") == "th" for cell in cells):
+            header_rows.append({"id": row.get("id", ""), "index": row.get("index", 0),
+                                "level": len(header_rows) + 1,
+                                "cells": [{"id": cell.get("id", ""),
+                                           "text": cell.get("text", ""),
+                                           "column": cell.get("column", 0),
+                                           "colspan": cell.get("colspan", 1),
+                                           "rowspan": cell.get("rowspan", 1),
+                                           "source_cell": cell.get("id", "")}
+                                          for cell in cells]})
     caption = table.find("caption")
     return {
         "headers": headers,
-        "has_header": has_header,
+        "header_rows": header_rows,
+        "has_header": bool(headers or header_rows),
         "rows": rows,
         "columns": max_columns,
         "caption": _normalise_text(caption.get_text(" ", strip=True)) if caption else "",

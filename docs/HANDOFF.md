@@ -1,5 +1,30 @@
 # DigiTracker — Handoff para a sessão do Windows
 
+## Estado atual — rodada 11/09/2026
+
+O código local está na linha `v0.11.4` e recebeu a implementação do Atlas
+estruturado, fontes GameFAQs/Wayback/HTML, itens e companion detalhado. A
+extração preserva JSON editorial e Markdown derivado; tabelas com células
+mescladas/cabeçalhos repetidos, marcadores `Evolution Item` e requisitos por
+item/local têm regressões cobrindo esses casos. Cards exibem IDs numéricos,
+pendências apontam tabela/linha/cards afetados, e o Atlas oferece foco/mapa/lista,
+preenchimento de imagens por nome da entidade, cancelamento/desfazer e exclusão
+segura de sistemas.
+
+O companion usa protocolo v2 com escrita por alvo, revisão, `request_id`
+idempotente, conflitos explícitos, quantidade de item `null/0/positivo` e
+polling que preserva detalhe/foco/rascunho. Foram adicionados endpoints de
+leitura autenticados para capítulos, Atlas, itens, conquistas e referências.
+
+Validação local desta rodada: **599 testes passaram**, `compileall`, `node
+--check` dos dois companions e `git diff --check` passaram. O build físico
+Windows foi concluído em `dist/DigiTracker.exe`; ainda falta abrir e validar
+o WebView2, além do smoke com provedor real. Não houve commit, push ou tag
+nesta rodada; fazer isso somente após autorização explícita do autor.
+
+O registro detalhado está em
+[`docs/EXECUCAO_CELULAR_ATLAS_FONTES_ITENS.md`](EXECUCAO_CELULAR_ATLAS_FONTES_ITENS.md).
+
 > Contexto para uma sessão do Claude Code rodando na máquina **Windows** do autor.
 > O desenvolvimento e os testes de Linux foram feitos numa sessão separada (GNOME/Wayland).
 > Aqui no Windows está o **alvo real**: onde o `.exe` roda e onde o overlay gruda no emulador (Dolphin etc.).
@@ -8,19 +33,22 @@
 
 App desktop **pywebview** (Python + HTML/CSS/JS vanilla) que acompanha conquistas do **RetroAchievements** reordenadas pela ordem de um guia, com um **overlay que gruda por cima da janela do emulador**. Uso pessoal, single-user, offline-first.
 
-- Repositório: **WnMoura/digitracker** (privado), branch `main`, código em preparação para a release **v0.10.6**.
+- Repositório: **WnMoura/digitracker** (privado), branch `main`, código em preparação para a release **v0.11.4**.
 - Backend: `engine.py` (janela + `js_api` + sincronização + estado + overlay). Módulos principais: `ra_api.py`, `gamefaqs.py`, `guide_ai.py`, `guide_parser.py`, `smart_guide.py`, `guide_media.py`, `experience.py`, `experience_api.py`, `companion.py`, `emulator_tracker.py`, `updater.py` e provedores de imagem.
 - Frontend: `ui/index.html`, `ui/app.js`, `ui/style.css`, fontes locais (`ui/fonts/`).
-- Testes: `tests/` (pytest) — **570 passando** na última validação local.
+- Testes: `tests/` (pytest) — **599 passando** na validação integrada atual
+  (os números menores abaixo são registros históricos das releases anteriores).
 
-### Estado da release v0.10.6
+### Contexto histórico da release v0.10.6
 
 - O Atlas agora processa a fonte em lotes auditáveis, salva checkpoints atômicos e retoma após falhas ou rate limits.
 - Gemini é serializado, respeita `Retry-After`/`RetryInfo` e usa fallback automático quando o modelo padrão não está disponível.
 - Relações alternativas do Atlas entre os mesmos nós preservam rótulo, tipo de rota e requisitos, sem serem rejeitadas como duplicatas.
 - A importação do GameFAQs separa navegação/anúncios do conteúdo e preserva tabelas e paginação.
 - PDF, GameFAQs e Atlas exibem estado de processamento e erros classificados; a área de IA mostra telemetria local sem chaves, prompts ou respostas.
-- `version.py` aponta para `0.10.6`; a tag deve corresponder exatamente a esse valor para o workflow publicar.
+- A release histórica usava `0.10.6`; o estado local atual aponta para `0.11.4` em
+  `version.py`. Antes de publicar, a tag planejada deve corresponder exatamente
+  ao valor atual para o workflow aceitar o build.
 
 ## Como rodar / buildar no Windows
 
@@ -36,7 +64,7 @@ App desktop **pywebview** (Python + HTML/CSS/JS vanilla) que acompanha conquista
 - **Arraste do overlay no Windows:** o drag-region nativo do pywebview **não funciona no WinForms** (ele chama `window.move` na thread do bridge js_api, que não surte efeito). Por isso existe um arraste próprio: `makeDraggable` (ui/app.js) → `move_window` → `_window_op` (roda numa thread própria, igual fechar/minimizar/dockar). Se o arraste falhar no Windows, é aqui que se investiga.
 - **Fullscreen exclusivo (D3D):** nenhum overlay aparece por cima. O app detecta (`SHQueryUserNotificationState`) e, com o interruptor ligado nas Configurações, pode mandar **Alt+Enter** ou levar o overlay para o **segundo monitor**. Sem interruptor, só avisa.
 
-## O que validar no Windows (v0.10.6)
+## O que validar no Windows (aplicável ao v0.11.4)
 
 1. **Overlay grudando no emulador (o principal):** abrir Dolphin/PCSX2/ePSXe em **janela ou borderless** → o app deve entrar em compacto, **dimensionar proporcional** à janela do emulador (~26%×44%) e **grudar no canto superior-direito de dentro**; seguir se a janela mover/redimensionar; **restaurar** ao fechar. Toggle "Ajustar ao tamanho do emulador" nas Configurações (ligado por padrão).
 2. **Arraste do overlay** pela faixa de cima (o `makeDraggable`).
@@ -47,9 +75,11 @@ App desktop **pywebview** (Python + HTML/CSS/JS vanilla) que acompanha conquista
 
 ## Build/Release
 
-- CI: `.github/workflows/build-windows.yml` dispara em **push de tag `v*`**, roda os 570 testes, gera o `.exe` e o checksum SHA-256, e publica o Release. Actions já estão em v7 (Node 24).
+- CI: `.github/workflows/build-windows.yml` dispara em **push de tag `v*`**, roda a suíte de testes, gera o `.exe` e o checksum SHA-256, e publica o Release. Actions já estão em v7 (Node 24).
 - **Gotcha conhecido:** às vezes o push da tag **não dispara** o build (hiccup do GitHub Actions). Fallback confiável: `gh workflow run build-windows.yml --ref <tag>` — como a `ref` é a própria tag, o passo de Release roda e publica o `.exe` igual.
-- Para validar a tag antes do push: `git show v0.10.6:version.py` e confirmar `APP_VERSION = "0.10.6"`.
+- Para validar uma tag antes do push: confira `version.py` no commit que será
+  publicado e confirme que `APP_VERSION` corresponde exatamente ao sufixo da
+  tag.
 
 ## Itens em aberto
 

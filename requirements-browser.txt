@@ -1,0 +1,3 @@
+# Opcional: habilita a captura de páginas que dependem de JavaScript,
+# rolagem e botões "carregar mais" usando o Microsoft Edge instalado.
+playwright==1.62.0

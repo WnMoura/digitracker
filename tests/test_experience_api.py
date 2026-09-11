@@ -64,6 +64,53 @@ def test_companion_progress_returns_no_source_or_private_notes(api):
     assert block["id"] in api._guides.progress("game")["completed"]
 
 
+def test_companion_v2_is_target_scoped_and_idempotent(api):
+    block = api.get_smart_guide("game")["current"]["chapters"][0]["blocks"][0]
+    snapshot = api._companion_snapshot("game")
+    body = {
+        "api_version": 2, "request_id": "mobile-request-1", "kind": "progress",
+        "slug": "game", "action": "complete", "value": True,
+        "target": {"block_id": block["id"]},
+        "expected_definition_revision": snapshot["definition_revision"],
+        "expected_value_version": 0,
+    }
+    first = api._companion_command(body)
+    second = api._companion_command(body)
+    assert first["ok"] and not first["idempotent"]
+    assert second["ok"] and second["idempotent"]
+    stale = {**body, "request_id": "mobile-request-2", "value": False, "expected_value_version": 0}
+    assert api._companion_command(stale)["conflict"]
+
+
+def test_companion_v2_rejects_string_boolean(api):
+    block = api.get_smart_guide("game")["current"]["chapters"][0]["blocks"][0]
+    snapshot = api._companion_snapshot("game")
+    result = api._companion_command({
+        "api_version": 2, "request_id": "mobile-request-bad", "kind": "progress",
+        "slug": "game", "action": "complete", "value": "true",
+        "target": {"block_id": block["id"]},
+        "expected_definition_revision": snapshot["definition_revision"],
+        "expected_value_version": 0,
+    })
+    assert not result["ok"] and result["code"] == "validation_error"
+
+
+def test_documented_item_requirement_is_cataloged_without_new_atlas_node(api):
+    saved = api._guides.save_system("game", {
+        "title": "Evoluções", "origin": "manual", "status": "approved",
+        "nodes": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+        "edges": [{"id": "edge", "from": "a", "to": "b", "requirements": [{
+            "id": "req", "text": "Use Sacred Wings on A", "mode": "item",
+            "condition": {"op": "item", "item_name": "Sacred Wings", "action": "use"},
+            "source_refs": [{"section": 1, "block": 1}],
+        }], "source_refs": [{"section": 1, "block": 1}]}],
+    })["system"]
+    api._refresh_smart_bundle("game")
+    items = api.get_guide_items("game")["items"]
+    assert [item["name"] for item in items] == ["Sacred Wings"]
+    assert all(node["label"] != "Sacred Wings" for node in saved["nodes"])
+
+
 def test_companion_does_not_publish_drafts_or_expose_spoilers(api):
     saved = api._guides.save_system("game", system())["system"]
     assert not api._companion_snapshot()["systems"]

@@ -177,7 +177,20 @@ class ExperienceApi:
         document = copy.deepcopy(bundle.get("current") or {})
         progress = bundle.get("effective_progress") or bundle.get("progress") or {}
         system_state = bundle.get("system_state") or {}
-        version = smart_guide._json_hash([document.get("revision_id"), progress, system_state])
+        definition_revision = str(document.get("revision_id") or "")
+        # ``version`` remains for protocol v1 clients.  Protocol v2 uses a
+        # definition revision plus independent value versions so a guide
+        # toggle cannot conflict with an unrelated change elsewhere.
+        progress_public = {key: progress.get(key) for key in
+                           ("completed", "checkpoint", "revealed_spoilers")}
+        progress_public["value_versions"] = dict(progress.get("value_versions") or {})
+        public_system_state = {key: copy.deepcopy(system_state.get(key)) for key in
+                               ("active_system", "goals", "completed_requirements", "node_media", "preferences", "value_versions")}
+        version = smart_guide._json_hash([definition_revision, progress_public, public_system_state])
+        progress_revision = smart_guide._json_hash(progress_public)
+        catalog = getattr(self, "_items", None)
+        items = catalog.list(slug) if catalog else []
+        items_revision = int((catalog.possession(slug) if catalog else {}).get("revision") or 0)
         revealed = set(progress.get("revealed_spoilers") or [])
         for chapter in document.get("chapters") or []:
             for index, block in enumerate(chapter.get("blocks") or []):
@@ -193,16 +206,21 @@ class ExperienceApi:
             ids = {node["id"] for node in system["nodes"]}
             system["edges"] = [edge for edge in system.get("edges") or [] if edge["from"] in ids and edge["to"] in ids and not edge.get("spoiler")]
             systems.append(system)
+        content_revision = smart_guide._json_hash([definition_revision, systems])
         next_objective = bundle.get("next_objective") or {}
         if next_objective.get("block_id") not in {b["id"] for c in document.get("chapters") or [] for b in c.get("blocks") or [] if not b.get("hidden")}:
             next_objective = {}
         with self._companion_ai_lock:
             answer = copy.deepcopy(self._companion_ai.get(slug) or {})
-        return {"ok": True, "version": version, "game": {key: game.get(key) for key in ("slug", "title", "platform", "art", "mastery")},
+        return {"ok": True, "api_version": 2, "version": version,
+                "definition_revision": definition_revision, "content_revision": content_revision,
+                "progress_revision": progress_revision,
+                "game": {key: game.get(key) for key in ("slug", "title", "platform", "art", "mastery")},
                 "chapters": document.get("chapters") or [], "systems": systems,
                 "media": [{"id": item.get("id"), "url": item.get("url"), "title": item.get("title")} for item in bundle.get("media") or [] if item.get("status") != "rejected"],
-                "progress": {key: progress.get(key) for key in ("completed", "checkpoint", "revealed_spoilers")},
-                "system_state": system_state, "objective": next_objective,
+                "progress": progress_public,
+                "system_state": public_system_state, "objective": next_objective,
+                "items": items, "items_revision": items_revision,
                 "missables": game.get("pending_missables") or [], "achievements": game.get("achievements") or [], "answer": answer}
 
     def _companion_command(self, body):
@@ -213,6 +231,11 @@ class ExperienceApi:
             return self._start_companion_question(slug, str(body.get("block_id") or ""), str(body.get("question") or ""))
         with self._guides._write_lock:
             snapshot = self._companion_snapshot(slug)
+            # Protocol v2 is target-scoped and idempotent.  It is deliberately
+            # additive: installed companions using v1 still use the legacy
+            # whole-snapshot guard below.
+            if body.get("api_version", 1) >= 2 or body.get("request_id"):
+                return self._companion_command_v2(body, snapshot)
             if body.get("version") != snapshot["version"]:
                 return {"ok": False, "conflict": True, "error": "O progresso mudou no PC. Atualize e tente novamente."}
             if kind == "progress":
@@ -240,6 +263,96 @@ class ExperienceApi:
                 result = self.set_guide_system_goal(slug, body.get("system_id"), body.get("node_id"))
                 return {key: result[key] for key in ("ok", "error") if key in result}
         return {"ok": False, "error": "Comando não permitido no companion."}
+
+    def _companion_command_v2(self, body, snapshot):
+        """Apply a strict, retry-safe companion command.
+
+        The mobile UI sends a semantic target and the value version it last
+        observed.  The server never coerces arbitrary truthy values: a
+        malformed or stale command receives a structured conflict and the
+        client can refresh only the affected target.
+        """
+        request_id = str(body.get("request_id") or "").strip()
+        if not request_id or len(request_id) > 120:
+            return {"ok": False, "code": "invalid_request", "error": "request_id é obrigatório."}
+        target = body.get("target") if isinstance(body.get("target"), dict) else {}
+        expected = body.get("expected") if isinstance(body.get("expected"), dict) else {}
+        expected_definition = str(body.get("expected_definition_revision") or
+                                  expected.get("definition_revision") or
+                                  target.get("definition_revision") or "")
+        expected_version = body.get("expected_value_version",
+                                   expected.get("value_version", target.get("value_version")))
+        if expected_version is not None:
+            try:
+                expected_version = int(expected_version)
+            except (TypeError, ValueError):
+                return {"ok": False, "code": "invalid_version", "error": "value_version inválida."}
+        try:
+            if body.get("kind") == "progress":
+                block_id = str(target.get("block_id") or body.get("block_id") or "")
+                action = str(body.get("action") or "")
+                value = body.get("value")
+                result = self._guides.update_progress_versioned(
+                    body.get("slug") or "", action, block_id, value,
+                    request_id=request_id, expected_definition_revision=expected_definition,
+                    expected_value_version=expected_version)
+                self._refresh_smart_bundle(body.get("slug") or "")
+                return {"ok": True, "kind": "progress", "request_id": request_id,
+                        "target": result.get("target"), "value": result.get("value"),
+                        "value_version": result.get("value_version"),
+                        "definition_revision": result.get("definition_revision"),
+                        "progress_revision": smart_guide._json_hash(result.get("progress") or {}),
+                        "idempotent": result.get("idempotent", False)}
+            if body.get("kind") == "item":
+                catalog = getattr(self, "_items", None)
+                if not catalog:
+                    return {"ok": False, "code": "unsupported_command", "error": "Catálogo de itens indisponível."}
+                identifier = str(target.get("item_id") or body.get("item_id") or "")
+                quantity = body.get("value", body.get("quantity"))
+                if quantity is not None and (isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 0):
+                    return {"ok": False, "code": "invalid_value", "error": "Quantidade de item inválida."}
+                item_revision = body.get("expected_item_revision",
+                                        expected.get("item_revision", snapshot.get("items_revision", 0)))
+                try:
+                    item_revision = int(item_revision)
+                except (TypeError, ValueError):
+                    return {"ok": False, "code": "invalid_version", "error": "Versão do catálogo inválida."}
+                result = self.set_guide_item_quantity(body.get("slug") or "", identifier, quantity, item_revision, request_id)
+                if not result.get("ok"):
+                    error = str(result.get("error") or "Não foi possível salvar o item.")
+                    conflict = any(token in error.casefold() for token in ("mudou", "versão", "versao", "atualize"))
+                    return {"ok": False, "conflict": conflict,
+                            "code": "version_conflict" if conflict else "validation_error", "error": error}
+                return {"ok": True, "kind": "item", "request_id": request_id,
+                        "item_id": identifier, "value": quantity,
+                        "items_revision": result.get("revision"),
+                        "idempotent": bool(result.get("idempotent"))}
+            if body.get("kind") == "requirement":
+                system_id = str(target.get("system_id") or body.get("system_id") or "")
+                edge_id = str(target.get("edge_id") or target.get("rule_id") or body.get("edge_id") or body.get("rule_id") or "")
+                requirement_id = str(target.get("requirement_id") or target.get("condition_id") or body.get("requirement_id") or body.get("condition_id") or "")
+                value = body.get("value", body.get("completed"))
+                if not isinstance(value, bool):
+                    return {"ok": False, "code": "invalid_value", "error": "Valor do requisito deve ser booleano."}
+                result = self._guides.update_requirement_versioned(
+                    body.get("slug") or "", system_id, edge_id, requirement_id, value,
+                    request_id=request_id, expected_definition_revision=expected_definition,
+                    expected_value_version=expected_version)
+                self._refresh_smart_bundle(body.get("slug") or "")
+                return {"ok": True, "kind": "requirement", "request_id": request_id,
+                        "target": result.get("target"), "value": result.get("value"),
+                        "value_version": result.get("value_version"),
+                        "definition_revision": result.get("definition_revision"),
+                        "progress_revision": smart_guide._json_hash(result.get("state") or {}),
+                        "idempotent": result.get("idempotent", False)}
+            return {"ok": False, "code": "unsupported_command", "error": "Comando não permitido no companion."}
+        except smart_guide.SmartGuideConflict as exc:
+            return {"ok": False, "conflict": True, "code": "version_conflict",
+                    "error": str(exc), "target": exc.target,
+                    "value": exc.value, "value_version": exc.value_version,
+                    "definition_revision": snapshot.get("definition_revision", "")}
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "code": "validation_error", "error": str(exc)}
 
     def _start_companion_question(self, slug, block_id, question):
         import guide_ai

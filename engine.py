@@ -48,6 +48,11 @@ import image_fetch
 import platform_providers
 import rawg
 import smart_guide
+import source_document
+import atlas_images
+import item_catalog
+import source_import
+import source_store
 import steamgriddb
 import updater
 import web_image_search
@@ -491,6 +496,8 @@ class Api(ExperienceApi, DataToolsApi):
         self._updates = updater.UpdateManager(APP_VERSION, sys.executable)
         self._guides = smart_guide.SmartGuideStore(GUIDES_DIR)
         self._guide_media = guide_media.GuideMediaLibrary(GUIDES_DIR, GUIDE_MEDIA_DIR)
+        self._items = item_catalog.ItemCatalog(GUIDES_DIR)
+        self._source_store = source_store.SourceStore(GUIDES_DIR)
         self._platforms = platform_providers.ProviderRegistry()
 
         for d in (GAMES_DIR, CACHE_DIR, BADGES_DIR, ICONS_DIR, ART_DIR):
@@ -1960,19 +1967,29 @@ class Api(ExperienceApi, DataToolsApi):
             return {"ok": False, "error": str(exc), "error_kind": "source_validation",
                     "error_code": "atlas_validation"}
 
-    def add_walkthrough_gamefaqs(self, slug: str, url: str) -> dict:
+    def add_walkthrough_gamefaqs(self, slug: str, url: str, title: str = "") -> dict:
         game = load_game_file(GAMES_DIR / f"{slug}.json")
         if not game:
             return {"ok": False, "error": "Jogo não encontrado."}
         try:
             session = gamefaqs.create_session()
             faq = gamefaqs.fetch_faq(session, url)
-            parsed = guide_parser.parse_freeform(faq.get("text") or "")
+            structured = source_document.from_gamefaqs(faq)
+            parsed_sections = source_document.to_guide_sections(structured)
+            if not parsed_sections:
+                # Plain text remains a compatibility fallback for old captures
+                # that do not contain editorial elements.
+                parsed = guide_parser.parse_freeform(faq.get("text") or "")
+                parsed_sections = parsed.get("sections") or []
+            selected_title = str(title or faq.get("title") or "GameFAQs").strip()
             source = self._guides.add_walkthrough_source(
-                slug, faq.get("title") or "GameFAQs", "gamefaqs",
-                parsed.get("sections") or [],
-                {"filename": faq.get("title") or "", "url": url,
-                 "capture": copy.deepcopy(faq.get("source") or {})},
+                slug, selected_title, "gamefaqs", parsed_sections,
+                {"filename": faq.get("title") or selected_title, "url": url,
+                 "capture": copy.deepcopy(faq.get("source") or {}),
+                 "edition_signals": faq.get("edition_signals") or [],
+                 "pages": faq.get("pages", 0)},
+                structured=structured, markdown=source_document.to_markdown(structured),
+                raw_pages=faq.get("page_records") or [],
                 text=faq.get("text") or "",
             )
             return {"ok": True, "source": source, "duplicate": bool(source.get("duplicate")),
@@ -1981,6 +1998,70 @@ class Api(ExperienceApi, DataToolsApi):
             return {"ok": False, "error": str(exc)}
         except Exception as exc:
             return {"ok": False, "error": f"Falha ao importar o GameFAQs: {exc}"}
+
+    def capture_web_source(self, slug: str, title: str, url: str,
+                           mode: str = "http") -> dict:
+        """Captura qualquer fonte editorial antes da interpretação com IA.
+
+        ``http`` cobre HTML estático; ``browser`` usa Edge/Playwright para
+        páginas que carregam tabelas por JavaScript, rolagem ou "load more".
+        A captura e o HTML ficam locais e a resposta pública contém apenas a
+        revisão estruturada, nunca HTML executável.
+        """
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        try:
+            capture = (source_import.capture_browser if str(mode).lower() == "browser"
+                       else source_import.capture_http)(url)
+            document = capture["document"]
+            if (str(mode).lower() != "browser"
+                    and (document.get("completeness") or {}).get("status") == "insufficient"):
+                # A static shell (for example a GameFAQs page whose table is
+                # filled by JavaScript) must not become a successful source.
+                # Keep discovery in the response so the UI can offer a
+                # browser capture or another page without losing the URL.
+                return {"ok": False,
+                        "error": "A captura está incompleta: a página retornou pouco conteúdo editorial. Tente a captura dinâmica.",
+                        "error_kind": "content_insufficient", "retryable": False,
+                        "discovery": capture.get("discovery") or [],
+                        "completeness": document.get("completeness") or {}}
+            source_id = source_store._safe(slug) + "-" + uuid.uuid4().hex[:10]
+            document["source_id"] = source_id
+            document["title"] = str(title or document.get("title") or "Fonte web").strip()[:500]
+            saved_capture = self._source_store.save_capture(
+                slug, document,
+                raw_pages=[{"number": 1, "url": capture.get("final_url") or url, "html": capture.get("html", "")}],
+            )
+            structured = saved_capture.get("document") or document
+            sections = source_document.to_guide_sections(structured, source_id=source_id)
+            source = self._guides.add_walkthrough_source(
+                slug, document["title"], "web", sections,
+                {"url": url, "canonical_url": capture.get("final_url") or url,
+                 "source_format": structured.get("format"), "capture_id": saved_capture.get("capture_id"),
+                 "capture_mode": str(mode).lower(), "stats": structured.get("stats", {})},
+                structured=structured, markdown=saved_capture.get("markdown", ""),
+                raw_pages=[{"number": 1, "url": capture.get("final_url") or url, "html": capture.get("html", "")}],
+            )
+            return {"ok": True, "source": source, "capture": saved_capture,
+                    "discovery": capture.get("discovery") or [],
+                    "sources": self._guides.walkthrough_sources(slug)}
+        except (source_import.SourceImportError, source_store.SourceStoreError,
+                smart_guide.SmartGuideError) as exc:
+            return {"ok": False, "error": str(exc), "error_kind": getattr(exc, "code", "source_import"),
+                    "retryable": bool(getattr(exc, "retryable", False))}
+
+    def list_source_captures(self, slug: str) -> dict:
+        try:
+            return {"ok": True, "sources": self._source_store.index(slug)}
+        except source_store.SourceStoreError as exc:
+            return {"ok": False, "error": str(exc), "sources": []}
+
+    def get_source_capture(self, slug: str, source_id: str, capture_id: str = "") -> dict:
+        try:
+            return {"ok": True, **self._source_store.get_capture(slug, source_id, capture_id)}
+        except source_store.SourceStoreError as exc:
+            return {"ok": False, "error": str(exc)}
 
     def add_walkthrough_text(self, slug: str, title: str, text: str) -> dict:
         game = load_game_file(GAMES_DIR / f"{slug}.json")
@@ -2149,6 +2230,7 @@ class Api(ExperienceApi, DataToolsApi):
 
     def _refresh_smart_bundle(self, slug: str) -> None:
         """Atualiza dashboard/HUD sem consultar novamente a plataforma."""
+        self._sync_item_catalog(slug)
         bundle = self.get_smart_guide(slug)
         if not bundle.get("ok"):
             return
@@ -2156,6 +2238,35 @@ class Api(ExperienceApi, DataToolsApi):
             if slug in self.state:
                 self.state[slug]["smart_guide"] = bundle
         self._notify_overlay_surfaces()
+
+    def _sync_item_catalog(self, slug: str) -> None:
+        """Materializa itens documentados sem criar nós de entidade no Atlas."""
+        document = self._guides.current(slug) or {}
+        existing = {item.get("id") for item in self._items.catalog(slug).get("items") or []}
+        for system in document.get("systems") or []:
+            for edge in system.get("edges") or []:
+                for requirement in edge.get("requirements") or []:
+                    if str(requirement.get("mode") or "").lower() != "item":
+                        continue
+                    condition = requirement.get("condition") or {}
+                    # A marker such as “Evolution Item” identifies the route
+                    # type but is not an item name.  Only a parsed item leaf
+                    # may enter the inventory catalog; this prevents marker
+                    # text, shops and locations from becoming fake items.
+                    if condition.get("op") != "item":
+                        continue
+                    name = condition.get("item_name") or ""
+                    if not name:
+                        continue
+                    identifier = item_catalog.item_id(str(name), system.get("edition_key") or "")
+                    if identifier in existing:
+                        continue
+                    self._items.upsert(
+                        slug, str(name), edition_key=system.get("edition_key") or "",
+                        description=requirement.get("original") or requirement.get("text") or "",
+                        source_refs=requirement.get("source_refs") or [], item_kind="evolution",
+                    )
+                    existing.add(identifier)
 
     def get_guide_systems(self, slug: str) -> dict:
         game = load_game_file(GAMES_DIR / f"{slug}.json")
@@ -2263,6 +2374,13 @@ class Api(ExperienceApi, DataToolsApi):
             return {"message": str(exc), "kind": "source_import",
                     "code": "gamefaqs_import", "hint": "Confira a URL e tente novamente.",
                     "details": {"exception": type(exc).__name__}}
+        if isinstance(exc, source_import.SourceImportError):
+            code = str(getattr(exc, "code", "source_import") or "source_import")
+            kind = "content_insufficient" if code == "content_insufficient" else "source_import"
+            hint = ("Escolha captura dinâmica / Edge para carregar a página completa."
+                    if code == "content_insufficient" else "Confira a URL, a conexão e o modo de captura.")
+            return {"message": str(exc), "kind": kind, "code": code,
+                    "hint": hint, "details": {"exception": type(exc).__name__, "hint": hint}}
         if isinstance(exc, smart_guide.SmartGuideError):
             return {"message": str(exc), "kind": "source_validation",
                     "code": "atlas_validation", "hint": "Revise a fonte ou edite o sistema manualmente.",
@@ -2601,7 +2719,7 @@ class Api(ExperienceApi, DataToolsApi):
                         "page": max(0, int(block.get("page") or section.get("page") or 0)),
                     }
         for document in pages:
-            page = max(1, int(document.get("page") or 1))
+            page = max(1, int(document.get("page") or document.get("number") or 1))
             for element in document.get("elements") or []:
                 if element.get("type") == "heading":
                     headings.append({"id": element.get("id", ""), "page": page,
@@ -2625,6 +2743,7 @@ class Api(ExperienceApi, DataToolsApi):
                     "title": element.get("title", ""),
                     "path": element.get("path") or [],
                     "headers": [item.get("text", "") for item in element.get("headers") or []],
+                    "header_rows": deepcopy(element.get("header_rows") or []),
                     "columns": element.get("columns", 0),
                     "rows": len(element.get("rows") or []),
                     "sample": sample,
@@ -2656,7 +2775,8 @@ class Api(ExperienceApi, DataToolsApi):
             "kind": source.get("kind", ""),
             "url": source.get("url") or metadata.get("url", ""),
             "pages": len(pages),
-            "page_numbers": [document.get("page") for document in pages],
+            "page_numbers": [document.get("page") or document.get("number") or index + 1
+                             for index, document in enumerate(pages)],
             "stats": stats or {"tables": len(tables), "table_rows": sum(t["rows"] for t in tables)},
             "tables": tables,
             "headings": headings,
@@ -2698,6 +2818,42 @@ class Api(ExperienceApi, DataToolsApi):
             return {"ok": False, "error": info["message"],
                     "error_kind": info["kind"], "error_code": info["code"],
                     "error_details": info["details"]}
+
+    def create_guide_system_from_web(self, slug: str, title: str, url: str,
+                                     mode: str = "http") -> dict:
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        try:
+            capture = (source_import.capture_browser if str(mode).lower() == "browser"
+                       else source_import.capture_http)(url)
+            structured = capture["document"]
+            if (str(mode).lower() != "browser"
+                    and (structured.get("completeness") or {}).get("status") == "insufficient"):
+                return {"ok": False,
+                        "error": "A captura está incompleta: a página retornou pouco conteúdo editorial. Tente a captura dinâmica.",
+                        "error_kind": "content_insufficient", "retryable": False,
+                        "discovery": capture.get("discovery") or [],
+                        "completeness": structured.get("completeness") or {}}
+            selected_title = str(title or structured.get("title") or "Fonte web").strip()
+            self._ensure_atlas_document(game)
+            raw_page = {"number": 1, "url": capture.get("final_url") or url, "html": capture.get("html", "")}
+            source = self._guides.add_system_source(
+                slug, selected_title, "web", source_document.to_guide_sections(structured),
+                {"filename": selected_title, "url": url, "canonical_url": capture.get("final_url") or url,
+                 "source_format": structured.get("format"), "capture_mode": str(mode).lower(),
+                 "stats": structured.get("stats", {})},
+                structured=structured, markdown=source_document.to_markdown(structured), raw_pages=[raw_page],
+            )
+            return self._queue_atlas_source(slug, source, selected_title, start=False)
+        except (source_import.SourceImportError, smart_guide.SmartGuideError) as exc:
+            info = self._atlas_error_info(exc)
+            return {"ok": False, "error": info["message"], "error_kind": info["kind"],
+                    "error_code": info["code"], "error_details": info["details"]}
+        except Exception as exc:
+            info = self._atlas_error_info(exc)
+            return {"ok": False, "error": info["message"], "error_kind": info["kind"],
+                    "error_code": info["code"], "error_details": info["details"]}
 
     def get_guide_system_source(self, slug: str, system_id: str) -> dict:
         current = self._guides.current(slug)
@@ -2754,8 +2910,20 @@ class Api(ExperienceApi, DataToolsApi):
                     structured=self._atlas_faq_structured(faq),
                     markdown=faq.get("markdown") or "",
                     raw_pages=faq.get("page_records") or [])
+            elif kind == "web":
+                url = str(source.get("url") or "").strip()
+                mode = str(source.get("mode") or "http").lower()
+                capture = (source_import.capture_browser if mode == "browser" else source_import.capture_http)(url)
+                structured = capture["document"]
+                raw_page = {"number": 1, "url": capture.get("final_url") or url, "html": capture.get("html", "")}
+                saved = self._guides.add_system_source(
+                    slug, title, "web", source_document.to_guide_sections(structured),
+                    {"filename": title, "url": url, "canonical_url": capture.get("final_url") or url,
+                     "source_format": structured.get("format"), "capture_mode": mode,
+                     "stats": structured.get("stats", {})},
+                    structured=structured, markdown=source_document.to_markdown(structured), raw_pages=[raw_page])
             else:
-                return {"ok": False, "error": "Escolha PDF ou GameFAQs."}
+                return {"ok": False, "error": "Escolha PDF, GameFAQs ou outro site."}
             self._guides.update_system_source(
                 slug, saved["id"], replace_system_id=system_id)
             return self._queue_atlas_source(slug, saved, title, system_id, start=False)
@@ -2809,13 +2977,134 @@ class Api(ExperienceApi, DataToolsApi):
         node = next((item for item in (system or {}).get("nodes") or [] if item.get("id") == node_id), None)
         if not game or not node:
             return {"ok": False, "error": "Nó do sistema não encontrado.", "results": []}
-        # An edited query is intentional; don't bury it under game/platform suffixes.
-        term = re.sub(r"\s+", " ", query or f"{node.get('label', '')} {game.get('title', '')} artwork").strip()[:300]
-        result = self.search_web_images(slug, term, page, "moderate", "icon", "google")
+        # Atlas entities use only the label (for example ``Agumon``). The
+        # game/platform suffix remains reserved for cover/background searches.
+        term = atlas_images.entity_query(node.get("label", ""), query)
+        result = self.search_web_images(slug, term, page, "moderate", "entity", "google")
         result["system_id"] = system_id
         result["node_id"] = node_id
         result["query"] = term
         return result
+
+    def start_guide_system_image_fill(self, slug: str, system_id: str,
+                                      source_id: str = "") -> dict:
+        """Preenche cards sem imagem em segundo plano; edições existentes vencem."""
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        if not game:
+            return {"ok": False, "error": "Jogo não encontrado."}
+        try:
+            system = self._guides.media_system(slug, system_id, source_id)
+        except smart_guide.SmartGuideError as exc:
+            return {"ok": False, "error": str(exc)}
+        key = f"images:{slug}:{system_id}:{source_id}"
+        with self._atlas_job_lock:
+            running = self._atlas_ai_status.get(key) or {}
+            if running.get("phase") == "running":
+                return dict(running)
+            nodes = [node for node in system.get("nodes") or [] if not node.get("spoiler")]
+            state = self._guides.system_state(slug)
+            existing = state.get("node_media") or {}
+            draft_media = {}
+            if source_id:
+                draft_media = (self._guides.atlas_draft(slug, source_id) or {}).get("node_media") or {}
+            pending = [node for node in nodes if not (
+                existing.get(f"{system_id}:{node.get('id')}")
+                or draft_media.get(node.get("id"))
+                or node.get("media_id") or node.get("image")
+            )]
+            task = {"ok": True, "phase": "running", "slug": slug, "system_id": system_id,
+                    "source_id": source_id, "job_id": uuid.uuid4().hex,
+                    "total": len(pending), "completed": 0,
+                    "filled": 0, "empty": 0, "failed": 0, "changes": [],
+                    "message": "Preenchendo imagens…", "cancel_requested": False}
+            self._atlas_ai_status[key] = task
+        threading.Thread(target=self._guide_system_image_fill_worker,
+                         args=(slug, system_id, source_id, pending, key), daemon=True).start()
+        return dict(task)
+
+    def _guide_system_image_fill_worker(self, slug: str, system_id: str, source_id: str,
+                                        nodes: list[dict], key: str) -> None:
+        task = self._atlas_ai_status.get(key) or {}
+        for node in nodes:
+            with self._atlas_job_lock:
+                if (self._atlas_ai_status.get(key) or {}).get("cancel_requested"):
+                    task["phase"] = "cancelled"; break
+            label = str(node.get("label") or "").strip()
+            try:
+                result = self.search_guide_system_media(slug, system_id, node.get("id", ""), label, 0, source_id)
+                candidates = atlas_images.rank_candidates(result.get("results") or [], label)
+                if not candidates:
+                    task["empty"] = int(task.get("empty") or 0) + 1
+                else:
+                    approved = self._guide_media.approve_remote(slug, candidates[0], True)
+                    if source_id:
+                        previous_id = ((self._guides.atlas_draft(slug, source_id) or {}).get("node_media") or {}).get(node.get("id", ""), "")
+                    else:
+                        previous_id = (self._guides.system_state(slug).get("node_media") or {}).get(f"{system_id}:{node.get('id', '')}", "")
+                    self._guides.set_system_media(slug, system_id, node.get("id", ""), approved.get("id", ""), source_id)
+                    task.setdefault("changes", []).append({"node_id": node.get("id", ""),
+                                                             "previous_media_id": previous_id,
+                                                             "media_id": approved.get("id", ""),
+                                                             "job_id": task.get("job_id", "")})
+                    task["filled"] = int(task.get("filled") or 0) + 1
+            except Exception:
+                task["failed"] = int(task.get("failed") or 0) + 1
+            task["completed"] = int(task.get("completed") or 0) + 1
+            with self._atlas_job_lock: self._atlas_ai_status[key] = dict(task)
+            time.sleep(1.0)
+        with self._atlas_job_lock:
+            if task.get("phase") == "running": task["phase"] = "complete"
+            task["message"] = "Preenchimento de imagens concluído." if task.get("phase") == "complete" else "Preenchimento cancelado."
+            self._atlas_ai_status[key] = dict(task)
+        self._refresh_smart_bundle(slug)
+
+    def get_guide_system_image_fill(self, slug: str, system_id: str, source_id: str = "") -> dict:
+        key = f"images:{slug}:{system_id}:{source_id}"
+        return dict(self._atlas_ai_status.get(key) or {"ok": True, "phase": "idle", "completed": 0, "total": 0})
+
+    def cancel_guide_system_image_fill(self, slug: str, system_id: str, source_id: str = "") -> dict:
+        key = f"images:{slug}:{system_id}:{source_id}"
+        with self._atlas_job_lock:
+            task = self._atlas_ai_status.get(key)
+            if not task or task.get("phase") != "running": return {"ok": False, "error": "Nenhum preenchimento em andamento."}
+            task["cancel_requested"] = True; task["message"] = "Cancelando…"
+            self._atlas_ai_status[key] = dict(task)
+        return dict(task)
+
+    def undo_guide_system_image_fill(self, slug: str, system_id: str, source_id: str = "",
+                                     job_id: str = "") -> dict:
+        """Desfaz apenas associações ainda pertencentes ao último lote."""
+        key = f"images:{slug}:{system_id}:{source_id}"
+        with self._atlas_job_lock:
+            task = dict(self._atlas_ai_status.get(key) or {})
+        if not task or task.get("phase") not in {"complete", "cancelled"}:
+            return {"ok": False, "error": "Nenhum lote concluído para desfazer."}
+        if job_id and job_id != task.get("job_id"):
+            return {"ok": False, "error": "O lote de imagens já não é o último lote."}
+        reverted = preserved = 0
+        for change in task.get("changes") or []:
+            node_id = str(change.get("node_id") or "")
+            if not node_id:
+                continue
+            try:
+                self._guides.media_system(slug, system_id, source_id)
+                if source_id:
+                    current_id = ((self._guides.atlas_draft(slug, source_id) or {}).get("node_media") or {}).get(node_id, "")
+                else:
+                    current_id = (self._guides.system_state(slug).get("node_media") or {}).get(f"{system_id}:{node_id}", "")
+                if current_id != change.get("media_id"):
+                    preserved += 1
+                    continue
+                self._guides.set_system_media(slug, system_id, node_id,
+                                              change.get("previous_media_id") or "", source_id)
+                reverted += 1
+            except smart_guide.SmartGuideError:
+                preserved += 1
+        task["undo"] = {"reverted": reverted, "preserved": preserved}
+        with self._atlas_job_lock:
+            self._atlas_ai_status[key] = task
+        self._refresh_smart_bundle(slug)
+        return {"ok": True, **task["undo"], "job_id": task.get("job_id", "")}
 
     def set_guide_system_media(self, slug: str, system_id: str, node_id: str,
                                media_id: str, source_id: str = '') -> dict:
@@ -2827,6 +3116,52 @@ class Api(ExperienceApi, DataToolsApi):
             return {"ok": True, "state": state, **self._guide_systems_payload(slug)}
         except smart_guide.SmartGuideError as exc:
             return {"ok": False, "error": str(exc)}
+
+    def get_guide_items(self, slug: str, query: str = "", category: str = "",
+                        possessed: str = "all") -> dict:
+        try:
+            catalog = self._items.catalog(slug)
+            possession = self._items.possession(slug)
+            if possessed not in {"all", "owned", "missing"}:
+                return {"ok": False, "error": "Filtro de posse inválido.", "items": []}
+            items = self._items.list(slug, query, category, possessed)
+            return {"ok": True, "items": items,
+                    "revision": int(possession.get("revision") or 0),
+                    "catalog_revision": int(catalog.get("revision") or 0)}
+        except item_catalog.ItemCatalogError as exc:
+            return {"ok": False, "error": str(exc), "items": []}
+
+    def list_game_items(self, slug: str, query: str = "", category: str = "",
+                        possessed: str = "all") -> dict:
+        """Compatibility name for clients that call the generic item API."""
+        return self.get_guide_items(slug, query, category, possessed)
+
+    def get_game_item(self, slug: str, item_id: str) -> dict:
+        try:
+            item = self._items.get(slug, item_id)
+            return {"ok": bool(item), "item": item, **({} if item else {"error": "Item não encontrado."})}
+        except item_catalog.ItemCatalogError as exc:
+            return {"ok": False, "error": str(exc), "item": None}
+
+    def set_guide_item_quantity(self, slug: str, item_id: str, quantity,
+                                expected_revision: int | None = None,
+                                request_id: str = "") -> dict:
+        try:
+            value = self._items.set_quantity(slug, item_id, quantity,
+                                             expected_revision=expected_revision,
+                                             request_id=request_id)
+            self._refresh_smart_bundle(slug)
+            return {"ok": True, "items": self._items.list(slug),
+                    "revision": int(value.get("revision") or 0),
+                    "idempotent": bool(value.get("idempotent"))}
+        except item_catalog.ItemCatalogError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def update_game_item_quantity(self, slug: str, item_id: str, quantity,
+                                  expected_revision: int | None = None,
+                                  request_id: str = "") -> dict:
+        return self.set_guide_item_quantity(slug, item_id, quantity,
+                                            expected_revision, request_id)
 
     def get_smart_guide_status(self, slug: str = "") -> dict:
         if slug:
@@ -3249,6 +3584,8 @@ class Api(ExperienceApi, DataToolsApi):
 
     @staticmethod
     def _web_art_query(game: dict, query: str = "", role: str = "cover") -> str:
+        if str(role or "").lower() == "entity":
+            return re.sub(r"\s+", " ", str(query or "")).strip()[:300]
         base = (query or "").strip() or " ".join(filter(None, (
             game.get("title", ""), game.get("platform", "")
         )))

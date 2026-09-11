@@ -35,6 +35,7 @@ import requests
 
 import guide_parser
 import smart_guide
+import atlas_model
 
 MAX_TOKENS = 16000
 TIMEOUT = 300           # guias longos levam minutos
@@ -50,7 +51,9 @@ ATLAS_BATCH_MAX_CHARS = 10000
 ATLAS_BATCH_MAX_BLOCKS = 24
 # Bump when the interpretation contract changes so an old mapping checkpoint
 # cannot silently be reused with different table semantics.
-ATLAS_EXTRACTION_VERSION = 3
+# Changes to this value invalidate Atlas batch checkpoints. It is additive to
+# smart_guide.SCHEMA_VERSION so old walkthrough documents remain readable.
+ATLAS_EXTRACTION_VERSION = 4
 
 # Só o Atlas usa fallback automático, e somente quando o usuário não fixou um
 # modelo. Uma escolha explícita nunca é trocada silenciosamente.
@@ -1882,14 +1885,43 @@ def _atlas_identity(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text.encode("ascii", "ignore").decode()).strip()
 
 
+def _atlas_requirement_identity(requirement: object) -> str:
+    """Identidade de requisito que preserva operador, valor e escopo."""
+    if not isinstance(requirement, dict):
+        return _atlas_identity(requirement)
+    value = {
+        "field": _atlas_identity(requirement.get("field")),
+        "operator": str(requirement.get("operator") or "="),
+        "value": str(requirement.get("value") if requirement.get("value") is not None else ""),
+        "mode": str(requirement.get("mode") or ""),
+        "group": str(requirement.get("group") or "all"),
+        "text": _atlas_identity(requirement.get("text")),
+    }
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _merge_refs(*groups: list) -> list[dict]:
     output, seen = [], set()
     for group in groups:
         for ref in group or []:
             if not isinstance(ref, dict):
                 continue
-            key = (str(ref.get("source_id") or ""), int(ref.get("section") or 0),
-                   int(ref.get("block") or 0), int(ref.get("page") or 0))
+            try:
+                section = int(ref.get("section") or 0)
+            except (TypeError, ValueError):
+                section = 0
+            try:
+                block = int(ref.get("block") or 0)
+            except (TypeError, ValueError):
+                block = 0
+            try:
+                page = int(ref.get("page") or 0)
+            except (TypeError, ValueError):
+                page = 0
+            key = (str(ref.get("source_id") or ""), section, block, page,
+                   str(ref.get("page_id") or ""), str(ref.get("element_id") or ""),
+                   str(ref.get("table_id") or ""), str(ref.get("row_id") or ""),
+                   str(ref.get("cell_id") or ""))
             if key in seen:
                 continue
             seen.add(key)
@@ -1956,9 +1988,9 @@ def _merge_atlas_fragments(fragments: list[dict], title: str) -> dict:
                     "Nenhuma prévia parcial foi salva."
                 )
             requirement_signature = tuple(sorted(
-                _atlas_identity(item.get("text"))
+                _atlas_requirement_identity(item)
                 for item in raw_edge.get("requirements") or []
-                if isinstance(item, dict) and _atlas_identity(item.get("text"))))
+                if isinstance(item, dict) and _atlas_requirement_identity(item)))
             # The same endpoints may have independent alternative conditions.
             # Merge only an exact path repeated in two source fragments.
             path_kind = (raw_edge.get("path_kind")
@@ -1982,12 +2014,12 @@ def _merge_atlas_fragments(fragments: list[dict], title: str) -> dict:
                 edge["spoiler"] = bool(edge.get("spoiler") or raw_edge.get("spoiler"))
                 if not edge.get("label") and raw_edge.get("label"):
                     edge["label"] = raw_edge["label"]
-            known_requirements = {_atlas_identity(item.get("text")): item
+            known_requirements = {_atlas_requirement_identity(item): item
                                   for item in edge.get("requirements") or [] if isinstance(item, dict)}
             for requirement in raw_edge.get("requirements") or []:
                 if not isinstance(requirement, dict) or not _atlas_identity(requirement.get("text")):
                     continue
-                requirement_key = _atlas_identity(requirement.get("text"))
+                requirement_key = _atlas_requirement_identity(requirement)
                 if requirement_key in known_requirements:
                     current = known_requirements[requirement_key]
                     current["source_refs"] = _merge_refs(
@@ -2038,7 +2070,10 @@ def _structured_tables(source: dict) -> list[dict]:
     pages = structured.get("pages") if isinstance(structured, dict) else []
     output = []
     for document in pages if isinstance(pages, list) else []:
-        page = max(1, int(document.get("page") or 1))
+        # SourceDocument uses ``number``; the legacy GameFAQs adapter uses
+        # ``page``.  Accept both so generic web captures use the same Atlas
+        # materializer instead of silently putting every table on page 1.
+        page = max(1, int(document.get("page") or document.get("number") or 1))
         for element in document.get("elements") or []:
             if element.get("type") != "table":
                 continue
@@ -2051,7 +2086,8 @@ def _structured_tables(source: dict) -> list[dict]:
             output.append({
                 "table_id": element.get("id", ""), "page": page,
                 "title": element.get("title", ""), "path": element.get("path") or [],
-                "headers": headers, "columns": int(element.get("columns") or 0),
+                "headers": headers, "header_rows": element.get("header_rows") or [],
+                "columns": int(element.get("columns") or 0),
                 "rows": element.get("rows") or [], "samples": samples,
                 "semantic_role": _structured_table_semantic_role({
                     "title": element.get("title", ""),
@@ -2066,7 +2102,8 @@ def _structured_table_payload(tables: list[dict], system_title: str, game: dict)
     visible = [{
         "table_id": table["table_id"], "page": table["page"],
         "title": table["title"], "path": table["path"],
-        "headers": table["headers"], "columns": table["columns"],
+        "headers": table["headers"], "header_rows": table.get("header_rows") or [],
+        "columns": table["columns"],
         "row_count": len(table["rows"]), "samples": table["samples"],
         "semantic_role_hint": table.get("semantic_role") or "unknown",
     } for table in tables]
@@ -2077,7 +2114,7 @@ def _structured_table_payload(tables: list[dict], system_title: str, game: dict)
 
 
 def _structured_table_groups(tables: list[dict], max_tables: int = 18,
-                             max_chars: int = 24_000) -> list[list[dict]]:
+                             max_chars: int = 20_000) -> list[list[dict]]:
     groups, current, size = [], [], 0
     for table in tables:
         cost = len(json.dumps(table, ensure_ascii=False))
@@ -2124,10 +2161,18 @@ def _structured_ref_lookup(source: dict) -> dict[tuple[str, str], dict]:
             table_id = str(block.get("table_id") or "")
             row_id = str(block.get("row_id") or "")
             if table_id and row_id:
-                lookup[(table_id, row_id)] = {
+                ref = {
                     "source_id": source.get("id", ""),
+                    "capture_id": source.get("capture_id") or (source.get("metadata") or {}).get("capture_id", ""),
                     "section": section_index, "block": block_index,
                     "page": max(0, int(block.get("page") or section.get("page") or 0)),
+                    "page_id": str(section.get("page_id") or ""),
+                    "element_id": str(block.get("element_id") or ""),
+                    "table_id": table_id, "row_id": row_id,
+                }
+                ref = {key: value for key, value in ref.items() if value not in (None, "")}
+                lookup[(table_id, row_id)] = {
+                    **ref,
                 }
     return lookup
 
@@ -2139,6 +2184,24 @@ def _structured_value_is_empty(value: object) -> bool:
     # placeholder into a real Atlas requirement.
     return (text in {"", "-", "—", "–", "n/a", "na"}
             or bool(text and re.fullmatch(r"[-‐‑‒–—―]+", text)))
+
+
+def _structured_typed_value(value: object) -> object:
+    """Convert only unambiguous scalar numbers; keep editorial text intact."""
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    text = str(value).strip()
+    if re.fullmatch(r"[+-]?\d+", text):
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            pass
+    if re.fullmatch(r"[+-]?(?:\d+\.\d+|\d+\.\d*|\.\d+)", text):
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            pass
+    return value
 
 
 _ATLAS_CONTEXT_MARKERS = frozenset({
@@ -2263,6 +2326,22 @@ def _structured_requirement_context_label(table: dict) -> str:
     return ""
 
 
+def _structured_is_item_marker(field: str, value: object) -> bool:
+    """Return true for a column marker such as ``Evolution Item``.
+
+    GameFAQs uses this phrase to classify a special route, not to name an
+    inventory item.  Treating it as a requirement would create a compare
+    condition (or a fake catalog entry) and can hide the real item row that
+    follows in a dedicated requirements table.
+    """
+    field_id = _atlas_identity(field)
+    value_id = _atlas_identity(value)
+    return value_id in {"evolution item", "evolution items", "item evolution"} and field_id not in {
+        "item", "items", "evolution item", "evolution items",
+        "required item", "required items", "ingredient", "ingredients",
+    }
+
+
 def _structured_requirement_mode(field: str, value: str) -> str:
     haystack = _atlas_identity(f"{field} {value}")
     raw = str(value or "").strip().casefold()
@@ -2270,7 +2349,9 @@ def _structured_requirement_mode(field: str, value: str) -> str:
         return "jogress"
     if "reincarnation" in haystack or "reincarnate" in haystack:
         return "reincarnation"
-    if "evolution item" in haystack or _atlas_identity(field) in {
+    if _structured_is_item_marker(field, value):
+        return ""
+    if "evolution item" in _atlas_identity(field) or _atlas_identity(field) in {
         "item", "items", "evolution item", "evolution items",
     } or re.search(r"\buse\b.+\bon\b", raw, re.I):
         return "item"
@@ -2283,31 +2364,65 @@ def _structured_requirement(header: str, value: str, ref: dict) -> dict:
     operator = "="
     if field.casefold() in {"quota", "cota", "decode quota", "quota decode"}:
         requirement = {"id": "", "text": f"{field}: {value} (semântica da cota não determinada)",
-                       "field": field, "operator": "unknown", "value": raw,
+                       "field": field, "operator": "unknown", "value": _structured_typed_value(raw),
                        "original": str(value), "group": "all", "source_refs": [ref]}
         mode = _structured_requirement_mode(field, str(value))
         if mode:
             requirement["mode"] = mode
         return requirement
     group = "any" if re.search(r"\bor\b|/", raw, re.I) else "all"
-    match = re.match(r"^(.*?)(?:\s+)(at\s+least|at\s+most|or\s+more|or\s+less|minimum|maximum|>=|<=|>|<)\s*(.+)$", raw, re.I)
+    match = re.match(r"^(?:(.*?)\s+)?(at\s+least|at\s+most|or\s+more|or\s+less|minimum|maximum|>=|<=|>|<)\s*(.+)$", raw, re.I)
     if match:
         token = match.group(2).casefold()
         token = (token.replace("at least", ">=").replace("or more", ">=")
                       .replace("minimum", ">=").replace("at most", "<=")
                       .replace("or less", "<=").replace("maximum", "<="))
         operator, raw = token, match.group(3).strip()
-    if operator == "=" and re.search(r"\b(\d+)\s+or\s+(?:more|less)\b", str(value), re.I):
+    if operator == "=" and re.search(r"\b(\d+)\s*\+\s*$", str(value), re.I):
+        number = re.search(r"\b(\d+)\b", str(value)).group(1)
+        operator, raw = ">=", number
+    elif operator == "=" and re.search(r"\b(\d+)\s*-\s*$", str(value), re.I):
+        number = re.search(r"\b(\d+)\b", str(value)).group(1)
+        operator, raw = "<=", number
+    elif operator == "=" and re.search(r"\b(\d+)\s+or\s+(?:more|less)\b", str(value), re.I):
         number = re.search(r"\b(\d+)\b", str(value)).group(1)
         operator = ">=" if re.search(r"or\s+more", str(value), re.I) else "<="
         raw = number
+    typed_value = _structured_typed_value(raw)
     requirement = {"id": "", "text": f"{field}: {value}", "field": field,
-                   "operator": operator, "value": raw, "original": str(value),
+                   "operator": operator, "value": typed_value, "original": str(value),
                    "group": group,
                    "source_refs": [ref]}
+    if operator in atlas_model.COMPARISON_OPERATORS and not _structured_value_is_empty(raw):
+        requirement["condition"] = {
+            "id": "", "op": "compare", "field": field, "operator": operator,
+            "value": typed_value, "original": str(value), "source_refs": [ref],
+        }
     mode = _structured_requirement_mode(field, str(value))
     if mode:
         requirement["mode"] = mode
+        if mode == "item":
+            parsed_item = atlas_model.parse_item_condition(str(value), source_refs=[ref])
+            if not parsed_item and _atlas_identity(field) in {
+                    "item", "items", "evolution item", "evolution items"}:
+                # Dedicated item columns are already explicit even when the
+                # cell contains only the item name (no "Use ..." verb). Feed
+                # it through the same quantity parser so ``3x Stone`` keeps
+                # its multiplier instead of cataloging ``3x Stone`` verbatim.
+                parsed_item = atlas_model.parse_item_condition(
+                    f"Item: {value}", source_refs=[ref])
+                if parsed_item:
+                    parsed_item["original"] = str(value)
+            if parsed_item:
+                requirement["condition"] = parsed_item
+                # Keep source-specific item rules on the matching route only.
+                # “ANY/all” means the rule is scoped to the destination.
+                target_text = re.search(r"\bon\s+(.+)$", str(value), re.I)
+                if target_text:
+                    labels = [part.strip(" .,:;()[]") for part in re.split(r"\s+(?:or|/|and)\s+", target_text.group(1), flags=re.I)]
+                    labels = [label for label in labels if _atlas_identity(label) not in {"any", "all", "any mega", "all mega"}]
+                    if labels:
+                        requirement["applies_to"] = labels[:12]
     return requirement
 
 
@@ -2355,10 +2470,34 @@ def _structured_requirement_row(table: dict, cells: list[str], headers: list[str
         return _structured_requirement(header, value, ref)
 
     # Multi-column item/location rows remain a single condition. A location is
-    # useful context for the item but never an independent Atlas entity.
+    # useful context for the item but never an independent Atlas entity. Feed
+    # only the item cell to the item parser; passing the rendered pair string
+    # ("Item: X · Location: Y") would incorrectly catalog the location as part
+    # of the item name.
+    item_headers = {
+        "item", "items", "evolution item", "evolution items",
+        "required item", "required items", "ingredient", "ingredients",
+    }
+    item_pair = next((pair for pair in pairs
+                      if _atlas_identity(pair[0]) in item_headers
+                      or "evolution item" in _atlas_identity(pair[0])), None)
+    location_pair = next((pair for pair in pairs
+                          if _atlas_identity(pair[0]) in {
+                              "location", "locations", "where", "where to find",
+                              "shop", "store", "source", "obtained", "obtain location",
+                          } or "location" in _atlas_identity(pair[0])), None)
     text = " · ".join(f"{header}: {value}" for header, value in pairs)
-    field = pairs[0][0] or "Requisito"
-    requirement = _structured_requirement(field, text, ref)
+    field = (item_pair[0] if item_pair else pairs[0][0]) or "Requisito"
+    requirement = _structured_requirement(
+        field, item_pair[1] if item_pair else text, ref)
+    if item_pair:
+        requirement["text"] = text
+        requirement["original"] = text
+        if location_pair:
+            requirement["location"] = location_pair[1]
+            condition = requirement.get("condition")
+            if isinstance(condition, dict):
+                condition["scope"] = location_pair[1]
     mode = _structured_requirement_mode(" ".join(header for header, _ in pairs), text)
     if mode:
         requirement["mode"] = mode
@@ -2459,7 +2598,10 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
         node = {"id": f"node-{len(fragment['nodes']) + 1}", "label": label,
                 "card_number": len(fragment["nodes"]) + 1,
                 "subtitle": "", "stage": "", "group": "", "tags": [],
-                "attributes": [], "media_query": f"{game.get('title', '')} {label}".strip(),
+                # Entity image lookup is intentionally label-only. Contextual
+                # game/platform suffixes are reserved for cover/background
+                # searches and make Atlas results noisy.
+                "attributes": [], "media_query": re.sub(r"\s+", " ", label).strip(),
                 "spoiler": False, "source_refs": [ref]}
         fragment["nodes"].append(node)
         node_by_key[key] = node
@@ -2472,8 +2614,8 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
                 add_issue(table, "invalid_row", "A linha estruturada não tem formato válido.",
                           "Reimporte a fonte para reconstruir esta linha.", row_number=row_index + 1)
                 continue
-            if row_index == 0 and any(cell.get("tag") == "th"
-                                      for cell in row.get("cells") or []):
+            cells = row.get("cells") or []
+            if cells and (row_index == 0 or all(cell.get("tag") == "th" for cell in cells)):
                 continue
             yield row_index, row, _structured_row_values(table, row)
 
@@ -2643,12 +2785,21 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
                 if column < 0 or column >= len(cells) or _structured_value_is_empty(cells[column]):
                     continue
                 header = headers[column] if column < len(headers) else f"Coluna {column + 1}"
+                if _structured_is_item_marker(header, cells[column]):
+                    continue
                 add_requirement_once(requirements,
                                      _structured_requirement(header, cells[column], ref))
             # Requisitos de item/Jogress/Reencarnação vivem na tabela da entidade
             # destino, mas devem aparecer em cada rota que chega a esse destino.
             target_requirements = requirements_by_entity.get(_atlas_identity(target_label), [])
             for entry in target_requirements:
+                applies_to = entry["requirement"].get("applies_to") or []
+                if applies_to and not any(_atlas_identity(label) == _atlas_identity(source_label)
+                                          for label in applies_to):
+                    # A destination can have several incoming paths. An item
+                    # mentioning a specific participant belongs only to that
+                    # participant; do not copy it to every route.
+                    continue
                 add_requirement_once(requirements, entry["requirement"])
                 entry["attached"] = True
             for requirement in requirements:
@@ -2662,8 +2813,7 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
                                       node_by_key.get(_atlas_identity(target_label), {}).get("card_number", 0)],
                         field=requirement.get("field"), value=requirement.get("original"),
                     )
-            signature = tuple(sorted((_atlas_identity(item.get("text")),
-                                      str(item.get("mode") or ""))
+            signature = tuple(sorted(_atlas_requirement_identity(item)
                                      for item in requirements))
             edge_key = (from_id, to_id, kind, signature)
             label = str(mapping.get("note") or "").strip()[:300]
@@ -2871,7 +3021,10 @@ def _generate_system_from_structured_source(source: dict, system_title: str, gam
         "unmapped_table_ids": quality.get("unmapped_table_ids") or [],
         "pending_items": quality.get("pending_items") or [],
         "warning_items": quality.get("warning_items") or [],
-        "protocol_version": "gamefaqs-json-v1", "provider": provider, "model": cfg["model"],
+        "protocol_version": (source.get("source_format")
+                             or (source.get("structured") or {}).get("format")
+                             or "gamefaqs-json-v1"),
+        "provider": provider, "model": cfg["model"],
         "resumed_batches": sum(1 for value in saved_groups.values() if isinstance(value, dict)),
     }
     return system
@@ -2901,9 +3054,10 @@ def generate_system_from_source(source: dict, system_title: str, game: dict,
     tendem a devolver apenas um caminho representativo. Cada lote conserva os
     índices absolutos da fonte; nós repetidos são reunidos sem perder relações.
     """
-    if (source.get("source_format") == "gamefaqs-json-v1"
+    if (source.get("source_format") in {"gamefaqs-json-v1", "digitracker-source-v1"}
             or (isinstance(source.get("structured"), dict)
-                and source.get("structured", {}).get("format") == "gamefaqs-json-v1")):
+                and source.get("structured", {}).get("format") in {
+                    "gamefaqs-json-v1", "digitracker-source-v1"})):
         return _generate_system_from_structured_source(
             source, system_title, game, config, progress, checkpoint,
             checkpoint_callback)
