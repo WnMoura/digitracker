@@ -47,6 +47,24 @@ def test_store_preserva_fontes_e_limita_revisoes(tmp_path):
     assert len(store.revisions("jogo")) == smart_guide.MAX_REVISIONS
 
 
+def test_gravacao_atomica_reintenta_bloqueio_transitorio_do_windows(tmp_path, monkeypatch):
+    destino = tmp_path / "system_sources" / "fonte.json"
+    real_replace = smart_guide.os.replace
+    chamadas = []
+
+    def bloqueia_duas_vezes(origem, alvo):
+        chamadas.append((origem, alvo))
+        if len(chamadas) < 3:
+            raise PermissionError(5, "Acesso negado")
+        return real_replace(origem, alvo)
+
+    monkeypatch.setattr(smart_guide.os, "replace", bloqueia_duas_vezes)
+    monkeypatch.setattr(smart_guide.time, "sleep", lambda *_: None)
+    smart_guide._atomic_json(destino, {"salvo": True})
+    assert len(chamadas) == 3
+    assert json.loads(destino.read_text(encoding="utf-8")) == {"salvo": True}
+
+
 def test_progresso_next_objective_e_restauracao(tmp_path):
     store = smart_guide.SmartGuideStore(tmp_path)
     source = store.ensure_source("jogo", "Jogo", SECTIONS)

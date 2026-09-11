@@ -652,6 +652,12 @@ class TestConfigDeIA:
         assert result["kind"] == "source_import"
         assert result["code"] == "gamefaqs_import"
 
+    def test_bloqueio_de_arquivo_do_windows_vira_diagnostico_de_armazenamento(self):
+        result = engine.Api._atlas_error_info(PermissionError(5, "Acesso negado"))
+        assert result["kind"] == "storage"
+        assert result["code"] == "storage_permission"
+        assert "retomar" in result["hint"]
+
     def test_refino_sem_chave_avisa_o_provedor_certo(self, api):
         api.set_ai_config("gemini", "")
         api.pending_import = {"achievements_meta": {"1": {"title": "X"}}}

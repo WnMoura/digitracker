@@ -1625,9 +1625,11 @@ function atlasJobsHTML(game) {
     if (!kind && /(503|UNAVAILABLE|high demand)/i.test(raw)) kind = "api_service";
     if (!kind && /(429|rate.?limit|limite de uso)/i.test(raw)) kind = "api_limit";
     if (!kind && /(tabela inteira|linhas referenciadas|Atlas inválido)/i.test(raw)) kind = "ai_response";
-    const titles = { api_service: "O serviço de IA está instável", api_limit: "A chave atingiu um limite temporário", api_configuration: "A configuração da IA precisa de atenção", network: "Falha de conexão com a IA", ai_response: "A fonte carregou, mas a resposta da IA falhou", source_import: "Não foi possível ler a fonte", source_validation: "A fonte não pôde ser validada", internal: "Falha interna do Atlas" };
+    if ((!kind || kind === "internal") && /(PermissionError|WinError\s*(5|32)|Acesso negado|Access is denied)/i.test(raw)) kind = "storage";
+    const titles = { api_service: "O serviço de IA está instável", api_limit: "A chave atingiu um limite temporário", api_configuration: "A configuração da IA precisa de atenção", network: "Falha de conexão com a IA", ai_response: "A fonte carregou, mas a resposta da IA falhou", source_import: "Não foi possível ler a fonte", source_validation: "A fonte não pôde ser validada", storage: "O Windows bloqueou o armazenamento local", internal: "Falha interna do Atlas" };
     let message = raw;
     if (kind === "api_service" && /\{.*(?:503|UNAVAILABLE)/s.test(raw)) message = "O provedor está temporariamente indisponível ou com alta demanda. O DigiTracker tentou novamente.";
+    if (kind === "storage") message = "O Windows bloqueou a atualização de um arquivo do Atlas. Os lotes já salvos podem ser retomados.";
     const hint = job.error_details?.hint || (Number(job.checkpoint_count || 0) ? `${job.checkpoint_count} lote(s) já foram salvos e serão reaproveitados.` : "Você pode tentar novamente sem alterar o Atlas publicado.");
     return { kind: kind || "internal", title: titles[kind] || "A análise não terminou", message, hint };
   };
@@ -2055,7 +2057,7 @@ function updateAtlasImportProgress(step, message, result = null) {
   if (result && result.ok === false) {
     modal.querySelector(".atlas-processing")?.classList.add("failed");
     const error = $("#atlas-processing-error"), kind = result.error_kind || "source_import";
-    const titles = { source_import: "Não consegui ler a fonte", source_validation: "A fonte não pôde ser validada", network: "Falha de conexão", api_limit: "Limite da API", api_service: "Serviço de IA indisponível", api_configuration: "Configuração da IA", ai_response: "Resposta da IA inválida", internal: "Falha interna" };
+    const titles = { source_import: "Não consegui ler a fonte", source_validation: "A fonte não pôde ser validada", network: "Falha de conexão", api_limit: "Limite da API", api_service: "Serviço de IA indisponível", api_configuration: "Configuração da IA", ai_response: "Resposta da IA inválida", storage: "Armazenamento local bloqueado", internal: "Falha interna" };
     const hint = result.error_details?.hint || "Confira os dados e tente novamente.";
     error.hidden = false; error.innerHTML = `<b>${esc(titles[kind] || "Falha no processamento")}</b><p>${esc(result.error || "Não foi possível continuar.")}</p><small>${esc(hint)}</small>${result.error_code ? `<code>${esc(result.error_code)}</code>` : ""}`;
     const close = $("#atlas-processing-close"); close.hidden = false; close.onclick = () => modal.remove();

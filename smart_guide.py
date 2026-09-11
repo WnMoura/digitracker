@@ -29,6 +29,7 @@ MAX_WALKTHROUGH_SOURCES = 10
 # grupos/filtros, sem descartar silenciosamente criaturas ou caminhos.
 MAX_SYSTEM_NODES = 240
 MAX_SYSTEM_EDGES = 720
+ATOMIC_REPLACE_ATTEMPTS = 7
 BLOCK_TYPES = {
     "text", "objective", "checklist", "warning", "missable", "achievement",
     "challenge", "table", "comparison", "image", "route", "graph", "note",
@@ -62,12 +63,45 @@ def _json_hash(value: object) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _replace_atomic(temp: Path, path: Path) -> None:
+    """Substitui um arquivo com tolerância a bloqueios transitórios do Windows.
+
+    O Defender/indexador pode manter o destino aberto por alguns instantes
+    depois de uma leitura. ``os.replace`` é a operação correta para preservar
+    a gravação atômica, mas no Windows ela retorna WinError 5/32 nesse caso.
+    Retentar no mesmo diretório evita perder lotes já processados; o último
+    erro continua sendo propagado para que a interface mostre diagnóstico.
+    """
+    last_error = None
+    for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+        try:
+            os.replace(temp, path)
+            return
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            transient = isinstance(exc, PermissionError) or winerror in {5, 32}
+            if not transient or attempt >= ATOMIC_REPLACE_ATTEMPTS - 1:
+                raise
+            last_error = exc
+            # Arquivos trazidos de ZIP/backup podem carregar o atributo
+            # somente-leitura. Isso não resolve compartilhamento aberto, mas
+            # permite que a próxima tentativa funcione sem intervenção.
+            try:
+                if path.exists():
+                    path.chmod(0o666)
+            except OSError:
+                pass
+            time.sleep(0.08 * (attempt + 1))
+    if last_error:  # pragma: no cover - o laço sempre retorna ou lança
+        raise last_error
+
+
 def _atomic_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temp, path)
+        _replace_atomic(temp, path)
     finally:
         try:
             temp.unlink(missing_ok=True)
@@ -80,7 +114,7 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
     temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         temp.write_bytes(value)
-        os.replace(temp, path)
+        _replace_atomic(temp, path)
     finally:
         try:
             temp.unlink(missing_ok=True)

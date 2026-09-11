@@ -2221,6 +2221,21 @@ class Api(ExperienceApi, DataToolsApi):
     @staticmethod
     def _atlas_error_info(exc: Exception) -> dict:
         """Classifica a falha sem obrigar a interface a interpretar frases."""
+        winerror = getattr(exc, "winerror", None)
+        if isinstance(exc, PermissionError) or winerror in {5, 32}:
+            hint = (
+                "O Windows bloqueou a gravação local. Feche outra instância do DigiTracker, "
+                "confira o antivírus/Windows Defender e tente retomar; os lotes salvos foram preservados."
+            )
+            return {
+                "message": "O Windows não permitiu atualizar os arquivos locais do Atlas.",
+                "kind": "storage",
+                "code": "storage_permission",
+                "hint": hint,
+                "details": {"exception": type(exc).__name__,
+                             "winerror": winerror,
+                             "message": str(exc)[:1000], "hint": hint},
+            }
         if isinstance(exc, guide_ai.GuideAIError):
             details = exc.as_dict()
             code = details.get("code") or "guide_ai_error"
