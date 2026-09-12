@@ -2616,3 +2616,72 @@ button, input, select, summary { outline: none; }
 .atlas-toolbar-actions > button.danger { min-height: 40px; padding: 0 13px; border: 1px solid rgba(255,111,102,.4); border-radius: 10px; color: #ffaaa5; background: rgba(116,30,32,.24); font-size: 10px; font-weight: 800; }
 .atlas-toolbar-actions > button.danger:hover, .atlas-toolbar-actions > button.danger:focus-visible { border-color: #ff8c82; background: rgba(144,34,35,.45); }
 @media (max-width: 600px) { .atlas-toolbar-actions { width: 100%; justify-content: flex-start; } .atlas-toolbar-actions > button { flex: 1 1 150px; } }
+
+/* Atlas visual fidelity --------------------------------------------------
+   The graph keeps the measured 214px card geometry used by the SVG router;
+   this layer only improves the visual hierarchy and the bounded surfaces so
+   labels, artwork and connectors remain readable at the proposed desktop
+   sizes without changing compact mode. */
+.atlas-shell {
+  margin: 0 24px 30px;
+  border-color: rgba(83, 179, 244, .34);
+  border-radius: 22px;
+  background: linear-gradient(150deg, rgba(7, 28, 53, .99), rgba(2, 13, 28, .99));
+  box-shadow: 0 28px 80px rgba(0, 0, 0, .3), inset 0 1px rgba(133, 218, 255, .05);
+}
+.atlas-toolbar {
+  min-height: 96px;
+  padding: 22px 26px;
+  align-items: center;
+  border-bottom-color: rgba(101, 177, 226, .2);
+  background: linear-gradient(125deg, rgba(11, 45, 75, .62), rgba(4, 20, 39, .38));
+}
+.atlas-toolbar > div:first-child { min-width: 0; }
+.atlas-toolbar > div:first-child > span { color: #59c5ff; font-size: 9px; font-weight: 900; letter-spacing: .18em; }
+.atlas-toolbar h2 { margin-top: 5px; color: #fff; font-size: 26px; letter-spacing: -.03em; }
+.atlas-toolbar p { margin-top: 6px; color: #a4bed3; font-size: 11px; }
+.atlas-toolbar-actions { gap: 8px; }
+.atlas-toolbar-actions > button { min-height: 42px; padding-inline: 14px; border-radius: 11px; border-color: rgba(96, 181, 236, .34); color: #c9e7f8; background: rgba(10, 44, 72, .7); font-size: 10px; }
+.atlas-toolbar-actions > button:hover, .atlas-toolbar-actions > button:focus-visible { border-color: #63cbff; color: #fff; background: rgba(22, 101, 156, .74); }
+.atlas-layout { grid-template-columns: minmax(0, 1fr) 328px; min-height: 620px; }
+.atlas-viewport { min-height: 620px; background-color: #031224; background-size: 24px 24px, 128px 100%; }
+.atlas-world { min-width: 760px; min-height: 520px; }
+.atlas-world svg { overflow: hidden; }
+.atlas-node { width: 214px; height: 214px; min-height: 214px; padding: 11px; grid-template-rows: 122px minmax(0, 1fr); gap: 10px; border-radius: 16px; border-color: rgba(91, 164, 219, .43); background: linear-gradient(155deg, rgba(15, 47, 78, .98), rgba(5, 21, 40, .99)); box-shadow: 0 16px 34px rgba(0, 0, 0, .38); }
+.atlas-node:hover, .atlas-node:focus-visible, .atlas-node.selected { box-shadow: 0 0 0 2px rgba(63, 190, 255, .2), 0 20px 42px rgba(0, 0, 0, .48), 0 0 32px rgba(53, 176, 255, .2); }
+.atlas-node-art { width: 100%; height: 122px; border-radius: 12px; background: radial-gradient(circle at 50% 35%, rgba(53, 149, 225, .2), transparent 68%), rgba(3, 14, 28, .88); }
+.atlas-node-art img { object-fit: contain; padding: 6px; }
+.atlas-node-copy { display: flex; flex-direction: column; justify-content: center; }
+.atlas-node-copy small { color: #5ccaff; font-size: 8px; }
+.atlas-node-copy b { margin-top: 4px; font-size: 14px; line-height: 1.15; overflow-wrap: anywhere; }
+.atlas-node-copy em { margin-top: 5px; color: #91abc1; font-size: 9px; line-height: 1.3; }
+.atlas-node-relations { margin-top: auto; padding-top: 5px; color: #62a2c9; font-size: 8px; }
+.atlas-inspector { padding: 22px; border-left-color: rgba(92, 170, 226, .24); background: linear-gradient(180deg, rgba(8, 31, 55, .99), rgba(3, 15, 30, .99)); }
+.atlas-inspector-art { height: 200px; margin-bottom: 17px; border-radius: 16px; background: radial-gradient(circle at 50% 32%, rgba(53, 149, 225, .22), transparent 65%), #061426; }
+.atlas-inspector-card-id { margin-bottom: 7px; color: #62c7ff; font-size: 9px; }
+.atlas-inspector > small { font-size: 9px; }
+.atlas-inspector h3 { margin-top: 7px; font-size: 26px; overflow-wrap: anywhere; }
+.atlas-inspector > p { margin-top: 7px; font-size: 12px; }
+.atlas-requirements { margin-top: 18px; padding: 14px; border-radius: 14px; background: rgba(2, 14, 29, .7); }
+.atlas-requirements label { padding: 8px 0; font-size: 10px; }
+.atlas-source { margin-top: 10px; padding: 10px; border: 1px solid rgba(91, 163, 214, .2); border-radius: 10px; color: #8db5d0; background: rgba(11, 40, 65, .35); }
+.atlas-inspector-actions { margin-top: 15px; gap: 8px; }
+.atlas-inspector-actions button { min-height: 40px; border-radius: 10px; }
+@media (max-width: 1180px) {
+  .atlas-layout { grid-template-columns: minmax(0, 1fr) 292px; }
+  .atlas-inspector { padding: 17px; }
+  .atlas-inspector-art { height: 180px; }
+}
+@media (max-width: 900px) {
+  .atlas-shell { margin-inline: 14px; }
+  .atlas-toolbar { min-height: 0; padding: 18px; }
+  .atlas-layout { display: block; min-height: 0; }
+  .atlas-viewport { min-height: 480px; }
+  .atlas-inspector { border-top-color: rgba(92, 170, 226, .24); }
+}
+@media (max-width: 600px) {
+  .atlas-shell { margin-inline: 8px; border-radius: 17px; }
+  .atlas-toolbar { padding: 16px; }
+  .atlas-toolbar h2 { font-size: 22px; }
+  .atlas-viewport { min-height: 0; }
+}

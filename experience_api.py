@@ -171,6 +171,15 @@ class ExperienceApi:
         slug = slug or self._active_slug
         with self._lock:
             game = copy.deepcopy(self.state.get(slug) or {})
+            # The mobile companion may render a lightweight library drawer,
+            # but it must receive only the same public game fields as the
+            # active snapshot.  Keep private guide state, credentials and
+            # source documents on the PC.
+            games_public = [
+                {key: copy.deepcopy(item.get(key)) for key in
+                 ("slug", "title", "platform", "art", "mastery", "completion")}
+                for item in self.state.values()
+            ]
         if not game:
             return {"ok": False, "error": "Abra um jogo no DigiTracker do PC."}
         bundle = self.get_smart_guide(slug)
@@ -215,7 +224,8 @@ class ExperienceApi:
         return {"ok": True, "api_version": 2, "version": version,
                 "definition_revision": definition_revision, "content_revision": content_revision,
                 "progress_revision": progress_revision,
-                "game": {key: game.get(key) for key in ("slug", "title", "platform", "art", "mastery")},
+                "game": {key: game.get(key) for key in ("slug", "title", "platform", "art", "mastery", "completion")},
+                "games": games_public,
                 "chapters": document.get("chapters") or [], "systems": systems,
                 "media": [{"id": item.get("id"), "url": item.get("url"), "title": item.get("title")} for item in bundle.get("media") or [] if item.get("status") != "rejected"],
                 "progress": progress_public,

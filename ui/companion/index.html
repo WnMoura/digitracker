@@ -1,3 +1,52 @@
 <!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#071323"><title>DigiTracker · Celular</title><link rel="stylesheet" href="/style.css"></head>
-<body><header><strong>Digi<span>Tracker</span></strong><small id="connection" role="status">Conectando…</small></header><main id="content"><section class="card"><h1>Seu guia, ao lado do jogo.</h1><p>Abra Celular no DigiTracker do PC e leia o QR Code.</p></section></main><nav id="tabs" aria-label="Navegação" hidden><button data-tab="now">Agora</button><button data-tab="guide">Guia</button><button data-tab="atlas">Atlas</button><button data-tab="items">Itens</button><button data-tab="achievements">Conquistas</button></nav><div id="message" role="status" data-testid="save-status"></div><script src="/app.js"></script></body></html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#041326">
+  <meta name="color-scheme" content="dark">
+  <title>DigiTracker · Celular</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="mobile-app" id="mobile-app">
+    <header class="mobile-topbar">
+      <button class="mobile-icon-button" id="mobile-menu" type="button" aria-label="Abrir biblioteca" aria-controls="mobile-sheet">☰</button>
+      <div class="mobile-brand" aria-label="DigiTracker">
+        <span class="brand-mark" aria-hidden="true">◇</span>
+        <strong>Digi<span>Tracker</span></strong>
+      </div>
+      <div class="mobile-top-actions">
+        <button class="mobile-icon-button" id="mobile-search-toggle" type="button" aria-label="Buscar" aria-controls="mobile-search">⌕</button>
+        <small id="connection" role="status">Conectando…</small>
+      </div>
+    </header>
+
+    <div class="mobile-search" id="mobile-search" hidden>
+      <label for="mobile-search-input">Buscar no jogo</label>
+      <div class="mobile-search-row">
+        <input id="mobile-search-input" type="search" maxlength="120" placeholder="Buscar guia, item ou sistema…" autocomplete="off">
+        <button class="mobile-icon-button" id="mobile-search-close" type="button" aria-label="Fechar busca">×</button>
+      </div>
+    </div>
+
+    <main id="content">
+      <section class="card connection-card">
+        <span class="eyebrow">DIGITRACKER · CELULAR</span>
+        <h1>Seu jogo, sempre com você.</h1>
+        <p>Abra Celular no DigiTracker do PC e leia o QR Code para começar.</p>
+      </section>
+    </main>
+
+    <nav id="tabs" aria-label="Navegação" hidden>
+      <button data-tab="now" type="button"><span class="nav-icon" aria-hidden="true">⌂</span><span>Início</span></button>
+      <button data-tab="guide" type="button"><span class="nav-icon" aria-hidden="true">▤</span><span>Guia</span></button>
+      <button data-tab="atlas" type="button"><span class="nav-icon" aria-hidden="true">◇</span><span>Atlas</span></button>
+      <button data-tab="items" type="button"><span class="nav-icon" aria-hidden="true">▣</span><span>Itens</span></button>
+      <button data-tab="achievements" type="button"><span class="nav-icon" aria-hidden="true">♜</span><span>Conquistas</span></button>
+    </nav>
+    <div id="message" role="status" data-testid="save-status"></div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
