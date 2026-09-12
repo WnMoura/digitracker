@@ -2,14 +2,18 @@
 
 ## Estado atual — Atlas, rodada 12/09/2026
 
-Base local: `main`, com a implementação do Atlas na linha `v0.11.7`. A tag
+Base local: `main`, com a implementação do Atlas na linha `v0.11.8`. A tag
 `v0.11.7` existente é apenas local e aponta para o commit anterior desta
-rodada; não houve push nem release no GitHub. A próxima tag só deve ser criada
-depois das validações externas pendentes.
+rodada; não houve push nem release no GitHub. A tag `v0.11.8` será criada
+somente no commit que contém as validações concluídas abaixo; o push permanece
+separado.
 
 - `atlas_entities.py` separa listas explícitas de origens/destinos e remove
   marcadores de nota do nome. Nomes editoriais exatos vencem a pontuação;
-  combinações ambíguas/fusões não viram rotas independentes inventadas.
+  combinações ambíguas/fusões não viram rotas independentes inventadas. Um
+  único link explícito pode ignorar uma continuação editorial em minúsculas
+  (por exemplo, `Chuumon and your bad decisions`), mas qualquer segundo nome
+  não vinculado mantém a linha pendente para revisão.
 - `guide_ai.py` usa contrato de extração v5: tabelas diretas antes das inversas,
   `Previous Forms` como origem e a primeira coluna como destino nos mapas
   declarados pela IA. Tabelas inversas corroboram relações detalhadas. Duplicatas
@@ -37,36 +41,46 @@ depois das validações externas pendentes.
   e componentes fortemente conectados para ciclos. Autozoom mínimo 85%; em
   largura estreita usa lista. Prévia não deixa seu aviso ocupar o mapa inteiro.
 
-Validação local: **622 testes pytest**, `compileall`, `node --check ui/app.js`,
+Validação local: **624 testes pytest**, `compileall`, `node --check ui/app.js`,
 `git diff --check` e `tests/atlas_ui_smoke.cjs` passaram. O smoke usa Edge com dados sintéticos e
 valida 1600×900, 1280×720, largura 820, prévia, modal de contexto, busca, marcação,
 150 nós e ciclo. Build PyInstaller concluído em
-`dist-check/atlas-v0.11.7/DigiTracker.exe`; os novos módulos e CSS estão incluídos.
+`dist-check/atlas-v0.11.8-corrective/DigiTracker.exe`; os novos módulos e CSS estão incluídos.
 A abertura nativa pelo `computer-use` não foi validada: a autorização para
 abrir a janela expirou. Não confundir o smoke do Edge com validação do WebView2.
 
-Auditoria local (não versionada): a captura salva do FAQ 64658 foi materializada
-com **mapeamentos de colunas explícitos de teste, sem chamar IA**: 144 cartões
-anteriores → 91 entidades, 198 caminhos, nenhum nome agrupado por vírgula;
-593 linhas selecionadas contabilizadas, das quais 328 excluídas por papel
-documentado. O rascunho legado de 144 entidades foi revisado e contém 20 cards
-compostos; portanto ele não é reutilizado como resultado válido, embora 144/144
-IDs, 68 associações de imagem e o objetivo existente sejam preserváveis. A
-captura de seis páginas (FAQ 71975) contém 248 tabelas e 323 linhas de evolução;
-as tabelas especiais sem endpoints ficam pendentes para classificação explícita.
-Isso não comprova o fluxo ponta a ponta com Gemini. O guia publicado em Downloads
-não foi modificado. Capturas da cópia local estão em
-`docs/screenshots/atlas-context/atlas-real-1600.png`, `atlas-real-1280.png` e
-`imagens-contexto.png`. As imagens nessas capturas são as antigas já salvas,
-não evidência de conclusão de um novo preenchimento.
+Auditoria de reimportação (não versionada): a captura salva do FAQ 64658 foi
+materializada com **mapeamentos de colunas explícitos de teste, sem chamar IA**:
+144 cartões anteriores → 91 entidades, 198 caminhos, nenhum nome agrupado por
+vírgula; 593/593 linhas selecionadas cobertas, com 328 exclusões justificadas
+por papel documentado. O rascunho legado de 144 entidades foi bloqueado por
+20 cards compostos; ele não substitui o publicado. A prévia limpa preserva
+91/91 IDs, 59 das 68 associações de imagem aplicáveis, o objetivo existente,
+cartões sequenciais e zero arestas duplicadas. Os hashes da fonte e de
+`current.json` permaneceram inalterados durante a revisão.
 
-Limite desta validação: a execução controlada de novas chamadas ao Gemini e de
-downloads externos requer autorização explícita para enviar a captura e baixar
-três imagens representativas. Não contornar com outra rota de rede. A fila
-persistente foi testada com respostas simuladas; ainda validar download/
-associação reais e o contrato com a chave/modelo do usuário antes de afirmar
-cobertura real de todas as imagens. Uma wiki/jogo sem resultado
-compatível continua pendente; não relaxar silenciosamente o contexto escolhido.
+Validação externa controlada concluída com a chave/modelo configurados pelo
+usuário: Gemini `gemini-3.5-flash-lite` processou as seis páginas do FAQ 71975
+em 85 lotes (248 tabelas capturadas, incluindo 323 linhas de evolução), gerando
+147 nós e 332 arestas. Após a revisão da fonte, 246 tabelas
+e 459/459 linhas foram cobertas; duas tabelas vazias de Sukamon foram excluídas
+explicitamente e a linha `Chuumon and your bad decisions` foi corroborada pelo
+link único `Chuumon`, sem criar card composto nem aresta duplicada. Todas as
+seis páginas foram referenciadas e não restaram pendências bloqueantes. Os
+avisos de cota continuam não bloqueantes porque a semântica da cota não é
+determinável na fonte.
+
+Também foram validados três downloads reais de imagem em biblioteca isolada
+(Agumon, Greymon e MetalGreymon): 3/3 aprovados, arquivos locais presentes e
+hashes registrados; nenhum dado publicado ou associação do usuário foi
+alterado. A execução real usou o provedor/modelo Gemini configurado e a
+revisão não grava o resultado diretamente em Downloads/config.
+
+O guia publicado em Downloads não foi modificado. Capturas da cópia local estão
+em `docs/screenshots/atlas-context/atlas-real-1600.png`,
+`atlas-real-1280.png` e `imagens-contexto.png`. As imagens nessas capturas são
+as antigas já salvas; os três downloads reais acima são evidência isolada de
+associação, não uma substituição automática do acervo publicado.
 
 Para aplicar a correção a um guia antigo: **Fontes e manutenção → Reprocessar
 fonte salva**, revisar seleção/resultado e aprovar. Para trocar imagens antigas
@@ -138,7 +152,7 @@ App desktop **pywebview** (Python + HTML/CSS/JS vanilla) que acompanha conquista
 - **Arraste do overlay no Windows:** o drag-region nativo do pywebview **não funciona no WinForms** (ele chama `window.move` na thread do bridge js_api, que não surte efeito). Por isso existe um arraste próprio: `makeDraggable` (ui/app.js) → `move_window` → `_window_op` (roda numa thread própria, igual fechar/minimizar/dockar). Se o arraste falhar no Windows, é aqui que se investiga.
 - **Fullscreen exclusivo (D3D):** nenhum overlay aparece por cima. O app detecta (`SHQueryUserNotificationState`) e, com o interruptor ligado nas Configurações, pode mandar **Alt+Enter** ou levar o overlay para o **segundo monitor**. Sem interruptor, só avisa.
 
-## O que validar no Windows (aplicável à v0.11.7)
+## O que validar no Windows (aplicável à v0.11.8)
 
 1. **Overlay grudando no emulador (o principal):** abrir Dolphin/PCSX2/ePSXe em **janela ou borderless** → o app deve entrar em compacto, **dimensionar proporcional** à janela do emulador (~26%×44%) e **grudar no canto superior-direito de dentro**; seguir se a janela mover/redimensionar; **restaurar** ao fechar. Toggle "Ajustar ao tamanho do emulador" nas Configurações (ligado por padrão).
 2. **Arraste do overlay** pela faixa de cima (o `makeDraggable`).
