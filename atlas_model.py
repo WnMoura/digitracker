@@ -129,6 +129,31 @@ def canonical_rule_identity(rule: object) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def requirement_identity(requirement: object) -> str:
+    """Stable semantics for deduplication and progress-safe reprocessing."""
+    if not isinstance(requirement, dict):
+        return _identity(requirement)
+
+    def without_provenance(value):
+        if isinstance(value, dict):
+            return {key: without_provenance(item) for key, item in value.items()
+                    if key not in {"id", "source_refs"}}
+        if isinstance(value, list):
+            return [without_provenance(item) for item in value]
+        return value
+
+    condition = requirement.get("condition")
+    condition = without_provenance(canonical_condition(condition)) if isinstance(condition, dict) else None
+    numeric = (condition or {}).get("op") == "compare" and isinstance((condition or {}).get("value"), (int, float))
+    value = {"field": _identity(requirement.get("field")), "operator": requirement.get("operator") or "=",
+             "value": requirement.get("value"), "mode": requirement.get("mode") or "",
+             "group": requirement.get("group") or "all", "condition": condition,
+             "text": "" if numeric else _identity(requirement.get("text")),
+             "scope": requirement.get("scope") or "", "location": requirement.get("location") or "",
+             "applies_to": sorted(_identity(item) for item in requirement.get("applies_to") or [])}
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _bool_value(value: object) -> bool | None:
     if isinstance(value, bool):
         return value

@@ -507,12 +507,12 @@ const backend = {
     if (S.mode === "demo") return { ok: true, results: [], query, provider: "demo" };
     return window.pywebview.api.search_guide_system_media(slug, systemId, nodeId, query || "", page, sourceId);
   },
-  async startGuideSystemImageFill(slug, systemId, sourceId = '') {
-    if (S.mode === "demo") return { ok: true, phase: "complete", total: 0, completed: 0, filled: 0, empty: 0, failed: 0 };
-    return window.pywebview.api.start_guide_system_image_fill(slug, systemId, sourceId);
+  async startGuideSystemImageFill(slug, systemId, sourceId = '', options = {}) {
+    if (S.mode === "demo") return { ok: false, error: "A prévia não realiza downloads. Use o Atlas no aplicativo para preencher as imagens." };
+    return window.pywebview.api.start_guide_system_image_fill(slug, systemId, sourceId, options);
   },
   async guideSystemImageFillStatus(slug, systemId, sourceId = '') {
-    if (S.mode === "demo") return { ok: true, phase: "complete", total: 0, completed: 0, filled: 0, empty: 0, failed: 0 };
+    if (S.mode === "demo") return { ok: true, phase: "idle" };
     return window.pywebview.api.get_guide_system_image_fill(slug, systemId, sourceId);
   },
   async undoGuideSystemImageFill(slug, systemId, sourceId = '', jobId = '') {
@@ -1403,7 +1403,7 @@ function mainHTML(game) {
   const fundo = arte.background || arte.title || arte.ingame || arte.cover || arte.box;
   const escolhido = arte.background || arte.cover;
   const heroArt = arte.background || arte.title || arte.ingame || arte.cover || arte.box;
-  return `<main class="main" data-scroll="main" style="--jogo:${cor}">
+  return `<main class="main ${S.tab === "atlas" ? "atlas-main" : ""}" data-scroll="main" style="--jogo:${cor}">
     ${fundo ? `<div class="game-bg ${escolhido ? "escolhida" : ""}" style="background-image:url('${esc(fundo)}')"></div>` : ""}
     <div class="game-glow"></div>
     <div class="panel-head">
@@ -1585,64 +1585,99 @@ function achievementsHTML(game) {
 const masteryHTML = achievementsHTML;
 const walkHTML = achievementsHTML;
 
-const ATLAS_CARD_WIDTH = 214;
-const ATLAS_CARD_HEIGHT = 214;
-const ATLAS_WORLD_PADDING = 56;
-const ATLAS_COLUMN_GAP = 86;
-const ATLAS_ROW_GAP = 52;
+const ATLAS_CARD_WIDTH = 176;
+const ATLAS_CARD_HEIGHT = 226;
+const ATLAS_WORLD_PADDING = 16;
+const ATLAS_COLUMN_GAP = 76;
+const ATLAS_ROW_GAP = 24;
+const ATLAS_FOCUS_PAGE_SIZE = 2;
 
-function guideSystemLayout(system, visibleNodes) {
-  const visible = new Set(visibleNodes.map((node) => node.id));
-  const edges = (system.edges || []).filter((edge) => visible.has(edge.from) && visible.has(edge.to));
-  const incoming = new Map(visibleNodes.map((node) => [node.id, 0]));
-  edges.forEach((edge) => incoming.set(edge.to, (incoming.get(edge.to) || 0) + 1));
-  const levels = new Map(), queue = visibleNodes.filter((node) => !incoming.get(node.id)).map((node) => node.id);
-  queue.forEach((id) => levels.set(id, 0));
-  for (let cursor = 0; cursor < queue.length; cursor += 1) {
-    const id = queue[cursor], level = levels.get(id) || 0;
-    edges.filter((edge) => edge.from === id).forEach((edge) => {
-      levels.set(edge.to, Math.max(levels.get(edge.to) || 0, level + 1));
-      incoming.set(edge.to, Math.max(0, (incoming.get(edge.to) || 0) - 1));
-      if (!incoming.get(edge.to)) queue.push(edge.to);
-    });
-  }
-  visibleNodes.forEach((node, index) => { if (!levels.has(node.id)) levels.set(node.id, index % 4); });
-  const columns = new Map();
-  visibleNodes.forEach((node) => {
-    const level = levels.get(node.id) || 0;
-    if (!columns.has(level)) columns.set(level, []);
-    columns.get(level).push(node);
-  });
-  const positions = new Map();
-  [...columns.entries()].sort((a, b) => a[0] - b[0]).forEach(([level, nodes]) => {
-    nodes.forEach((node, row) => positions.set(node.id, {
-      x: ATLAS_WORLD_PADDING + level * (ATLAS_CARD_WIDTH + ATLAS_COLUMN_GAP),
-      y: ATLAS_WORLD_PADDING + row * (ATLAS_CARD_HEIGHT + ATLAS_ROW_GAP),
+function guideSystemLayout(system, visibleNodes, focusId = "") {
+  const visible = new Set(visibleNodes.map(node => node.id));
+  const edges = (system.edges || []).filter(edge => visible.has(edge.from) && visible.has(edge.to));
+  const positions = new Map(), levels = new Map();
+  if (focusId && visible.has(focusId)) {
+    const origins = new Set(edges.filter(edge => edge.to === focusId && edge.from !== focusId).map(edge => edge.from));
+    const destinations = visibleNodes.filter(node => node.id !== focusId && !origins.has(node.id));
+    visibleNodes.filter(node => origins.has(node.id)).forEach((node, row) => positions.set(node.id, {
+      x: ATLAS_WORLD_PADDING, y: ATLAS_WORLD_PADDING + row * (ATLAS_CARD_HEIGHT + ATLAS_ROW_GAP)
     }));
-  });
-  const maxLevel = Math.max(0, ...levels.values());
-  const maxRows = Math.max(1, ...[...columns.values()].map((items) => items.length));
-  let width = Math.max(760, ATLAS_WORLD_PADDING * 2 + (maxLevel + 1) * ATLAS_CARD_WIDTH + maxLevel * ATLAS_COLUMN_GAP);
-  let height = Math.max(520, ATLAS_WORLD_PADDING * 2 + maxRows * ATLAS_CARD_HEIGHT + (maxRows - 1) * ATLAS_ROW_GAP + 70);
-  let direction = "horizontal";
-  if (system.layout === "vertical") {
-    [...positions.entries()].forEach(([id, pos]) => positions.set(id, { x: pos.y, y: pos.x }));
-    [width, height] = [Math.max(760, height), Math.max(520, width)];
-    direction = "vertical";
-  } else if (system.layout === "radial") {
-    const radius = Math.max(230, visibleNodes.length * 28), center = radius + ATLAS_WORLD_PADDING + ATLAS_CARD_WIDTH / 2;
-    visibleNodes.forEach((node, index) => {
-      const angle = (Math.PI * 2 * index / Math.max(1, visibleNodes.length)) - Math.PI / 2;
-      positions.set(node.id, {
-        x: center + Math.cos(angle) * radius - ATLAS_CARD_WIDTH / 2,
-        y: center + Math.sin(angle) * radius - ATLAS_CARD_HEIGHT / 2,
-      });
+    positions.set(focusId, {x: ATLAS_WORLD_PADDING + ATLAS_CARD_WIDTH + ATLAS_COLUMN_GAP, y: ATLAS_WORLD_PADDING});
+    destinations.forEach((node, row) => positions.set(node.id, {
+      x: ATLAS_WORLD_PADDING + 2 * (ATLAS_CARD_WIDTH + ATLAS_COLUMN_GAP),
+      y: ATLAS_WORLD_PADDING + row * (ATLAS_CARD_HEIGHT + ATLAS_ROW_GAP)
+    }));
+  } else {
+    // Collapse strongly connected components before layering the DAG. Cyclic
+    // systems retain deterministic positions instead of arbitrary columns.
+    const adjacency = new Map(visibleNodes.map(node => [node.id, []]));
+    edges.forEach(edge => adjacency.get(edge.from).push(edge.to));
+    const indices = new Map(), low = new Map(), onStack = new Set(), stack = [], components = [];
+    let nextIndex = 0;
+    const visit = id => {
+      indices.set(id, nextIndex); low.set(id, nextIndex++); stack.push(id); onStack.add(id);
+      for (const target of adjacency.get(id)) {
+        if (!indices.has(target)) { visit(target); low.set(id, Math.min(low.get(id), low.get(target))); }
+        else if (onStack.has(target)) low.set(id, Math.min(low.get(id), indices.get(target)));
+      }
+      if (low.get(id) === indices.get(id)) {
+        const component = []; let member;
+        do { member = stack.pop(); onStack.delete(member); component.push(member); } while (member !== id);
+        components.push(component);
+      }
+    };
+    visibleNodes.forEach(node => { if (!indices.has(node.id)) visit(node.id); });
+    const owner = new Map();
+    components.forEach((group, i) => group.forEach(id => owner.set(id, i)));
+    const links = components.map(() => new Set()), indegree = components.map(() => 0), depth = components.map(() => 0);
+    edges.forEach(edge => {
+      const a = owner.get(edge.from), b = owner.get(edge.to);
+      if (a !== b && !links[a].has(b)) { links[a].add(b); indegree[b]++; }
     });
-    width = height = Math.max(760, center * 2 + ATLAS_WORLD_PADDING);
-    direction = "radial";
+    const queue = indegree.map((value, i) => value ? -1 : i).filter(i => i >= 0);
+    for (let cursor = 0; cursor < queue.length; cursor++) {
+      const a = queue[cursor];
+      for (const b of links[a]) { depth[b] = Math.max(depth[b], depth[a] + 1); if (--indegree[b] === 0) queue.push(b); }
+    }
+    const rows = new Map();
+    visibleNodes.forEach(node => {
+      const level = depth[owner.get(node.id)], row = rows.get(level) || 0;
+      levels.set(node.id, level); rows.set(level, row + 1);
+      positions.set(node.id, {x: ATLAS_WORLD_PADDING + level * (ATLAS_CARD_WIDTH + ATLAS_COLUMN_GAP),
+        y: ATLAS_WORLD_PADDING + row * (ATLAS_CARD_HEIGHT + ATLAS_ROW_GAP)});
+    });
   }
-  return { edges, positions, width, height, direction,
-    cardWidth: ATLAS_CARD_WIDTH, cardHeight: ATLAS_CARD_HEIGHT };
+  const values = [...positions.values()];
+  const width = Math.max(ATLAS_CARD_WIDTH + 2 * ATLAS_WORLD_PADDING,
+    ...values.map(pos => pos.x + ATLAS_CARD_WIDTH + ATLAS_WORLD_PADDING + 12));
+  const height = Math.max(ATLAS_CARD_HEIGHT + 2 * ATLAS_WORLD_PADDING,
+    ...values.map(pos => pos.y + ATLAS_CARD_HEIGHT + ATLAS_WORLD_PADDING + 12));
+  return {edges, positions, width, height, direction: "horizontal", cardWidth: ATLAS_CARD_WIDTH, cardHeight: ATLAS_CARD_HEIGHT};
+}
+
+function atlasEdgePath(edge, layout) {
+  const from = layout.positions.get(edge.from), to = layout.positions.get(edge.to);
+  if (!from || !to) return "";
+  const x1 = from.x + layout.cardWidth, y1 = from.y + layout.cardHeight * .45;
+  const x2 = to.x, y2 = to.y + layout.cardHeight * .45;
+  if (x2 > x1 && x2 - x1 < layout.cardWidth + ATLAS_COLUMN_GAP) {
+    const middle = (x1 + x2) / 2;
+    return `M${x1},${y1} C${middle},${y1} ${middle},${y2} ${x2},${y2}`;
+  }
+  // Long, backward and cyclic connections use exterior lanes.
+  const right = x1 + 14, left = Math.max(8, x2 - 14), lane = layout.height - 10;
+  return `M${x1},${y1} L${right},${y1} L${right},${lane} L${left},${lane} L${left},${y2} L${x2},${y2}`;
+}
+
+function atlasRefsLabel(refs) {
+  return [...new Set((refs || []).map(ref => ref.page ? `p. ${ref.page}` : `§ ${ref.section}.${ref.block}`))].slice(0, 3).join(" · ");
+}
+
+function atlasEdgeStatus(edge, completed) {
+  const reqs = edge.requirements || [];
+  const unknown = reqs.some(req => req.operator === "unknown" || req.group === "unknown" || req.condition?.op === "unknown");
+  const done = reqs.filter(req => completed.has(req.id)).length;
+  return {unknown, done, total: reqs.length, available: !unknown && done === reqs.length};
 }
 
 function atlasSystems(game) {
@@ -1682,148 +1717,111 @@ function atlasJobsHTML(game) {
 }
 
 function guideSystemsHTML(game) {
-  const bundle = game.smart_guide || {}, doc = bundle.current || {};
-  const systems = atlasSystems(game).filter((item) => item.status !== "rejected");
+  const bundle = game.smart_guide || {}, systems = atlasSystems(game).filter(item => item.status !== "rejected");
   const jobs = atlasJobsHTML(game);
-  if (!systems.length) return `${jobs}<section class="atlas-empty"><span>◇</span><h3>Crie o primeiro sistema visual</h3><p>Cada sistema usa um PDF ou GameFAQs exclusivo para gerar caminhos e requisitos fiéis à fonte.</p><button id="atlas-create">＋ Novo sistema com fonte própria</button></section>`;
+  if (!systems.length) return `${jobs}<section class="atlas-empty"><span>◇</span><h3>Crie o primeiro sistema visual</h3><p>Importe uma fonte e revise as rotas e requisitos do seu jogo.</p><button id="atlas-create">＋ Novo sistema</button></section>`;
   const A = S.guideAtlas;
-  let system = systems.find((item) => item.id === A.systemId) || systems.find((item) => item.status === "approved") || systems[0];
+  const system = systems.find(item => item.id === A.systemId) || systems.find(item => item.status === "approved") || systems[0];
+  if (A.systemId !== system.id) { A.mode = "focus"; A.branchPage = 0; A.viewKey = ""; A.edgeId = ""; }
   A.systemId = system.id;
   const state = bundle.system_state || {}, completed = new Set(state.completed_requirements || []);
-  const groups = [...new Set((system.nodes || []).map((node) => node.group).filter(Boolean))];
-  const tags = [...new Set((system.nodes || []).flatMap((node) => node.tags || []).filter(Boolean))];
-  const cardNumberFor = (node) => Number(node?.card_number || (system.nodes || []).indexOf(node) + 1) || 0;
-  const available = (node) => {
-    const incoming = (system.edges || []).filter((edge) => edge.to === node.id);
-    return !incoming.length || incoming.some((edge) => (edge.requirements || []).every((req) => completed.has(req.id)));
+  const allNodes = system.nodes || [], allEdges = system.edges || [], byId = new Map(allNodes.map(node => [node.id, node]));
+  const number = node => Number(node?.card_number || allNodes.indexOf(node) + 1) || 0;
+  const mediaFor = node => {
+    const id = (system._draftMedia || {})[node.id] ?? (state.node_media || {})[`${system.id}:${node.id}`];
+    return (bundle.media || []).find(item => item.id === id);
   };
-  const visibleNodes = (system.nodes || []).filter((node) => {
+  const nodeStatus = node => {
+    const edges = allEdges.filter(edge => edge.to === node.id);
+    if (!edges.length) return "available";
+    if (edges.some(edge => atlasEdgeStatus(edge, completed).available)) return "available";
+    return edges.some(edge => atlasEdgeStatus(edge, completed).unknown) ? "unknown" : "blocked";
+  };
+  const groups = [...new Set(allNodes.map(node => node.stage || node.group).filter(Boolean))];
+  const tags = [...new Set(allNodes.flatMap(node => node.tags || []))];
+  const mode = window.innerWidth <= 820 ? "list" : A.mode || "focus";
+  const eligibleNodes = allNodes.filter(node => {
     if (node.spoiler && !A.spoilers) return false;
-    if (A.group !== "all" && node.group !== A.group) return false;
+    if (A.group !== "all" && (node.stage || node.group) !== A.group) return false;
     if (A.tag !== "all" && !(node.tags || []).includes(A.tag)) return false;
-    if (A.search && !`${node.label} ${node.subtitle} ${node.stage} ${node.group} ${(node.tags || []).join(" ")} card ${cardNumberFor(node)} #${cardNumberFor(node)}`.toLocaleLowerCase("pt-BR").includes(A.search.toLocaleLowerCase("pt-BR"))) return false;
-    if (A.availability === "available" && !available(node)) return false;
-    if (A.availability === "blocked" && available(node)) return false;
+    if (A.availability !== "all" && nodeStatus(node) !== A.availability) return false;
     return true;
   });
-  const selectedId = visibleNodes.some((node) => node.id === A.nodeId)
-    ? A.nodeId : (visibleNodes.find(node => node.id === (state.goals || {})[system.id])?.id || visibleNodes[0]?.id || "");
-  A.nodeId = selectedId;
-  const selected = (system.nodes || []).find((node) => node.id === selectedId) || null;
-  const mode = A.mode || "focus";
-  const focusedIds = new Set(selectedId ? [selectedId] : []);
-  if (mode === "focus" && selectedId) {
-    (system.edges || []).forEach((edge) => { if (edge.from === selectedId || edge.to === selectedId) { focusedIds.add(edge.from); focusedIds.add(edge.to); } });
-  }
-  const mapNodes = mode === "focus" ? visibleNodes.filter((node) => focusedIds.has(node.id)) : visibleNodes;
-  const layout = guideSystemLayout(system, mapNodes);
-  const routeEdges = new Set();
-  const trace = (nodeId, seen = new Set()) => {
-    if (seen.has(nodeId)) return; seen.add(nodeId);
-    (system.edges || []).filter((edge) => edge.to === nodeId).forEach((edge) => { routeEdges.add(edge.id); trace(edge.from, seen); });
-  };
-  if (selectedId) trace(selectedId);
-  const path = (edge) => {
-    const from = layout.positions.get(edge.from), to = layout.positions.get(edge.to);
-    if (!from || !to) return "";
-    const width = layout.cardWidth || ATLAS_CARD_WIDTH;
-    const height = layout.cardHeight || ATLAS_CARD_HEIGHT;
-    if (layout.direction === "radial") {
-      const center = (item) => ({ x: item.x + width / 2, y: item.y + height / 2 });
-      const a = center(from), b = center(to), dx = b.x - a.x, dy = b.y - a.y;
-      const edgePoint = (origin, vector) => {
-        const scale = 1 / Math.max(Math.abs(vector.x) / (width / 2 - 4), Math.abs(vector.y) / (height / 2 - 4), .001);
-        return { x: origin.x + vector.x * scale, y: origin.y + vector.y * scale };
-      };
-      const start = edgePoint(a, { x: dx, y: dy });
-      const end = edgePoint(b, { x: -dx, y: -dy });
-      return `M${start.x},${start.y} Q${(start.x + end.x) / 2},${(start.y + end.y) / 2} ${end.x},${end.y}`;
-    }
-    if (layout.direction === "vertical") {
-      const x1 = from.x + width / 2, y1 = from.y + height - 4;
-      const x2 = to.x + width / 2, y2 = to.y + 4;
-      if (y2 > y1 + 10) {
-        const bend = Math.max(36, (y2 - y1) * .45);
-        return `M${x1},${y1} C${x1},${y1 + bend} ${x2},${y2 - bend} ${x2},${y2}`;
-      }
-      const channelX = Math.min(layout.width - 16, Math.max(from.x + width, to.x + width) + 30);
-      return `M${x1},${y1} C${x1},${y1 + 28} ${channelX},${y1 + 28} ${channelX},${y1 + 56} L${channelX},${y2 - 56} C${channelX},${y2 - 28} ${x2},${y2 - 28} ${x2},${y2}`;
-    }
-    const x1 = from.x + width - 4, y1 = from.y + height / 2;
-    const x2 = to.x + 4, y2 = to.y + height / 2;
-    if (x2 > x1 + 10) {
-      const bend = Math.max(42, (x2 - x1) * .45);
-      return `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}`;
-    }
-    // Backward/cyclic links use a reserved lower channel so they never cut
-    // through a card or leave the bounded SVG world.
-    const channelY = Math.min(layout.height - 16, Math.max(from.y + height, to.y + height) + 30);
-    const laneStart = Math.min(layout.width - 16, Math.max(16, x1 + 30));
-    const laneEnd = Math.min(layout.width - 16, Math.max(16, x2 + width / 2));
-    return `M${x1},${y1} C${laneStart},${y1} ${laneStart},${channelY} ${laneStart},${channelY} L${laneEnd},${channelY} C${laneEnd},${channelY} ${x2},${y2 - 28} ${x2},${y2}`;
-  };
-  const refsHTML = (refs) => (refs || []).map((ref) => ref.page ? `p.${ref.page}` : `§${ref.section}.${ref.block}`).join(" · ");
-  const nodeHTML = mapNodes.map((node) => {
-    const pos = layout.positions.get(node.id), mediaId = (system._draftMedia || {})[node.id] ?? (state.node_media || {})[`${system.id}:${node.id}`];
-    const media = (bundle.media || []).find((item) => item.id === mediaId);
-    const goal = (state.goals || {})[system.id] === node.id;
-    const cardNumber = cardNumberFor(node);
-    const incomingCount = (system.edges || []).filter((edge) => edge.to === node.id).length;
-    const outgoingCount = (system.edges || []).filter((edge) => edge.from === node.id).length;
-    return `<button class="atlas-node ${node.id === selectedId ? "selected" : ""} ${available(node) ? "available" : "blocked"} ${goal ? "goal" : ""}" data-atlas-node="${esc(node.id)}" data-atlas-card-number="${cardNumber}" aria-label="Card ${cardNumber}: ${esc(node.label)}" title="Card #${String(cardNumber).padStart(3, "0")} — ${esc(node.label)}" style="left:${pos.x}px;top:${pos.y}px">
-      <span class="atlas-node-id">#${String(cardNumber).padStart(3, "0")}</span>
-      <span class="atlas-node-art">${media?.url ? `<img src="${esc(media.url)}" alt="">` : `<i>◇</i>`}</span>
-      <span class="atlas-node-copy"><small>${esc(node.stage || node.group || "NÓ")}</small><b>${esc(node.label)}</b><em>${esc(node.subtitle || (node.tags || []).slice(0, 2).join(" · "))}</em><span class="atlas-node-relations">${incomingCount} entrada${incomingCount === 1 ? "" : "s"} · ${outgoingCount} saída${outgoingCount === 1 ? "" : "s"}</span></span>
-      ${goal ? `<span class="atlas-goal-badge">OBJETIVO</span>` : ""}
+  const matches = eligibleNodes.filter(node => !A.search || `${node.label} ${node.subtitle || ""} ${node.stage || ""} ${node.group || ""} #${String(number(node)).padStart(3, "0")} ${number(node)}`.toLocaleLowerCase("pt-BR").includes(A.search.toLocaleLowerCase("pt-BR")));
+  // In focus mode a search locates the entity without hiding its routes.
+  const visibleNodes = mode === "focus" ? eligibleNodes : matches;
+  const visibleIds = new Set(visibleNodes.map(node => node.id));
+  const selected = matches.find(node => node.id === A.nodeId) || matches.find(node => node.id === state.goals?.[system.id]) || matches[0];
+  A.nodeId = selected?.id || "";
+  const incoming = allEdges.filter(edge => edge.to === A.nodeId && visibleIds.has(edge.from));
+  const outgoing = allEdges.filter(edge => edge.from === A.nodeId && visibleIds.has(edge.to));
+  const preferredEdge = A.edgeId || state.preferences?.[system.id]?.edge_id;
+  const chosenPath = incoming.find(edge => edge.id === preferredEdge) || incoming[0];
+  A.edgeId = chosenPath?.id || "";
+  const origins = [...new Set(incoming.map(edge => edge.from))], destinations = [...new Set(outgoing.map(edge => edge.to))];
+  if (chosenPath && origins.includes(chosenPath.from)) { origins.splice(origins.indexOf(chosenPath.from), 1); origins.unshift(chosenPath.from); }
+  const pageSize = A.focusPageSize || (window.innerHeight < 880 ? 1 : ATLAS_FOCUS_PAGE_SIZE);
+  const pages = Math.max(1, Math.ceil(Math.max(origins.length, destinations.length) / pageSize));
+  A.branchPage = Math.min(pages - 1, Math.max(0, A.branchPage || 0));
+  const offset = A.branchPage * pageSize;
+  const focusedIds = new Set([A.nodeId, ...origins.slice(offset, offset + pageSize), ...destinations.slice(offset, offset + pageSize)]);
+  const mapNodes = mode === "focus" ? visibleNodes.filter(node => focusedIds.has(node.id)) : visibleNodes;
+  const layout = guideSystemLayout(system, mapNodes, mode === "focus" ? A.nodeId : "");
+  const routeEdges = new Set([chosenPath?.id, ...outgoing.map(edge => edge.id)]);
+  const refsHTML = refs => esc(atlasRefsLabel(refs));
+  const nodesHTML = mapNodes.map(node => {
+    const pos = layout.positions.get(node.id), media = mediaFor(node), goal = state.goals?.[system.id] === node.id;
+    return `<button class="atlas-node ${node.id === A.nodeId ? "selected" : ""} ${nodeStatus(node)} ${goal ? "goal" : ""}" data-atlas-node="${esc(node.id)}" data-atlas-card-number="${number(node)}" aria-label="Card ${number(node)}: ${esc(node.label)}" aria-pressed="${node.id === A.nodeId}" style="left:${pos.x}px;top:${pos.y}px">
+      <span class="atlas-node-id">#${String(number(node)).padStart(3, "0")}</span>
+      <span class="atlas-node-art">${media?.url ? `<img src="${esc(media.url)}" alt="" draggable="false">` : '<i aria-hidden="true">◇</i>'}</span>
+      <span class="atlas-node-copy"><b>${esc(node.label)}</b><small>${esc(node.stage || node.group || "Entidade")}</small><em>▤ ${refsHTML(node.source_refs) || "Fonte local"}</em></span>
+      ${goal ? '<span class="atlas-goal-badge">OBJETIVO</span>' : ""}
     </button>`;
   }).join("");
-  const edgeHTML = layout.edges.map((edge) => {
-    const marker = edge.missable ? "missable" : routeEdges.has(edge.id) ? "route" : "muted";
-    const fromNumber = cardNumberFor((system.nodes || []).find((node) => node.id === edge.from));
-    const toNumber = cardNumberFor((system.nodes || []).find((node) => node.id === edge.to));
-    const title = `Card #${String(fromNumber).padStart(3, "0")} → Card #${String(toNumber).padStart(3, "0")}${edge.label ? ` — ${edge.label}` : ""}`;
-    return `<path class="atlas-edge ${routeEdges.has(edge.id) ? "route" : "muted"} ${edge.path_kind === "alternative" ? "alternative" : ""} ${edge.missable ? "missable" : ""}" data-atlas-edge="${esc(edge.id)}" marker-end="url(#atlas-arrow-${marker})" d="${path(edge)}"><title>${esc(title)}</title></path>`;
+  const edgesHTML = layout.edges.map(edge => {
+    const from = layout.positions.get(edge.from), to = layout.positions.get(edge.to);
+    const status = atlasEdgeStatus(edge, completed), active = routeEdges.has(edge.id);
+    const label = status.unknown ? "?" : status.total ? `${status.done} / ${status.total}` : "→";
+    const x = (from.x + ATLAS_CARD_WIDTH + to.x) / 2, y = (from.y + to.y) / 2 + ATLAS_CARD_HEIGHT * .45 - 12;
+    return `<g class="atlas-edge-group ${active ? "route" : ""}"><path class="atlas-edge ${active ? "route" : "muted"} ${edge.path_kind === "alternative" ? "alternative" : ""}" data-atlas-edge="${esc(edge.id)}" d="${atlasEdgePath(edge, layout)}" marker-end="url(#atlas-arrow-${active ? "route" : "muted"})"><title>${esc(byId.get(edge.from)?.label)} → ${esc(byId.get(edge.to)?.label)}${edge.label ? ` · ${esc(edge.label)}` : ""}</title></path>${to.x > from.x ? `<text x="${x}" y="${y}" class="atlas-edge-label" text-anchor="middle">${label}</text>` : ""}</g>`;
   }).join("");
-  const incoming = selected ? (system.edges || []).filter((edge) => edge.to === selected.id) : [];
-  const chosenPath = incoming.find(edge => edge.id === state.preferences?.[system.id]?.edge_id) || [...incoming].sort((a,b) => a.requirements.filter(r=>!completed.has(r.id)).length-b.requirements.filter(r=>!completed.has(r.id)).length)[0];
-  const requirements = chosenPath ? (chosenPath.requirements || []).map(req => ({...req,edge_id:chosenPath.id,missable:chosenPath.missable})) : [];
-  const mediaId = selected ? ((system._draftMedia || {})[selected.id] ?? (state.node_media || {})[`${system.id}:${selected.id}`]) : "";
-  const media = (bundle.media || []).find((item) => item.id === mediaId);
-  const selectedCardNumber = selected ? cardNumberFor(selected) : 0;
-  const requirementModes = { item: "ITEM DO JOGO", jogress: "JOGRESS / DIGIMEMORY", reincarnation: "REENCARNAÇÃO" };
-  const requirementBadge = (req) => requirementModes[req.mode] ? `<b class="atlas-requirement-mode ${esc(req.mode)}">${esc(requirementModes[req.mode])}</b>` : "";
-  const inspector = selected ? `<aside class="atlas-inspector">
-    ${incoming.length > 1 ? `<label class="atlas-path-label">Caminho para este objetivo<select id="atlas-path">${incoming.map(edge=>{ const fromNode = system.nodes.find(node=>node.id===edge.from); return `<option value="${esc(edge.id)}" ${edge.id===chosenPath?.id?'selected':''}>Card #${String(cardNumberFor(fromNode)).padStart(3, "0")} · ${esc(fromNode?.label || edge.label)}</option>`; }).join('')}</select></label>` : ''}
-    <div class="atlas-inspector-art">${media?.url ? `<img src="${esc(media.url)}" alt="${esc(selected.label)}">` : `<span>◇</span>`}</div>
-    <div class="atlas-inspector-card-id">CARD #${String(selectedCardNumber).padStart(3, "0")}</div><small>${esc(selected.stage || selected.group || "SISTEMA")}</small><h3>${esc(selected.label)}</h3><p>${esc(selected.subtitle || "Selecione uma imagem e acompanhe os requisitos deste objetivo.")}</p>
-    ${(selected.tags || []).length ? `<div class="atlas-tags">${selected.tags.map((tag) => `<span>${esc(tag)}</span>`).join("")}</div>` : ""}
-    ${Object.keys(selected.attributes || {}).length ? `<dl>${Object.entries(selected.attributes).map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>` : ""}
-    <div class="atlas-requirements"><b>REQUISITOS</b>${requirements.length ? requirements.map((req) => `<label class="${req.missable ? "missable" : ""} ${req.operator === "unknown" ? "unknown" : ""}"><input type="checkbox" data-testid="atlas-requirement" data-atlas-requirement="${esc(req.id)}" data-condition-id="${esc(req.id)}" data-edge="${esc(req.edge_id)}" ${req.operator === "unknown" ? "disabled" : ""} ${completed.has(req.id) ? "checked" : ""}><span>${requirementBadge(req)}${req.operator === "unknown" ? "? " : ""}${esc(req.text)}</span></label>`).join("") : `<p>Nenhum requisito documentado.</p>`}</div>
-    ${system.source_id ? `<button class="atlas-source" data-atlas-source="${esc(selected.id)}">Fonte exclusiva: ${esc(system.source_id === "legacy-main" ? "guia migrado" : refsHTML(selected.source_refs || system.source_refs || []))}</button>` : ""}
-    <div class="atlas-inspector-actions"><button class="primary" id="atlas-goal">${(state.goals || {})[system.id] === selected.id ? "✓ Objetivo fixado" : "◎ Fixar como objetivo"}</button><button id="atlas-media">▧ Trocar imagem</button><button id="atlas-edit">✎ Editar sistema</button><button id="atlas-replace-source">↺ Trocar fonte</button>${!system._draftSource ? `<button class="danger wide" id="atlas-delete">⌫ Excluir sistema</button>` : ""}</div>
-  </aside>` : `<aside class="atlas-inspector empty">Selecione um nó para ver seus detalhes.</aside>`;
-  const diagnostics = system._draftDiagnostics || {};
-  const imageFillStatus = S.guideImageFill[`${game.slug}:${system.id}:${system._draftSource || ""}`] || {};
-  const imageFillRunning = ["running", "queued"].includes(imageFillStatus.phase);
-  const imageFillUndo = !system._draftSource && imageFillStatus.phase === "complete" && (imageFillStatus.changes || []).length;
-  const pendingItems = diagnostics.pending_items || [];
-  const warningItems = diagnostics.warning_items || [];
-  const pendingCount = pendingItems.length || (diagnostics.pending_table_ids || []).length;
-  const warningCount = warningItems.length;
-  const coverage = diagnostics.batches ? `${(system.nodes || []).length} cartões · ${(system.edges || []).length} caminhos · ${diagnostics.batches} lotes${diagnostics.source_pages ? ` · ${diagnostics.referenced_pages}/${diagnostics.source_pages} páginas citadas` : ""}${diagnostics.table_blocks ? ` · ${diagnostics.covered_table_blocks}/${diagnostics.table_blocks} linhas de tabela cobertas` : ""}${pendingCount ? ` · ${pendingCount} pendência${pendingCount === 1 ? "" : "s"}` : ""}${warningCount ? ` · ${warningCount} aviso${warningCount === 1 ? "" : "s"}` : ""}` : "";
-  const review = system.status === "suggested" ? `<div class="atlas-review"><span>REVISÃO NECESSÁRIA</span><p>Confira nomes, caminhos, requisitos, spoilers e perdíveis antes de publicar.${coverage ? `<strong>${esc(coverage)}</strong>` : ""}${pendingCount ? `<small class="atlas-pending-warning">A aprovação está bloqueada até cada pendência ser resolvida ou excluída na seleção da fonte.</small>` : warningCount ? `<small class="atlas-review-warning">Há avisos de interpretação para confirmar; eles não bloqueiam a publicação.</small>` : ""}</p><div class="atlas-review-actions">${pendingCount ? `<button class="atlas-review-secondary" id="atlas-open-diagnostics">Ver detalhes (${pendingCount})</button>${system._draftSource ? `<button class="atlas-review-secondary" id="atlas-review-pending-source">Revisar tabelas</button>` : ""}` : warningCount ? `<button class="atlas-review-secondary" id="atlas-open-diagnostics">Ver avisos (${warningCount})</button>` : ""}<button id="atlas-approve" ${pendingCount ? "disabled" : ""}>Aprovar sistema</button><button id="atlas-edit">Revisar e editar</button><button id="atlas-reject">Rejeitar</button></div></div>` : "";
-  return `${jobs}<section class="atlas-shell ${mode === "list" ? "list-view" : ""}" style="--atlas-zoom:${A.zoom};--atlas-x:${A.panX}px;--atlas-y:${A.panY}px">
-    <header class="atlas-toolbar"><div><span>ATLAS DE SISTEMAS</span><h2>${esc(system.title)}</h2><p>${esc(system.description)}</p></div><div class="atlas-toolbar-actions"><button id="atlas-create">＋ Novo sistema</button><button id="atlas-fill-images" data-testid="atlas-image-fill" ${imageFillRunning ? "data-image-fill-running=\"true\"" : ""} title="Buscar e associar uma imagem por card, usando apenas o nome da entidade">${imageFillRunning ? `⏳ ${imageFillStatus.completed || 0}/${imageFillStatus.total || 0} · Cancelar` : "▧ Preencher imagens"}</button>${imageFillUndo ? `<button id="atlas-undo-images" title="Desfazer somente as associações deste lote">↶ Desfazer imagens</button>` : ""}${!system._draftSource ? `<button class="danger" id="atlas-delete-header">⌫ Excluir sistema</button>` : ""}</div></header>
-    ${review}<div class="atlas-filters">
-      <select id="atlas-system">${systems.map((item) => `<option value="${esc(item.id)}" ${item.id === system.id ? "selected" : ""}>${esc(item.title)}${item.status === "suggested" ? " · revisar" : ""}</option>`).join("")}</select>
-      <select id="atlas-group"><option value="all">Todos os ${esc(system.group_label || "grupos")}</option>${groups.map((group) => `<option value="${esc(group)}" ${A.group === group ? "selected" : ""}>${esc(group)}</option>`).join("")}</select>
-      <select id="atlas-tag"><option value="all">Todas as tags</option>${tags.map((tag) => `<option value="${esc(tag)}" ${A.tag === tag ? "selected" : ""}>${esc(tag)}</option>`).join("")}</select>
-      <select id="atlas-availability"><option value="all">Toda disponibilidade</option><option value="available" ${A.availability === "available" ? "selected" : ""}>Disponíveis</option><option value="blocked" ${A.availability === "blocked" ? "selected" : ""}>Bloqueados</option></select>
-      <input id="atlas-search" value="${esc(A.search || "")}" placeholder="Buscar no mapa" aria-label="Buscar no mapa">
-      <label><input id="atlas-spoilers" type="checkbox" ${A.spoilers ? "checked" : ""}> Spoilers</label>
-      <div class="atlas-zoom"><button class="${mode === "focus" ? "active" : ""}" data-atlas-mode="focus">Foco</button><button class="${mode === "map" ? "active" : ""}" data-atlas-mode="map">Mapa</button><button class="${mode === "list" ? "active" : ""}" data-atlas-mode="list">Lista</button><button data-atlas-zoom="out">−</button><button data-atlas-zoom="fit">Ajustar</button><button data-atlas-zoom="in">＋</button>${A.draftSource ? '<button id="atlas-back-published">Voltar ao publicado</button>' : ""}</div>
-    </div>
-    <div class="atlas-layout"><div class="atlas-viewport" id="atlas-viewport"><div class="atlas-world" style="width:${layout.width}px;height:${layout.height}px"><svg width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="atlas-arrow-route" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#4bc4ff"></path></marker><marker id="atlas-arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto" markerUnits="userSpaceOnUse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#37516b"></path></marker><marker id="atlas-arrow-missable" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#e5ae3e"></path></marker></defs>${edgeHTML}</svg>${nodeHTML}</div>${!visibleNodes.length ? `<p class="atlas-no-results">Nenhum nó corresponde aos filtros.</p>` : ""}</div>${inspector}</div>
+  const requirements = chosenPath?.requirements || [], chosenStatus = chosenPath ? atlasEdgeStatus(chosenPath, completed) : null;
+  const sourceRefs = chosenPath?.source_refs || selected?.source_refs || system.source_refs;
+  const details = selected ? `<aside class="atlas-inspector" aria-label="Detalhes da rota" data-scroll="atlas-inspector-${esc(A.nodeId)}">
+    <div class="atlas-inspector-title"><div><h3>${esc(selected.label)}</h3><p>${chosenPath ? "Rota selecionada" : "Entidade selecionada"}</p></div><span>#${String(number(selected)).padStart(3, "0")}</span></div>
+    <div class="atlas-inspector-art">${mediaFor(selected)?.url ? `<img src="${esc(mediaFor(selected).url)}" alt="${esc(selected.label)}">` : '<span aria-hidden="true">◇</span>'}</div>
+    ${incoming.length ? `<label class="atlas-path-label">Origem desta rota<select id="atlas-path" aria-label="Origem desta rota">${incoming.map(edge => `<option value="${esc(edge.id)}" ${edge.id === chosenPath?.id ? "selected" : ""}>${esc(byId.get(edge.from)?.label || "Origem")} → ${esc(selected.label)}${edge.label ? ` · ${esc(edge.label)}` : ""}</option>`).join("")}</select></label>` : ""}
+    <div class="atlas-requirements"><h4>Requisitos da fonte ${chosenStatus?.total ? `<span>${chosenStatus.done}/${chosenStatus.total}</span>` : ""}</h4>
+    ${chosenPath?.label ? `<p class="atlas-route-kind">${esc(chosenPath.label)}</p>` : ""}
+    ${requirements.map(req => `<label class="${req.operator === "unknown" ? "unknown" : ""}"><input type="checkbox" data-testid="atlas-requirement" data-atlas-requirement="${esc(req.id)}" data-edge="${esc(chosenPath.id)}" ${req.operator === "unknown" || system._draftSource ? "disabled" : ""} ${completed.has(req.id) ? "checked" : ""}><span>${req.mode === "item" ? '<em class="atlas-requirement-mode">Item do jogo</em>' : ""}${esc(req.text)}</span></label>`).join("") || '<p>Esta fonte não detalha requisitos para a seleção.</p>'}
+    ${chosenStatus?.unknown ? '<p class="atlas-rule-warning">Disponibilidade desconhecida. Consulte a regra e a cota no trecho original.</p>' : ""}</div>
+    ${system.source_id ? `<button class="atlas-source" data-atlas-source="${esc(selected.id)}">Consultar trecho · ${refsHTML(sourceRefs) || "Fonte local"} ↗</button>` : ""}
+    <div class="atlas-inspector-actions"><button class="primary" id="atlas-goal" ${system._draftSource ? "disabled" : ""}>${state.goals?.[system.id] === selected.id ? "✓ Objetivo fixado" : "♧ Fixar objetivo"}</button><button id="atlas-media">▧ Trocar imagem</button><button id="atlas-edit">✎ Editar sistema</button></div>
+    <details class="atlas-source-info"><summary>ⓘ Fontes e manutenção</summary><p>${esc(system.description || system.title)}</p><button id="atlas-reprocess-source">Reprocessar fonte salva</button><button id="atlas-replace-source">Importar outra fonte</button>${!system._draftSource ? '<button class="danger" id="atlas-delete">Excluir sistema</button>' : ""}</details>
+  </aside>` : '<aside class="atlas-inspector empty">Nenhum cartão corresponde à busca.</aside>';
+  const diagnostics = system._draftDiagnostics || {}, pendingCount = (diagnostics.pending_items || []).length || (diagnostics.pending_table_ids || []).length;
+  const review = system.status === "suggested" ? `<div class="atlas-review"><span>REVISAR PRÉVIA</span><p>${allNodes.length} cartões · ${allEdges.length} caminhos${pendingCount ? ` · ${pendingCount} pendências` : ""}</p><div class="atlas-review-actions"><button id="atlas-open-diagnostics">Ver detalhes</button><button id="atlas-review-pending-source">Revisar tabelas</button><button id="atlas-approve" ${pendingCount ? "disabled" : ""}>Aprovar sistema</button><button id="atlas-reject">Rejeitar</button></div></div>` : "";
+  const fill = S.guideImageFill[`${game.slug}:${system.id}:${system._draftSource || ""}`] || {};
+  const running = ["running", "waiting_retry", "queued"].includes(fill.phase);
+  const filled = allNodes.filter(node => mediaFor(node)?.url).length;
+  const activeJobs = (bundle.atlas_jobs || []).filter(job => ["running", "error", "interrupted", "suggested", "awaiting_source_review"].includes(job.status));
+  const jobTray = activeJobs.length ? `<details class="atlas-job-tray"><summary>Atividade das fontes · ${activeJobs.length} ${activeJobs.some(job => job.status === "error") ? "· Há uma análise com erro" : ""}</summary>${jobs}</details>` : "";
+  const filters = `<details class="atlas-filter-menu" ${A.filtersOpen ? "open" : ""}><summary>☷ Filtros</summary><div>
+    <label>Estágio / grupo<select id="atlas-group"><option value="all">Todos</option>${groups.map(group => `<option ${A.group === group ? "selected" : ""}>${esc(group)}</option>`).join("")}</select></label>
+    <label>Tags<select id="atlas-tag"><option value="all">Todas</option>${tags.map(tag => `<option ${A.tag === tag ? "selected" : ""}>${esc(tag)}</option>`).join("")}</select></label>
+    <label>Disponibilidade<select id="atlas-availability">${[["all","Todas"],["available","Disponível"],["blocked","Pendente"],["unknown","Desconhecida"]].map(([id,label]) => `<option value="${id}" ${A.availability === id ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+    <label class="atlas-spoilers"><input id="atlas-spoilers" type="checkbox" ${A.spoilers ? "checked" : ""}> Mostrar spoilers</label></div></details>`;
+  return `${jobTray}<section class="atlas-shell atlas-v2 ${review ? "has-review" : ""} ${mode === "list" ? "list-view" : ""}" style="--atlas-card-width:${ATLAS_CARD_WIDTH}px;--atlas-card-height:${ATLAS_CARD_HEIGHT}px;--atlas-zoom:${A.zoom};--atlas-x:${A.panX}px;--atlas-y:${A.panY}px">
+    ${review}<div class="atlas-workspace">
+      <header class="atlas-toolbar"><h2>Atlas</h2><select id="atlas-system" aria-label="Sistema">${systems.map(item => `<option value="${esc(item.id)}" ${item.id === system.id ? "selected" : ""}>${esc(item.title)}</option>`).join("")}</select><label class="atlas-search"><span aria-hidden="true">⌕</span><input id="atlas-search" type="search" value="${esc(A.search || "")}" placeholder="Buscar no mapa" aria-label="Buscar nome ou número do card"></label><button id="atlas-sources" title="Fontes e revisões" aria-label="Fontes e revisões">▤</button><button class="primary" id="atlas-create">Novo ＋</button></header>
+      <div class="atlas-contextbar"><span>${mode === "focus" ? `Rotas de <b>${esc(selected?.label || "—")}</b>` : `${visibleNodes.length} cartões`}</span>${mode === "focus" && pages > 1 ? `<nav class="atlas-branches" aria-label="Mais conexões"><button data-atlas-branch="-1" ${A.branchPage === 0 ? "disabled" : ""}>‹</button><span>${A.branchPage + 1}/${pages}</span><button data-atlas-branch="1" ${A.branchPage + 1 === pages ? "disabled" : ""}>Mais conexões ›</button></nav>` : ""}${filters}</div>
+      <div class="atlas-viewport" id="atlas-viewport" data-view-key="${esc([system.id, mode, A.nodeId, A.branchPage, A.group, A.tag, A.availability, A.search].join(":"))}" data-selected-id="${esc(A.nodeId)}">
+        <div class="atlas-world" style="width:${layout.width}px;height:${layout.height}px"><svg width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="atlas-arrow-route" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#25deeb" stroke-width="1.5"/></marker><marker id="atlas-arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#63748c" stroke-width="1.5"/></marker></defs>${edgesHTML}</svg>${nodesHTML}</div>
+        ${!matches.length ? '<p class="atlas-no-results">Nenhum cartão corresponde aos filtros.</p>' : ""}
+      </div>
+      <footer class="atlas-map-footer"><div class="atlas-zoom"><button data-atlas-zoom="out" aria-label="Diminuir zoom">−</button><output id="atlas-zoom-value">${Math.round(A.zoom * 100)}%</output><button data-atlas-zoom="in" aria-label="Aumentar zoom">＋</button></div><div class="atlas-mode-tabs" aria-label="Visualização">${[["focus","Foco"],["map","Mapa"],["list","Lista"]].map(([id,label]) => `<button data-atlas-mode="${id}" class="${mode === id ? "active" : ""}" aria-pressed="${mode === id}">${label}</button>`).join("")}</div><button data-atlas-zoom="fit">⛶ Ajustar</button></footer>
+      <div class="atlas-image-status"><button id="atlas-fill-images" data-testid="atlas-image-fill">▧ ${running ? "Acompanhar imagens" : fill.phase === "cancelled" || fill.phase === "interrupted" ? "Retomar imagens" : "Preencher imagens"}</button><span>${filled}/${allNodes.length} com imagem${fill.phase === "waiting_retry" ? " · Nova tentativa agendada" : running ? " · Buscando…" : ""}</span>${(fill.changes || []).length && !running && !fill.undo ? '<button id="atlas-undo-images">↶ Desfazer lote</button>' : ""}${A.draftSource ? '<button id="atlas-back-published">Voltar ao publicado</button>' : ""}</div>
+    </div>${details}
   </section>`;
 }
 
@@ -2248,7 +2246,9 @@ async function viewAtlasSource(systemId, nodeId = "") {
   const sourceLinkLabel = capture.archived ? "Abrir captura do Web Archive" : "Abrir GameFAQs";
   const system = atlasSystems(S.dashboardGame || {}).find((item) => item.id === systemId);
   const node = system?.nodes?.find((item) => item.id === nodeId);
-  const refs = new Set((node?.source_refs || []).map((ref) => `${ref.section}:${ref.block}`));
+  const path = (system?.edges || []).find(edge => edge.id === S.guideAtlas.edgeId && edge.to === nodeId)
+    || (system?.edges || []).find(edge => edge.to === nodeId);
+  const refs = new Set((path?.source_refs || node?.source_refs || []).map((ref) => `${ref.section}:${ref.block}`));
   const matches = (review.review?.tables || []).flatMap((table) => (table.row_refs || []).filter((row) => refs.has(`${row.ref?.section}:${row.ref?.block}`)).map((row) => ({ ...row, table })));
   const excerpt = matches.slice(0, 12).map((item) => {
     const rowNumber = (item.table.row_refs || []).findIndex((row) => row.id === item.id) + 1;
@@ -2369,30 +2369,152 @@ function renderGuideSystemEditor() {
   };
 }
 
+function atlasApplyView() {
+  const shell = $(".atlas-v2"), A = S.guideAtlas;
+  shell?.style.setProperty("--atlas-zoom", A.zoom);
+  shell?.style.setProperty("--atlas-x", `${A.panX}px`);
+  shell?.style.setProperty("--atlas-y", `${A.panY}px`);
+  if ($("#atlas-zoom-value")) $("#atlas-zoom-value").value = `${Math.round(A.zoom * 100)}%`;
+}
+
+function atlasFitView() {
+  const viewport = $("#atlas-viewport"), world = viewport?.querySelector(".atlas-world");
+  if (!viewport || !world || viewport.closest(".list-view")) return;
+  const A = S.guideAtlas;
+  A.zoom = Math.max(.85, Math.min(1, (viewport.clientWidth - 20) / world.offsetWidth, (viewport.clientHeight - 20) / world.offsetHeight));
+  A.panX = (viewport.clientWidth - world.offsetWidth * A.zoom) / 2;
+  A.panY = Math.max(8, (viewport.clientHeight - world.offsetHeight * A.zoom) / 2);
+  const selected = world.querySelector(".atlas-node.selected");
+  if (selected && world.offsetWidth * A.zoom > viewport.clientWidth)
+    A.panX = viewport.clientWidth / 2 - (selected.offsetLeft + ATLAS_CARD_WIDTH / 2) * A.zoom;
+  if (selected && world.offsetHeight * A.zoom > viewport.clientHeight)
+    A.panY = viewport.clientHeight / 2 - (selected.offsetTop + ATLAS_CARD_HEIGHT / 2) * A.zoom;
+  atlasApplyView();
+}
+
+let atlasResizeObserver;
+function atlasMeasureWorkspace(forceFit = false) {
+  const shell = $(".atlas-v2"), main = shell?.closest(".atlas-main"), viewport = $("#atlas-viewport");
+  if (!shell || !main || !viewport) return;
+  if (window.innerWidth > 820) {
+    const top = shell.getBoundingClientRect().top - main.getBoundingClientRect().top + main.scrollTop;
+    shell.style.setProperty("--atlas-shell-height", `${Math.max(420, main.clientHeight - top - 8)}px`);
+  }
+  const twoRows = (ATLAS_CARD_HEIGHT * 2 + ATLAS_ROW_GAP + ATLAS_WORLD_PADDING * 2 + 12) * .85 + 20;
+  const size = viewport.clientHeight >= twoRows ? ATLAS_FOCUS_PAGE_SIZE : 1;
+  const narrow = window.innerWidth <= 820;
+  if (S.guideAtlas.focusPageSize !== size || S.guideAtlas.narrow !== narrow) {
+    S.guideAtlas.focusPageSize = size; S.guideAtlas.narrow = narrow; S.guideAtlas.viewKey = "";
+    renderDashboard({force:true}); return;
+  }
+  if (forceFit || S.guideAtlas.viewKey !== viewport.dataset.viewKey) {
+    S.guideAtlas.viewKey = viewport.dataset.viewKey; atlasFitView();
+  }
+}
+
+function openAtlasImageFill(game, system, start) {
+  document.getElementById("atlas-image-modal")?.remove();
+  const key = `${game.slug}:${system.id}:${system._draftSource || ""}`;
+  const status = S.guideImageFill[key] || {}, options = status.options || {};
+  const active = ["running", "queued", "waiting_retry"].includes(status.phase);
+  const modal = document.createElement("div"); modal.id = "atlas-image-modal"; modal.className = "modal-bg";
+  const previousFocus = document.activeElement;
+  const close = () => { modal.remove(); if (previousFocus?.isConnected) previousFocus.focus(); else $("#atlas-fill-images")?.focus(); };
+  const example = system.nodes.find(node => node.id === S.guideAtlas.nodeId && !node.spoiler)?.label
+    || system.nodes.find(node => !node.spoiler)?.label || "Entidade";
+  modal.innerHTML = `<section class="atlas-image-dialog" role="dialog" aria-modal="true" aria-labelledby="atlas-image-title"><header><div><h2 id="atlas-image-title">Imagens do Atlas</h2><p>Escolha o contexto da busca. Ele será aplicado a cada entidade deste sistema.</p></div><button data-close aria-label="Fechar">×</button></header>
+    ${active ? '<div class="atlas-image-progress" aria-live="polite"><b data-fill-counter></b><progress></progress><p data-fill-message></p></div><ul class="atlas-image-issues"></ul>' : `<form id="atlas-image-form"><label>Jogo ou contexto (opcional)<input id="atlas-image-context" value="${esc(options.context || "")}" placeholder="Ex.: Digimon World 3"></label><label>Wiki / site (opcional)<input id="atlas-image-wiki" value="${esc(options.wiki || "")}" placeholder="Ex.: wikimon.net ou URL da wiki"></label><label>Exemplo da busca<output id="atlas-image-example"></output></label><label class="atlas-image-replace"><input id="atlas-image-replace" type="checkbox"> Refazer também as imagens existentes com este contexto.</label><p>As buscas continuam enquanto o DigiTracker estiver aberto. Você pode fechar esta janela, pausar ou retomar depois.</p><p>O jogo e a wiki informados restringem os resultados. Se não houver uma imagem compatível, o card continua pendente: ajuste o contexto ou escolha uma imagem manualmente. A fila só conclui quando todos têm imagem.</p></form>`}
+    <footer><button data-close>${active ? "Continuar navegando" : "Cancelar"}</button><button class="primary" id="atlas-image-start">${active ? "Pausar preenchimento" : "Preencher todos os cartões"}</button></footer></section>`;
+  document.body.appendChild(modal);
+  modal.querySelectorAll("[data-close]").forEach(button => button.onclick = close);
+  modal.onkeydown = event => {
+    if (event.key === "Escape") { event.stopPropagation(); close(); }
+    if (event.key === "Tab") {
+      const targets = [...modal.querySelectorAll("button:not(:disabled), input:not(:disabled)")];
+      const first = targets[0], last = targets[targets.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }
+  };
+  modal.querySelector("form")?.addEventListener("submit", event => { event.preventDefault(); modal.querySelector("#atlas-image-start").click(); });
+  const updateExample = () => {
+    const context = modal.querySelector("#atlas-image-context")?.value.trim() || "";
+    let wiki = modal.querySelector("#atlas-image-wiki")?.value.trim() || "";
+    if (wiki) { try { wiki = new URL(wiki.includes("://") ? wiki : `https://${wiki}`).hostname; } catch (_) {} }
+    const output = modal.querySelector("#atlas-image-example");
+    if (output) output.textContent = [context, example, wiki ? `site:${wiki}` : ""].filter(Boolean).join(" ");
+  };
+  modal.querySelectorAll("input").forEach(input => input.addEventListener("input", updateExample));
+  updateExample();
+  const refreshStatus = () => {
+    if (!modal.isConnected || !active) return;
+    const latest = S.guideImageFill[key] || status;
+    modal.querySelector("[data-fill-counter]").textContent = `${latest.completed || 0}/${latest.total || 0} cartões com imagem`;
+    modal.querySelector("[data-fill-message]").textContent = latest.message || "Buscando imagens…";
+    modal.querySelector("progress").max = latest.total || 1; modal.querySelector("progress").value = latest.completed || 0;
+    modal.querySelector(".atlas-image-issues").innerHTML = Object.entries(latest.issues || {}).map(([id, message]) => `<li>Card #${String(system.nodes.find(node => node.id === id)?.card_number || "—").padStart(3, "0")}: ${esc(message)}</li>`).join("");
+    if (["running", "queued", "waiting_retry"].includes(latest.phase)) setTimeout(refreshStatus, 800);
+    else modal.querySelector("#atlas-image-start").textContent = "Fechar";
+  };
+  refreshStatus();
+  modal.querySelector("#atlas-image-start").onclick = async event => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    if (active) {
+      const latest = S.guideImageFill[key] || status;
+      if (["running", "queued", "waiting_retry"].includes(latest.phase)) await backend.cancelGuideSystemImageFill(game.slug, system.id, system._draftSource || "");
+      close(); return;
+    }
+    const result = await start({context: modal.querySelector("#atlas-image-context").value, wiki: modal.querySelector("#atlas-image-wiki").value,
+      replace_existing: modal.querySelector("#atlas-image-replace").checked});
+    if (result) close(); else button.disabled = false;
+  };
+  modal.querySelector("input, [data-close]")?.focus();
+}
+
+const atlasImagePollers = new Set();
+
 function bindGuideAtlas(game) {
   if (S.tab !== "atlas" || !game) return;
+  atlasResizeObserver?.disconnect();
   const systems = atlasSystems(game);
   const system = systems.find((item) => item.id === S.guideAtlas.systemId) || systems.find((item) => item.status !== "rejected");
   const selected = system?.nodes?.find((node) => node.id === S.guideAtlas.nodeId);
   const rerender = () => renderDashboard({ force: true });
   const imageFillKey = `${game.slug}:${system?.id || ""}:${system?._draftSource || ""}`;
   const acompanharPreenchimentoImagens = async () => {
-    while (S.view === "dashboard" && S.tab === "atlas") {
+    if (atlasImagePollers.has(imageFillKey)) return;
+    atlasImagePollers.add(imageFillKey);
+    try { while (S.view === "dashboard" && S.tab === "atlas" && S.guideAtlas.systemId === system.id) {
       const status = await backend.guideSystemImageFillStatus(
         game.slug, system.id, system._draftSource || ""
       ).catch((error) => ({ ok: false, phase: "error", error: String(error) }));
       S.guideImageFill[imageFillKey] = status;
-      await rerender();
-      if (!["running", "queued"].includes(status.phase)) {
-        if (status.phase === "complete") toast(`Imagens preenchidas: ${status.filled || 0} associada(s), ${status.empty || 0} sem resultado.`);
+      const readingOrEditing = !!root.querySelector(".gf-backdrop, .modal-bg")
+        || (root.contains(document.activeElement) && /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName || ""));
+      if (!readingOrEditing) await rerender();
+      if (!["running", "queued", "waiting_retry"].includes(status.phase)) {
+        if (status.phase === "complete") toast(`Todos os ${status.total || 0} cartões estão com imagem.`);
         else if (status.phase === "cancelled") toast("Preenchimento de imagens cancelado.");
         else if (status.phase === "error") toast(status.error || "Falha ao preencher imagens.", true);
         break;
       }
       await esperar(900);
-    }
+    } } finally { atlasImagePollers.delete(imageFillKey); }
   };
-  $("#atlas-path")?.addEventListener("change", async event => { const r = await appCall("set_guide_system_path", game.slug, system.id, event.target.value); if (!r.ok) toast(r.error,true); await rerender(); });
+  const selectPath = async edgeId => {
+    S.guideAtlas.search = "";
+    S.guideAtlas.edgeId = edgeId;
+    S.guideAtlas.branchPage = 0;
+    if (!system._draftSource && S.mode !== "demo") { const result = await appCall("set_guide_system_path", game.slug, system.id, edgeId); if (!result.ok) toast(result.error, true); }
+    await rerender();
+  };
+  $("#atlas-path")?.addEventListener("change", event => selectPath(event.target.value));
+  root.querySelectorAll("[data-atlas-edge]").forEach(path => path.onclick = () => {
+    const edge = system.edges.find(item => item.id === path.dataset.atlasEdge);
+    if (edge) { S.guideAtlas.nodeId = edge.to; selectPath(edge.id); }
+  });
+  root.querySelectorAll("[data-atlas-branch]").forEach(button => button.onclick = () => { S.guideAtlas.branchPage = Math.max(0, (S.guideAtlas.branchPage || 0) + Number(button.dataset.atlasBranch)); rerender(); });
   root.querySelectorAll("[data-atlas-review-job]").forEach((b) => b.onclick = () => { S.guideAtlas.draftSource = b.dataset.atlasReviewJob; S.guideAtlas.systemId = ""; rerender(); });
   root.querySelectorAll("[data-atlas-review-source]").forEach((b) => b.onclick = async () => {
     const review = await backend.atlasSourceReview(game.slug, b.dataset.atlasReviewSource).catch((error) => ({ ok: false, error: String(error) }));
@@ -2423,16 +2545,26 @@ function bindGuideAtlas(game) {
     });
   }
   $("#atlas-back-published")?.addEventListener("click", () => { S.guideAtlas.draftSource = ""; rerender(); });
-  root.querySelectorAll("[data-atlas-mode]").forEach((button) => button.addEventListener("click", () => { S.guideAtlas.mode = button.dataset.atlasMode; rerender(); }));
+  root.querySelectorAll("[data-atlas-mode]").forEach((button) => button.addEventListener("click", () => { S.guideAtlas.mode = button.dataset.atlasMode; S.guideAtlas.viewKey = ""; rerender(); }));
   $("#atlas-list-toggle")?.addEventListener("click", () => { S.guideAtlas.mode = S.guideAtlas.mode === "list" ? "map" : "list"; rerender(); });
-  $("#atlas-system")?.addEventListener("change", (event) => { S.guideAtlas.systemId = event.target.value; S.guideAtlas.nodeId = ""; S.guideAtlas.group = "all"; S.guideAtlas.tag = "all"; rerender(); });
+  $("#atlas-system")?.addEventListener("change", (event) => { Object.assign(S.guideAtlas, {systemId: event.target.value, nodeId: "", edgeId: "", group: "all", tag: "all", mode: "focus", branchPage: 0, viewKey: ""}); rerender(); });
   $("#atlas-group")?.addEventListener("change", (event) => { S.guideAtlas.group = event.target.value; rerender(); });
   $("#atlas-tag")?.addEventListener("change", (event) => { S.guideAtlas.tag = event.target.value; rerender(); });
   $("#atlas-availability")?.addEventListener("change", (event) => { S.guideAtlas.availability = event.target.value; rerender(); });
-  $("#atlas-search")?.addEventListener("change", (event) => { S.guideAtlas.search = event.target.value; rerender(); });
+  $(".atlas-filter-menu")?.addEventListener("toggle", event => { S.guideAtlas.filtersOpen = event.currentTarget.open; });
+  let searchTimer;
+  $("#atlas-search")?.addEventListener("input", event => {
+    const value = event.target.value;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(async () => {
+      if (S.activeSlug !== game.slug || S.tab !== "atlas") return;
+      S.guideAtlas.search = value; await rerender();
+      $("#atlas-search")?.focus();
+    }, 240);
+  });
   $("#atlas-spoilers")?.addEventListener("change", (event) => { S.guideAtlas.spoilers = event.target.checked; rerender(); });
   root.querySelectorAll("[data-atlas-node]").forEach((button) => {
-    button.onclick = () => { S.guideAtlas.nodeId = button.dataset.atlasNode; rerender(); };
+    button.onclick = () => { S.guideAtlas.nodeId = button.dataset.atlasNode; S.guideAtlas.search = ""; S.guideAtlas.branchPage = 0; S.guideAtlas.edgeId = ""; rerender(); };
     button.onkeydown = (event) => {
       const current = button.dataset.atlasNode;
       const edge = event.key === "ArrowRight" ? system?.edges?.find((item) => item.from === current)
@@ -2444,13 +2576,10 @@ function bindGuideAtlas(game) {
   root.querySelectorAll("[data-atlas-zoom]").forEach((button) => button.onclick = () => {
     const action = button.dataset.atlasZoom;
     if (action === "fit") {
-      const view = $("#atlas-viewport"), world = view?.querySelector(".atlas-world");
-      S.guideAtlas.zoom = Math.max(.1, Math.min(1.6, (view.clientWidth - 32) / world.offsetWidth, (view.clientHeight - 32) / world.offsetHeight));
-      S.guideAtlas.panX = (view.clientWidth - world.offsetWidth * S.guideAtlas.zoom) / 2;
-      S.guideAtlas.panY = (view.clientHeight - world.offsetHeight * S.guideAtlas.zoom) / 2;
+      atlasFitView(); return;
     }
-    else S.guideAtlas.zoom = Math.max(.1, Math.min(1.6, S.guideAtlas.zoom + (action === "in" ? .12 : -.12)));
-    rerender();
+    else S.guideAtlas.zoom = Math.max(.65, Math.min(1.6, S.guideAtlas.zoom + (action === "in" ? .12 : -.12)));
+    atlasApplyView();
   });
   const viewport = $("#atlas-viewport");
   if (viewport) {
@@ -2458,24 +2587,29 @@ function bindGuideAtlas(game) {
     viewport.onmousedown = (event) => { if (event.target.closest("button,input,select,label")) return; start = [event.clientX, event.clientY]; origin = [S.guideAtlas.panX, S.guideAtlas.panY]; viewport.classList.add("panning"); };
     window.onmousemove = (event) => { if (!start) return; S.guideAtlas.panX = origin[0] + event.clientX - start[0]; S.guideAtlas.panY = origin[1] + event.clientY - start[1]; viewport.closest(".atlas-shell")?.style.setProperty("--atlas-x", `${S.guideAtlas.panX}px`); viewport.closest(".atlas-shell")?.style.setProperty("--atlas-y", `${S.guideAtlas.panY}px`); };
     window.onmouseup = () => { start = null; viewport.classList.remove("panning"); };
-    viewport.onwheel = (event) => { event.preventDefault(); S.guideAtlas.zoom = Math.max(.1, Math.min(1.6, S.guideAtlas.zoom + (event.deltaY < 0 ? .08 : -.08))); viewport.closest(".atlas-shell")?.style.setProperty("--atlas-zoom", S.guideAtlas.zoom); };
+    viewport.onwheel = (event) => {
+      if (viewport.closest(".list-view")) return;
+      event.preventDefault();
+      const rect = viewport.getBoundingClientRect(), old = S.guideAtlas.zoom;
+      const next = Math.max(.65, Math.min(1.6, old + (event.deltaY < 0 ? .08 : -.08)));
+      S.guideAtlas.panX = event.clientX - rect.left - (event.clientX - rect.left - S.guideAtlas.panX) * next / old;
+      S.guideAtlas.panY = event.clientY - rect.top - (event.clientY - rect.top - S.guideAtlas.panY) * next / old;
+      S.guideAtlas.zoom = next; atlasApplyView();
+    };
+    requestAnimationFrame(() => atlasMeasureWorkspace());
+    atlasResizeObserver = new ResizeObserver(() => requestAnimationFrame(() => atlasMeasureWorkspace()));
+    atlasResizeObserver.observe(viewport.closest(".atlas-main"));
   }
   $("#atlas-create")?.addEventListener("click", () => openAtlasSourceWizard());
   $("#atlas-fill-images")?.addEventListener("click", async (event) => {
     if (!system?.id) return;
-    const status = S.guideImageFill[imageFillKey] || {};
-    if (["running", "queued"].includes(status.phase)) {
-      event.currentTarget.disabled = true;
-      const result = await backend.cancelGuideSystemImageFill(game.slug, system.id, system._draftSource || "");
-      if (!result?.ok) toast(result?.error || "Não foi possível cancelar.", true);
-      return;
-    }
-    event.currentTarget.disabled = true;
-    const result = await backend.startGuideSystemImageFill(game.slug, system.id, system._draftSource || "");
-    if (!result?.ok) { event.currentTarget.disabled = false; return toast(result?.error || "Não foi possível iniciar o preenchimento.", true); }
-    S.guideImageFill[imageFillKey] = result;
-    toast("Preenchimento iniciado. Você pode continuar revisando o Atlas.");
-    acompanharPreenchimentoImagens();
+    openAtlasImageFill(game, system, async options => {
+      const result = await backend.startGuideSystemImageFill(game.slug, system.id, system._draftSource || "", options).catch(error => ({ok:false, error:String(error)}));
+      if (!result?.ok) { toast(result?.error || "Não foi possível iniciar o preenchimento.", true); return false; }
+      S.guideImageFill[imageFillKey] = result;
+      acompanharPreenchimentoImagens();
+      return true;
+    });
   });
   $("#atlas-undo-images")?.addEventListener("click", async (event) => {
     if (!system?.id) return;
@@ -2501,6 +2635,15 @@ function bindGuideAtlas(game) {
   root.querySelectorAll("[data-atlas-requirement]").forEach((input) => input.onchange = async () => { const result = await backend.updateGuideRequirement(S.activeSlug, system.id, input.dataset.edge, input.dataset.atlasRequirement, input.checked); if (!result?.ok) { input.checked = !input.checked; return toast(result?.error || "Falha ao salvar requisito.", true); } await rerender(); });
   $("#atlas-media")?.addEventListener("click", () => selected && openGuideMedia(selected.media_query || selected.label, { systemId: system.id, nodeId: selected.id, sourceId: system._draftSource || "" }));
   $("#atlas-replace-source")?.addEventListener("click", () => openAtlasSourceWizard(system));
+  $("#atlas-sources")?.addEventListener("click", () => viewAtlasSource(system.id, selected?.id || ""));
+  $("#atlas-reprocess-source")?.addEventListener("click", async () => {
+    if (S.mode === "demo") return toast("A demonstração não possui captura original para reprocessar.");
+    if (!system.source_id || system.source_id === "legacy-main") return openAtlasSourceWizard(system);
+    const result = await backend.atlasSourceReview(game.slug, system.source_id).catch(error => ({ok:false, error:String(error)}));
+    if (!result.ok) return toast(result.error || "Não foi possível abrir a fonte salva.", true);
+    if (!(result.review?.tables || []).length) return openAtlasSourceWizard(system);
+    openAtlasSourceReview(system.source_id, result.review, system.title);
+  });
   const deleteSystem = async () => {
     if (system._draftSource) return toast("Rejeite a prévia antes de excluir um sistema.", true);
     if (!window.confirm(`Excluir o sistema visual “${system.title}”? A fonte original ficará preservada para reimportação.`)) return;
@@ -2513,7 +2656,11 @@ function bindGuideAtlas(game) {
   $("#atlas-delete")?.addEventListener("click", deleteSystem);
   $("#atlas-delete-header")?.addEventListener("click", deleteSystem);
   $("[data-atlas-source]")?.addEventListener("click", () => viewAtlasSource(system.id, selected?.id || ""));
-  if (system?._draftSource) root.querySelectorAll('#atlas-goal,#atlas-image,#atlas-path,[data-atlas-requirement]').forEach(el => {el.disabled=true;el.title='Aprove o sistema antes de alterar progresso.';});
+  if (system?._draftSource) root.querySelectorAll('#atlas-goal,#atlas-image,[data-atlas-requirement]').forEach(el => {el.disabled=true;el.title='Aprove o sistema antes de alterar progresso.';});
+  const storedFill = S.guideImageFill[imageFillKey];
+  if (system && S.mode !== "demo" && (!storedFill || ["running", "queued", "waiting_retry"].includes(storedFill.phase))) {
+    acompanharPreenchimentoImagens();
+  }
 }
 
 function showMissableDetails(game) {

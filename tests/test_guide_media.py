@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import io
 
 import pytest
 from pypdf import PdfWriter
@@ -66,3 +67,29 @@ def test_openverse_preserva_atribuicao(monkeypatch):
     result = guide_media.GuideMediaLibrary.search("mapa", "openverse")
     assert result[0]["creator"] == "Autor" and result[0]["license"] == "cc0"
 
+
+@pytest.mark.parametrize("content", [b"<html>not an image</html>", PNG_1PX])
+def test_atlas_rejects_invalid_downloads_and_tracking_pixels(library, monkeypatch, content):
+    class Response:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def raise_for_status(self): pass
+        def iter_content(self, _size): yield content
+    monkeypatch.setattr(guide_media, "_safe_remote_url", lambda url: url)
+    monkeypatch.setattr(guide_media.requests, "get", lambda *_args, **_kwargs: Response())
+    with pytest.raises(guide_media.GuideMediaError, match="imagem válida"):
+        library.approve_remote("jogo", {"url": "https://cdn.test/Agumon.png"}, True, validate_bitmap=True)
+    assert library.list("jogo") == []
+
+
+def test_local_image_association_requires_existing_file(library):
+    from PIL import Image
+    stream = io.BytesIO()
+    Image.new("RGB", (16, 16)).save(stream, format="PNG")
+    item = library.add_local("jogo", base64.b64encode(stream.getvalue()).decode(), "art.png")
+    assert library.available("jogo", item["id"])
+    assert not library.available("jogo", "unknown")
+    (library.assets_root / "jogo" / item["url"].rsplit("/", 1)[-1]).unlink()
+    assert not library.available("jogo", item["id"])

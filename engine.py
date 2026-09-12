@@ -50,6 +50,7 @@ import rawg
 import smart_guide
 import source_document
 import atlas_images
+import atlas_image_fill
 import item_catalog
 import source_import
 import source_store
@@ -2566,7 +2567,7 @@ class Api(ExperienceApi, DataToolsApi):
             self._guides.update_system_source(slug, source_id,
                                               selection=chosen,
                                               edition_warning=review.get("edition_warning") or "")
-            replace_system_id = source.get("replace_system_id") or ""
+            replace_system_id = source.get("replace_system_id") or source.get("system_id") or ""
             return self._queue_atlas_source(slug, source, source.get("title") or "Sistema visual",
                                             replace_system_id, start=True, selection=chosen)
         except smart_guide.SmartGuideError as exc:
@@ -2968,7 +2969,8 @@ class Api(ExperienceApi, DataToolsApi):
             return {"ok": False, "error": str(exc)}
 
     def search_guide_system_media(self, slug: str, system_id: str, node_id: str,
-                                  query: str = "", page: int = 0, source_id: str = '') -> dict:
+                                  query: str = "", page: int = 0, source_id: str = '',
+                                  options: dict | None = None) -> dict:
         game = load_game_file(GAMES_DIR / f"{slug}.json")
         try:
             system = self._guides.media_system(slug, system_id, source_id)
@@ -2977,98 +2979,129 @@ class Api(ExperienceApi, DataToolsApi):
         node = next((item for item in (system or {}).get("nodes") or [] if item.get("id") == node_id), None)
         if not game or not node:
             return {"ok": False, "error": "Nó do sistema não encontrado.", "results": []}
-        # Atlas entities use only the label (for example ``Agumon``). The
-        # game/platform suffix remains reserved for cover/background searches.
-        term = atlas_images.entity_query(node.get("label", ""), query)
+        saved = self._guides.image_fill_job(slug, system_id, source_id)
+        try:
+            settings = atlas_images.normalize_options(options if options is not None else saved.get("options"))
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "results": []}
+        term = atlas_images.entity_query(node.get("label", ""), query, options=settings)
         result = self.search_web_images(slug, term, page, "moderate", "entity", "google")
+        result["results"] = atlas_images.rank_candidates(result.get("results") or [], node.get("label", ""), settings)
         result["system_id"] = system_id
         result["node_id"] = node_id
         result["query"] = term
         return result
 
     def start_guide_system_image_fill(self, slug: str, system_id: str,
-                                      source_id: str = "") -> dict:
+                                      source_id: str = "", options: dict | None = None) -> dict:
         """Preenche cards sem imagem em segundo plano; edições existentes vencem."""
         game = load_game_file(GAMES_DIR / f"{slug}.json")
         if not game:
             return {"ok": False, "error": "Jogo não encontrado."}
         try:
             system = self._guides.media_system(slug, system_id, source_id)
-        except smart_guide.SmartGuideError as exc:
+            previous = self._guides.image_fill_job(slug, system_id, source_id)
+            settings = atlas_images.normalize_options(options if options is not None else previous.get("options"))
+        except (smart_guide.SmartGuideError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
         key = f"images:{slug}:{system_id}:{source_id}"
         with self._atlas_job_lock:
             running = self._atlas_ai_status.get(key) or {}
-            if running.get("phase") == "running":
+            if running.get("phase") in atlas_image_fill.ACTIVE_PHASES:
                 return dict(running)
-            nodes = [node for node in system.get("nodes") or [] if not node.get("spoiler")]
-            state = self._guides.system_state(slug)
-            existing = state.get("node_media") or {}
-            draft_media = {}
-            if source_id:
-                draft_media = (self._guides.atlas_draft(slug, source_id) or {}).get("node_media") or {}
-            pending = [node for node in nodes if not (
-                existing.get(f"{system_id}:{node.get('id')}")
-                or draft_media.get(node.get("id"))
-                or node.get("media_id") or node.get("image")
-            )]
-            task = {"ok": True, "phase": "running", "slug": slug, "system_id": system_id,
+            resume = previous.get("options") == settings and previous.get("phase") != "complete"
+            task = {**(previous if resume else {}), "ok": True, "phase": "running", "slug": slug, "system_id": system_id,
                     "source_id": source_id, "job_id": uuid.uuid4().hex,
-                    "total": len(pending), "completed": 0,
-                    "filled": 0, "empty": 0, "failed": 0, "changes": [],
+                    "options": settings, "total": len(system.get("nodes") or []),
                     "message": "Preenchendo imagens…", "cancel_requested": False}
             self._atlas_ai_status[key] = task
+            self._guides.save_image_fill_job(slug, system_id, source_id, task)
         threading.Thread(target=self._guide_system_image_fill_worker,
-                         args=(slug, system_id, source_id, pending, key), daemon=True).start()
+                         args=(slug, system_id, source_id, [], key), daemon=True).start()
         return dict(task)
 
     def _guide_system_image_fill_worker(self, slug: str, system_id: str, source_id: str,
                                         nodes: list[dict], key: str) -> None:
         task = self._atlas_ai_status.get(key) or {}
-        for node in nodes:
+        def cancelled():
+            return bool((self._atlas_ai_status.get(key) or {}).get("cancel_requested"))
+
+        def wait(seconds):
+            until = time.monotonic() + seconds
+            while not cancelled() and time.monotonic() < until:
+                time.sleep(min(.25, max(0, until - time.monotonic())))
+            return cancelled()
+
+        def persist(value):
             with self._atlas_job_lock:
-                if (self._atlas_ai_status.get(key) or {}).get("cancel_requested"):
-                    task["phase"] = "cancelled"; break
-            label = str(node.get("label") or "").strip()
-            try:
-                result = self.search_guide_system_media(slug, system_id, node.get("id", ""), label, 0, source_id)
-                candidates = atlas_images.rank_candidates(result.get("results") or [], label)
-                if not candidates:
-                    task["empty"] = int(task.get("empty") or 0) + 1
-                else:
-                    approved = self._guide_media.approve_remote(slug, candidates[0], True)
-                    if source_id:
-                        previous_id = ((self._guides.atlas_draft(slug, source_id) or {}).get("node_media") or {}).get(node.get("id", ""), "")
-                    else:
-                        previous_id = (self._guides.system_state(slug).get("node_media") or {}).get(f"{system_id}:{node.get('id', '')}", "")
-                    self._guides.set_system_media(slug, system_id, node.get("id", ""), approved.get("id", ""), source_id)
-                    task.setdefault("changes", []).append({"node_id": node.get("id", ""),
-                                                             "previous_media_id": previous_id,
-                                                             "media_id": approved.get("id", ""),
-                                                             "job_id": task.get("job_id", "")})
-                    task["filled"] = int(task.get("filled") or 0) + 1
-            except Exception:
-                task["failed"] = int(task.get("failed") or 0) + 1
-            task["completed"] = int(task.get("completed") or 0) + 1
-            with self._atlas_job_lock: self._atlas_ai_status[key] = dict(task)
-            time.sleep(1.0)
-        with self._atlas_job_lock:
-            if task.get("phase") == "running": task["phase"] = "complete"
-            task["message"] = "Preenchimento de imagens concluído." if task.get("phase") == "complete" else "Preenchimento cancelado."
-            self._atlas_ai_status[key] = dict(task)
+                value["cancel_requested"] = cancelled()
+                self._atlas_ai_status[key] = dict(value)
+                # The worker may publish one last checkpoint after Pause. Keep
+                # the on-disk state paused even if it has not left its loop yet.
+                saved = {**value, "phase": "cancelled"} if value["cancel_requested"] else value
+                self._guides.save_image_fill_job(slug, system_id, source_id, saved)
+            self._refresh_smart_bundle(slug)
+
+        def current_media(node_id):
+            if source_id:
+                return (self._guides.atlas_draft(slug, source_id).get("node_media") or {}).get(node_id, "")
+            return self._guides.system_state(slug)["node_media"].get(f"{system_id}:{node_id}", "")
+
+        def search(node, attempt, settings):
+            label = str(node.get("label") or "")
+            if attempt == 1:
+                direct = atlas_images.source_candidates(captured_source, label, settings)
+                if direct:
+                    return direct
+            variants = (label, f"{label} artwork", f"{label} transparent png")
+            term = atlas_images.entity_query(label, variants[((attempt - 1) // 3) % 3], options=settings)
+            provider = ("google", "yandex", "bing")[(attempt - 1) % 3]
+            result = self.search_web_images(slug, term, ((attempt - 1) // 9) % 11, "moderate", "entity", provider)
+            return result.get("results") or []
+
+        try:
+            system = self._guides.media_system(slug, system_id, source_id)
+            capture_id = source_id or system.get("source_id") or ""
+            captured_source = self._guides.system_source(slug, capture_id, include_sections=True) if capture_id else {}
+            editorial_labels = [element["path"][-1]
+                for page in (captured_source.get("structured") or {}).get("pages") or []
+                for element in page.get("elements") or [] if element.get("path")]
+            atlas_image_fill.run(task,
+                nodes=lambda: self._guides.media_system(slug, system_id, source_id).get("nodes") or [],
+                current_media=current_media, search=search,
+                is_valid_media=lambda media: self._guide_media.available(slug, media),
+                known_labels=editorial_labels,
+                approve=lambda candidate: self._guide_media.approve_remote(slug, candidate, True, validate_bitmap=True),
+                associate=lambda node, media, expected: self._guides.set_system_media_if_current(
+                    slug, system_id, node, media, expected, source_id),
+                cancelled=cancelled, persist=persist, wait=wait)
+        except Exception:
+            task.update(phase="interrupted", message="A fila foi salva. Retome o preenchimento para continuar.")
+            with self._atlas_job_lock:
+                self._atlas_ai_status[key] = dict(task)
+            self._guides.save_image_fill_job(slug, system_id, source_id, task)
         self._refresh_smart_bundle(slug)
 
     def get_guide_system_image_fill(self, slug: str, system_id: str, source_id: str = "") -> dict:
         key = f"images:{slug}:{system_id}:{source_id}"
+        if key not in self._atlas_ai_status:
+            saved = self._guides.image_fill_job(slug, system_id, source_id)
+            if saved.get("phase") in atlas_image_fill.ACTIVE_PHASES and not saved.get("cancel_requested"):
+                return self.start_guide_system_image_fill(slug, system_id, source_id)
+            if saved.get("cancel_requested"):
+                saved["phase"] = "cancelled"
+            if saved:
+                self._atlas_ai_status[key] = saved
         return dict(self._atlas_ai_status.get(key) or {"ok": True, "phase": "idle", "completed": 0, "total": 0})
 
     def cancel_guide_system_image_fill(self, slug: str, system_id: str, source_id: str = "") -> dict:
         key = f"images:{slug}:{system_id}:{source_id}"
         with self._atlas_job_lock:
             task = self._atlas_ai_status.get(key)
-            if not task or task.get("phase") != "running": return {"ok": False, "error": "Nenhum preenchimento em andamento."}
+            if not task or task.get("phase") not in atlas_image_fill.ACTIVE_PHASES: return {"ok": False, "error": "Nenhum preenchimento em andamento."}
             task["cancel_requested"] = True; task["message"] = "Cancelando…"
             self._atlas_ai_status[key] = dict(task)
+            self._guides.save_image_fill_job(slug, system_id, source_id, {**task, "phase": "cancelled"})
         return dict(task)
 
     def undo_guide_system_image_fill(self, slug: str, system_id: str, source_id: str = "",
@@ -3082,7 +3115,7 @@ class Api(ExperienceApi, DataToolsApi):
         if job_id and job_id != task.get("job_id"):
             return {"ok": False, "error": "O lote de imagens já não é o último lote."}
         reverted = preserved = 0
-        for change in task.get("changes") or []:
+        for change in reversed(task.get("changes") or []):
             node_id = str(change.get("node_id") or "")
             if not node_id:
                 continue
@@ -3095,14 +3128,17 @@ class Api(ExperienceApi, DataToolsApi):
                 if current_id != change.get("media_id"):
                     preserved += 1
                     continue
-                self._guides.set_system_media(slug, system_id, node_id,
-                                              change.get("previous_media_id") or "", source_id)
-                reverted += 1
+                if self._guides.set_system_media_if_current(slug, system_id, node_id,
+                        change.get("previous_media_id") or "", current_id, source_id):
+                    reverted += 1
+                else:
+                    preserved += 1
             except smart_guide.SmartGuideError:
                 preserved += 1
         task["undo"] = {"reverted": reverted, "preserved": preserved}
         with self._atlas_job_lock:
             self._atlas_ai_status[key] = task
+            self._guides.save_image_fill_job(slug, system_id, source_id, task)
         self._refresh_smart_bundle(slug)
         return {"ok": True, **task["undo"], "job_id": task.get("job_id", "")}
 

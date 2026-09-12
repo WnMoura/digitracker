@@ -90,6 +90,20 @@ class GuideMediaLibrary:
         except (OSError, ValueError):
             return []
 
+    def available(self, slug: str, media_id: str) -> bool:
+        """A stale association is not evidence that a card has a local image."""
+        item = next((row for row in self.list(slug) if row.get("id") == media_id), None)
+        if not item:
+            return False
+        filename = str(item.get("url") or "").rsplit("/", 1)[-1]
+        if not filename or Path(filename).name != filename:
+            return False
+        image = self._asset_dir(slug) / filename
+        try:
+            return image.is_file() and image.stat().st_size > 0
+        except OSError:
+            return False
+
     def _save_item(self, slug: str, data: bytes, extension: str, metadata: dict) -> dict:
         if not data or len(data) > MAX_IMAGE_BYTES:
             raise GuideMediaError("Imagem vazia ou maior que 20 MB.")
@@ -229,7 +243,8 @@ class GuideMediaLibrary:
             raise GuideMediaError(f"Falha ao buscar imagens: {exc}") from exc
         raise GuideMediaError("Fonte de mídia desconhecida.")
 
-    def approve_remote(self, slug: str, candidate: dict, rights_confirmed: bool = False) -> dict:
+    def approve_remote(self, slug: str, candidate: dict, rights_confirmed: bool = False,
+                       *, validate_bitmap: bool = False) -> dict:
         if not isinstance(candidate, dict):
             raise GuideMediaError("Resultado de mídia inválido.")
         source = str(candidate.get("source") or "manual")
@@ -266,6 +281,15 @@ class GuideMediaLibrary:
                 data = b"".join(chunks)
         except requests.RequestException as exc:
             raise GuideMediaError(f"Não foi possível baixar a imagem: {exc}") from exc
+        if validate_bitmap:
+            try:
+                from PIL import Image
+                with Image.open(io.BytesIO(data)) as decoded:
+                    if min(decoded.size) < 8 or decoded.format not in {"PNG", "JPEG", "WEBP", "GIF", "BMP", "AVIF"}:
+                        raise ValueError("tracking pixel")
+                    decoded.verify()
+            except Exception as exc:
+                raise GuideMediaError("O arquivo não contém uma imagem válida para o Atlas.") from exc
         return self._save_item(slug, data, _extension(final_url, mime), {
             "type": "image", "title": str(candidate.get("title") or "Imagem")[:500],
             "source": source, "source_name": str(candidate.get("provider") or source),

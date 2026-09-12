@@ -22,6 +22,7 @@ from functools import wraps
 from pathlib import Path
 
 import atlas_model
+import atlas_entities
 
 # Keep the walkthrough document schema stable for existing installs. Typed
 # Atlas rules use the additive version below and remain readable by schema 3
@@ -646,6 +647,50 @@ def default_progress() -> dict:
     }
 
 
+def reconcile_system_ids(candidate: dict, previous: dict) -> dict:
+    """Reuse IDs only for the same entity/path; old combined cards never leak media."""
+    result = deepcopy(candidate)
+    result["id"] = previous["id"]
+    old_nodes = {atlas_entities.identity(node.get("label")): node for node in previous.get("nodes") or []}
+    used, node_ids = set(), {}
+    reserved = {node["id"] for node in previous.get("nodes") or []}
+    for node in result.get("nodes") or []:
+        raw_id, key = node.get("id", ""), atlas_entities.identity(node.get("label"))
+        old = old_nodes.get(key)
+        if old and old["id"] not in used:
+            node["id"] = old["id"]
+        else:
+            node["id"] = _stable_id("node", previous["id"], key, "reprocess")
+            while node["id"] in used or node["id"] in reserved:
+                node["id"] = _stable_id("node", node["id"], len(used))
+        used.add(node["id"])
+        node_ids[raw_id] = node["id"]
+
+    def req_signature(req):
+        return atlas_model.requirement_identity(req)
+
+    def edge_signature(edge):
+        return (edge.get("from"), edge.get("to"), tuple(sorted(req_signature(req) for req in edge.get("requirements") or [])))
+
+    old_edges = {edge_signature(edge): edge for edge in previous.get("edges") or []}
+    for edge in result.get("edges") or []:
+        edge["from"] = node_ids.get(edge.get("from"), edge.get("from"))
+        edge["to"] = node_ids.get(edge.get("to"), edge.get("to"))
+        old = old_edges.get(edge_signature(edge))
+        if old:
+            edge["id"] = old["id"]
+            old_reqs = {req_signature(req): req for req in old.get("requirements") or []}
+            for req in edge.get("requirements") or []:
+                match = old_reqs.get(req_signature(req))
+                if match:
+                    req["id"] = match["id"]
+        else:
+            edge["id"] = _stable_id("edge", result["id"], edge_signature(edge), "reprocess")
+            for req in edge.get("requirements") or []:
+                req["id"] = _stable_id("req", edge["id"], req_signature(req))
+    return result
+
+
 def default_system_state() -> dict:
     return {
         "schema_version": SCHEMA_VERSION, "active_system": "", "goals": {},
@@ -1080,6 +1125,10 @@ class SmartGuideStore:
             raise SmartGuideError("Análise cancelada ou substituída.")
         candidate = deepcopy(system)
         candidate.update(source_id=source_id, origin="ai", status="suggested")
+        previous = next((item for item in self.current(slug).get("systems") or []
+                         if item.get("id") == source.get("replace_system_id")), None)
+        if previous:
+            candidate = reconcile_system_ids(candidate, previous)
         normalized = _validate_systems({"systems": [candidate]})
         if len(normalized) != 1:
             raise SmartGuideError("A fonte precisa documentar ao menos dois nós e uma relação.")
@@ -1209,6 +1258,28 @@ class SmartGuideStore:
             if _clean_text(key, 180)
         }
         return base
+
+    def image_fill_job(self, slug: str, system_id: str, source_id: str = "") -> dict:
+        key = hashlib.sha256(f"{system_id}:{source_id}".encode()).hexdigest()[:24]
+        return _read_json(self._path(slug, f"image_jobs/{key}.json"), {})
+
+    @_serialized
+    def save_image_fill_job(self, slug: str, system_id: str, source_id: str, job: dict) -> None:
+        key = hashlib.sha256(f"{system_id}:{source_id}".encode()).hexdigest()[:24]
+        _atomic_json(self._path(slug, f"image_jobs/{key}.json"), deepcopy(job))
+
+    @_serialized
+    def set_system_media_if_current(self, slug: str, system_id: str, node_id: str,
+                                    media_id: str, expected: str, source_id: str = "") -> bool:
+        self.media_system(slug, system_id, source_id)
+        if source_id:
+            current = (self.atlas_draft(slug, source_id).get("node_media") or {}).get(node_id, "")
+        else:
+            current = self.system_state(slug)["node_media"].get(f"{system_id}:{node_id}", "")
+        if current != expected:
+            return False
+        self.set_system_media(slug, system_id, node_id, media_id, source_id)
+        return True
 
     def _save_system_state(self, slug: str, state: dict) -> dict:
         state = {**default_system_state(), **dict(state or {})}

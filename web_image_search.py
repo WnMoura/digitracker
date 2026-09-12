@@ -187,11 +187,14 @@ _QUERY_NOISE = {
     "playstation", "ps", "psx", "ps1", "ps2", "ps3", "ps4", "ps5",
     "xbox", "nintendo", "gamecube", "switch", "windows", "steam", "pc",
     "1920x1080", "1080p", "4k",
+    "artwork", "render", "portrait", "transparent",
 }
 
 
 def _search_terms(query: str) -> list[str]:
-    normalized = unicodedata.normalize("NFKD", str(query or "")) \
+    # Search operators constrain the provider; they are not entity/title words.
+    query = re.sub(r"\b(?:site|filetype):\S+", "", str(query or ""), flags=re.I)
+    normalized = unicodedata.normalize("NFKD", query) \
         .encode("ascii", "ignore").decode().lower()
     return [token for token in re.findall(r"[a-z0-9]+", normalized)
             if len(token) > 1 and token not in _QUERY_NOISE]

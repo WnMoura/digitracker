@@ -634,3 +634,73 @@ def test_atlas_checkpoint_is_atomic_and_owned_by_active_worker(tmp_path):
     assert store.clear_atlas_checkpoint("game", source_id, "job-antigo") is False
     assert store.clear_atlas_checkpoint("game", source_id, "job-a") is True
     assert store.atlas_checkpoint("game", source_id) == {}
+
+
+def test_origin_list_corroborates_existing_routes_and_keeps_one_card_per_entity():
+    source = _structured_atlas_source([
+        ("evo-a", ["Rookie Digimon", "Agumon"], ["Evolution", "HP"], [["Greymon", "1000"]]),
+        ("evo-b", ["Rookie Digimon", "Guilmon"], ["Evolution", "HP"], [["Greymon", "900"]]),
+        ("reverse", ["Champion Digimon", "Greymon"], ["Evolves from"], [["Agumon*, Guilmon, Agumon"]]),
+        ("repeat", ["Rookie Digimon", "Agumon"], ["Evolution", "HP"], [["Greymon", "1000"]]),
+    ])
+    maps = {key: {"kind": "evolution", "source_from_context": True, "target_column": 0, "condition_columns": [1]}
+            for key in ("evo-a", "evo-b", "repeat")}
+    maps["reverse"] = {"kind": "reverse_origin", "source_column": 0, "target_from_context": True}
+    fragment, quality = guide_ai._materialize_structured_atlas(source, "Evoluções", {}, maps)
+    assert {node["label"] for node in fragment["nodes"]} == {"Agumon", "Guilmon", "Greymon"}
+    assert len(fragment["edges"]) == 2
+    assert all(edge["requirements"] for edge in fragment["edges"])
+    assert quality["covered_rows"] == quality["selected_rows"] == 4
+    assert quality["complete"] and len(quality["row_outcomes"]) == 4
+    assert next(node for node in fragment["nodes"] if node["label"] == "Greymon")["stage"] == "Champion"
+
+
+def test_alternative_endpoints_count_source_row_once_and_keep_operators():
+    source = _structured_atlas_source([
+        ("evo-list", ["Rookie", "Agumon"], ["Evolution", "Weight"],
+         [["Greymon, Birdramon", "25 or more"], ["Greymon", "25 or less"]]),
+    ])
+    fragment, quality = guide_ai._materialize_structured_atlas(source, "Evoluções", {}, {
+        "evo-list": {"kind": "evolution", "source_from_context": True, "target_column": 0, "condition_columns": [1]}})
+    assert len(fragment["nodes"]) == 3 and len(fragment["edges"]) == 3
+    assert quality["selected_rows"] == quality["covered_rows"] == 2
+    assert {edge["requirements"][0]["operator"] for edge in fragment["edges"]} == {">=", "<="}
+
+
+def test_image_job_survives_store_restart_and_manual_edit_wins(store):
+    saved = store.save_system("game", system())["system"]
+    sid, node = saved["id"], saved["nodes"][0]["id"]
+    store.save_image_fill_job("game", sid, "", {"phase": "waiting_retry", "pending_ids": [node]})
+    assert smart_guide.SmartGuideStore(store.root).image_fill_job("game", sid)["pending_ids"] == [node]
+    store.set_system_media("game", sid, node, "manual")
+    assert store.set_system_media_if_current("game", sid, node, "automatic", "") is False
+    assert store.system_state("game")["node_media"][f"{sid}:{node}"] == "manual"
+
+
+def test_reprocess_reuses_only_same_entity_path_and_progress(store):
+    original = system()
+    original["status"] = "approved"
+    original["nodes"].append({"id": "combined", "label": "Agumon*, Guilmon", "source_refs": original["source_refs"]})
+    saved = store.save_system("game", original)["system"]
+    sid = saved["id"]
+    node_id, combined_id = saved["nodes"][0]["id"], saved["nodes"][2]["id"]
+    requirement_id = saved["edges"][0]["requirements"][0]["id"]
+    store.set_system_media("game", sid, node_id, "kept-image")
+    store.set_system_media("game", sid, combined_id, "wrong-composite-image")
+    store.set_system_goal("game", sid, node_id)
+    store.update_requirement("game", sid, saved["edges"][0]["id"], requirement_id, True)
+    source_id = pending(store)
+    store.update_system_source("game", source_id, replace_system_id=sid)
+    fresh = system()
+    fresh["nodes"].extend({"id": label, "label": label, "source_refs": fresh["source_refs"]}
+                          for label in ("Agumon", "Guilmon"))
+    draft = store.save_atlas_draft("game", source_id, fresh, "job1")
+    assert draft["system"]["nodes"][0]["id"] == node_id
+    assert draft["system"]["edges"][0]["requirements"][0]["id"] == requirement_id
+    assert len(store.current("game")["systems"][0]["nodes"]) == 3
+    result = store.approve_atlas_draft("game", source_id)
+    assert result["system"]["id"] == sid
+    state = store.system_state("game")
+    assert state["node_media"][f"{sid}:{node_id}"] == "kept-image"
+    assert state["goals"][sid] == node_id and requirement_id in state["completed_requirements"]
+    assert all(f"{sid}:{node['id']}" not in state["node_media"] for node in result["system"]["nodes"][-2:])

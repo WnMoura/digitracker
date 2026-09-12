@@ -36,6 +36,7 @@ import requests
 import guide_parser
 import smart_guide
 import atlas_model
+import atlas_entities
 
 MAX_TOKENS = 16000
 TIMEOUT = 300           # guias longos levam minutos
@@ -53,7 +54,7 @@ ATLAS_BATCH_MAX_BLOCKS = 24
 # cannot silently be reused with different table semantics.
 # Changes to this value invalidate Atlas batch checkpoints. It is additive to
 # smart_guide.SCHEMA_VERSION so old walkthrough documents remain readable.
-ATLAS_EXTRACTION_VERSION = 4
+ATLAS_EXTRACTION_VERSION = 5
 
 # Só o Atlas usa fallback automático, e somente quando o usuário não fixou um
 # modelo. Uma escolha explícita nunca é trocada silenciosamente.
@@ -1167,6 +1168,13 @@ Use -1 quando uma coluna não existe e marque source_from_context ou
 target_from_context conforme necessário. Tabelas de índice, texto e navegação
 são unrelated/reference. Não extraia relações nem reescreva valores: o
 aplicativo fará isso localmente preservando células vazias, hífens e zeros.
+Uma célula pode conter uma lista de origens ou destinos. Mapeie a coluna da
+lista sem concatená-la ao título. Em tabelas de Chart View, Previous ... Forms
+é a coluna de origens e a coluna de estágio (Rookie/Champion/etc.) é o destino;
+ambos vêm de células, não do título da tabela. As colunas numéricas continuam
+sendo condições. Listas sem condições do tipo Evolves from apenas corroboram
+rotas detalhadas já documentadas. O aplicativo separará alternativas e juntará
+repetições idênticas; não troque uma combinação simultânea por alternativas.
 
 Uma tabela com kind=requirement NUNCA cria uma relação nem um nó para cada célula:
 use source_column=-1, target_column=-1 e deixe source_from_context e
@@ -1887,17 +1895,7 @@ def _atlas_identity(value: object) -> str:
 
 def _atlas_requirement_identity(requirement: object) -> str:
     """Identidade de requisito que preserva operador, valor e escopo."""
-    if not isinstance(requirement, dict):
-        return _atlas_identity(requirement)
-    value = {
-        "field": _atlas_identity(requirement.get("field")),
-        "operator": str(requirement.get("operator") or "="),
-        "value": str(requirement.get("value") if requirement.get("value") is not None else ""),
-        "mode": str(requirement.get("mode") or ""),
-        "group": str(requirement.get("group") or "all"),
-        "text": _atlas_identity(requirement.get("text")),
-    }
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return atlas_model.requirement_identity(requirement)
 
 
 def _merge_refs(*groups: list) -> list[dict]:
@@ -2077,7 +2075,11 @@ def _structured_tables(source: dict) -> list[dict]:
         for element in document.get("elements") or []:
             if element.get("type") != "table":
                 continue
-            headers = [item.get("text", "") for item in element.get("headers") or []]
+            headers = [""] * max(1, int(element.get("columns") or 1))
+            for index, item in enumerate(element.get("headers") or []):
+                start = int(item.get("column", index))
+                for column in range(start, min(len(headers), start + int(item.get("colspan") or 1))):
+                    headers[column] = str(item.get("text") or "")
             samples = []
             for row in (element.get("rows") or [])[:4]:
                 cells = _structured_row_values({"columns": element.get("columns", 0),
@@ -2177,6 +2179,21 @@ def _structured_ref_lookup(source: dict) -> dict[tuple[str, str], dict]:
     return lookup
 
 
+def _structured_endpoint_cell(table: dict, row: dict, column: int) -> dict:
+    """Resolve the original cell, including rowspan, to retain its links."""
+    row_index = int(row.get("index") or 0)
+    for previous in reversed(table.get("rows") or []):
+        index = int(previous.get("index") or 0)
+        if index > row_index:
+            continue
+        for cell in previous.get("cells") or []:
+            start = int(cell.get("column") or 0)
+            if (start <= column < start + int(cell.get("colspan") or 1)
+                    and index <= row_index < index + int(cell.get("rowspan") or 1)):
+                return cell
+    return {}
+
+
 def _structured_value_is_empty(value: object) -> bool:
     text = str(value or "").strip().casefold()
     # FAQs commonly use -, ---, em dashes or en dashes interchangeably for a
@@ -2247,8 +2264,7 @@ def _structured_table_semantic_role(table: dict, mapping_kind: str = "") -> str:
         or any(token in _atlas_identity(header) for token in ("evolution", "digivolve"))
         for header in headers
     )
-    reverse_header = any("evolve from" in _atlas_identity(header)
-                         or "digivolve from" in _atlas_identity(header)
+    reverse_header = any(re.search(r"(?:digi)?e?volves? from|(?:digi)?e?volutions? from", _atlas_identity(header))
                          for header in headers)
     requirement_header = bool(header_ids & {
         _atlas_identity(value) for value in _ATLAS_REQUIREMENT_HEADER_MARKERS
@@ -2362,7 +2378,7 @@ def _structured_requirement(header: str, value: str, ref: dict) -> dict:
     raw = str(value or "").strip()
     field = str(header or "Condição").strip() or "Condição"
     operator = "="
-    if field.casefold() in {"quota", "cota", "decode quota", "quota decode"}:
+    if field.casefold() in {"quo", "quota", "cota", "decode quota", "quota decode"}:
         requirement = {"id": "", "text": f"{field}: {value} (semântica da cota não determinada)",
                        "field": field, "operator": "unknown", "value": _structured_typed_value(raw),
                        "original": str(value), "group": "all", "source_refs": [ref]}
@@ -2389,6 +2405,8 @@ def _structured_requirement(header: str, value: str, ref: dict) -> dict:
         operator = ">=" if re.search(r"or\s+more", str(value), re.I) else "<="
         raw = number
     typed_value = _structured_typed_value(raw)
+    if operator in {">", ">=", "<", "<="} and isinstance(typed_value, (int, float)):
+        group = "all"  # 'or more' is a comparison, not an alternative condition.
     requirement = {"id": "", "text": f"{field}: {value}", "field": field,
                    "operator": operator, "value": typed_value, "original": str(value),
                    "group": group,
@@ -2512,16 +2530,19 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
         selected = {table["table_id"] for table in tables}
     refs = _structured_ref_lookup(source)
     fragment = {"id": "atlas-structured", "title": system_title or "Sistema visual",
-                "description": "Relações materializadas localmente a partir das tabelas estruturadas.",
+                "description": "Explore as rotas e consulte os requisitos documentados na fonte.",
                 "group_label": "Grupo", "layout": "layered", "origin": "ai",
                 "status": "suggested", "source_refs": [], "nodes": [], "edges": []}
-    node_by_key, edge_keys, edge_by_key = {}, set(), {}
+    node_by_key, edge_by_key = {}, {}
     pending, pending_items, warning_items = [], [], []
     issue_keys = set()
     relation_rows = selected_rows = covered_rows = excluded_rows = 0
     requirement_entries = []
     requirements_by_entity = {}
     relation_tables = []
+    known_labels = [_structured_requirement_context_label(table) for table in tables]
+    covered_relation_rows = set()
+    row_outcomes = {}
 
     def table_title(table: dict) -> str:
         path = table.get("path") or []
@@ -2588,7 +2609,7 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
             warning_items.append(item)
 
     def node_for(label: str, ref: dict) -> str:
-        label = str(label or "").strip()
+        label = atlas_entities.clean_label(label)
         key = _atlas_identity(label)
         if not key:
             return ""
@@ -2598,9 +2619,7 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
         node = {"id": f"node-{len(fragment['nodes']) + 1}", "label": label,
                 "card_number": len(fragment["nodes"]) + 1,
                 "subtitle": "", "stage": "", "group": "", "tags": [],
-                # Entity image lookup is intentionally label-only. Contextual
-                # game/platform suffixes are reserved for cover/background
-                # searches and make Atlas results noisy.
+                # Optional image context belongs to the user's search settings.
                 "attributes": [], "media_query": re.sub(r"\s+", " ", label).strip(),
                 "spoiler": False, "source_refs": [ref]}
         fragment["nodes"].append(node)
@@ -2615,18 +2634,21 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
                           "Reimporte a fonte para reconstruir esta linha.", row_number=row_index + 1)
                 continue
             cells = row.get("cells") or []
-            if cells and (row_index == 0 or all(cell.get("tag") == "th" for cell in cells)):
+            values = _structured_row_values(table, row)
+            reverse_inline = (len(cells) >= 2 and _structured_table_semantic_role(table) == "reverse_origin"
+                              and any(cell.get("tag") != "th" for cell in cells))
+            repeated_header = [str(value).strip().casefold() for value in values] == [
+                str(value).strip().casefold() for value in table.get("headers") or []]
+            if cells and not reverse_inline and (row_index == 0 or all(cell.get("tag") == "th" for cell in cells) or repeated_header):
                 continue
-            yield row_index, row, _structured_row_values(table, row)
+            yield row_index, row, values
 
     def add_requirement_once(target: list[dict], requirement: dict) -> None:
-        key = (_atlas_identity(requirement.get("text")),
-               str(requirement.get("mode") or ""))
-        if not key[0]:
+        key = _atlas_requirement_identity(requirement)
+        if not requirement.get("text"):
             return
         for current in target:
-            if (_atlas_identity(current.get("text")),
-                    str(current.get("mode") or "")) == key:
+            if _atlas_requirement_identity(current) == key:
                 current["source_refs"] = _merge_refs(
                     current.get("source_refs") or [], requirement.get("source_refs") or [])
                 return
@@ -2721,7 +2743,9 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
             continue
         relation_tables.append((table, mapping, role))
 
-    for table, mapping, kind in relation_tables:
+    # Detailed destination tables run first. Reverse lists only corroborate
+    # those paths, instead of creating unconditional duplicate evolutions.
+    for table, mapping, kind in sorted(relation_tables, key=lambda entry: entry[2] == "reverse_origin"):
         table_id = str(table.get("table_id") or "")
         headers = table.get("headers") or []
         try:
@@ -2767,77 +2791,84 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
                     row=row, ref=ref, source_label=source_label, target_label=target_label,
                 )
                 continue
-            from_id, to_id = node_for(source_label, ref), node_for(target_label, ref)
-            if not from_id or not to_id or from_id == to_id:
-                add_issue(
-                    table, "invalid_relation",
-                    "A linha não produziu duas entidades diferentes para formar um caminho.",
-                    "Revise os nomes da origem/destino ou exclua a linha/tabela da seleção.",
-                    row=row, ref=ref, source_label=source_label, target_label=target_label,
-                    card_numbers=[node_by_key.get(_atlas_identity(source_label), {}).get("card_number", 0),
-                                  node_by_key.get(_atlas_identity(target_label), {}).get("card_number", 0)],
-                )
+            sources, source_error = atlas_entities.split_entities(source_label,
+                cell=_structured_endpoint_cell(table, row, source_col), known_labels=known_labels)
+            targets, target_error = atlas_entities.split_entities(target_label,
+                cell=_structured_endpoint_cell(table, row, target_col), known_labels=known_labels)
+            if source_error or target_error:
+                add_issue(table, "ambiguous_entity_list", source_error or target_error,
+                          "Confira a lista na fonte e indique os participantes; nenhum card combinado foi criado.",
+                          row=row, ref=ref, source_label=source_label, target_label=target_label)
                 continue
-            requirements = []
-            columns = condition_cols or [index for index in range(len(cells))
-                                         if index not in {source_col, target_col}]
-            for column in columns:
-                if column < 0 or column >= len(cells) or _structured_value_is_empty(cells[column]):
-                    continue
-                header = headers[column] if column < len(headers) else f"Coluna {column + 1}"
-                if _structured_is_item_marker(header, cells[column]):
-                    continue
-                add_requirement_once(requirements,
-                                     _structured_requirement(header, cells[column], ref))
-            # Requisitos de item/Jogress/Reencarnação vivem na tabela da entidade
-            # destino, mas devem aparecer em cada rota que chega a esse destino.
-            target_requirements = requirements_by_entity.get(_atlas_identity(target_label), [])
-            for entry in target_requirements:
-                applies_to = entry["requirement"].get("applies_to") or []
-                if applies_to and not any(_atlas_identity(label) == _atlas_identity(source_label)
-                                          for label in applies_to):
-                    # A destination can have several incoming paths. An item
-                    # mentioning a specific participant belongs only to that
-                    # participant; do not copy it to every route.
-                    continue
-                add_requirement_once(requirements, entry["requirement"])
-                entry["attached"] = True
-            for requirement in requirements:
-                if requirement.get("operator") == "unknown":
-                    add_issue(
-                        table, "unknown_requirement",
-                        f"A condição {requirement.get('field') or 'desconhecida'} não tem semântica determinada na fonte.",
-                        "Confirme a regra no trecho original; não transforme a condição em obrigatória por suposição.",
-                        row=row, ref=ref, severity="warning",
-                        card_numbers=[node_by_key.get(_atlas_identity(source_label), {}).get("card_number", 0),
-                                      node_by_key.get(_atlas_identity(target_label), {}).get("card_number", 0)],
-                        field=requirement.get("field"), value=requirement.get("original"),
-                    )
-            signature = tuple(sorted(_atlas_requirement_identity(item)
-                                     for item in requirements))
-            edge_key = (from_id, to_id, kind, signature)
-            label = str(mapping.get("note") or "").strip()[:300]
-            if not label:
-                label = requirement_label(requirements)
-            if edge_key in edge_keys:
-                existing = edge_by_key.get(edge_key)
-                if existing:
-                    existing["source_refs"] = _merge_refs(existing.get("source_refs") or [], [ref])
-                covered_rows += 1
-                continue
-            edge_keys.add(edge_key)
-            edge = {
-                "id": f"edge-{len(fragment['edges']) + 1}", "from": from_id, "to": to_id,
-                "label": label,
-                "path_kind": "alternative" if kind == "evolution" and signature else "normal",
-                "requirements": requirements, "missable": False, "spoiler": False,
-                "source_refs": [ref],
-            }
-            edge_by_key[edge_key] = edge
-            fragment["edges"].append(edge)
-            fragment["source_refs"] = _merge_refs(fragment["source_refs"], [ref])
-            relation_rows += 1
-            covered_rows += 1
+            row_key = (table_id, str(row.get("id") or ""))
+            row_edges = []
+            for source_name in sources:
+                for target_name in targets:
+                    from_id, to_id = node_for(source_name, ref), node_for(target_name, ref)
+                    if not from_id or not to_id or from_id == to_id:
+                        add_issue(table, "invalid_relation", "A linha aponta uma entidade para ela mesma.",
+                                  "Confirme se a fonte documenta uma transformação ou apenas repete um nome.",
+                                  row=row, ref=ref)
+                        continue
+                    requirements = []
+                    columns = condition_cols or ([index for index in range(len(cells))
+                        if index not in {source_col, target_col}] if kind != "reverse_origin" else [])
+                    for column in columns:
+                        if column < 0 or column >= len(cells) or _structured_value_is_empty(cells[column]):
+                            continue
+                        header = headers[column] if column < len(headers) else f"Coluna {column + 1}"
+                        if not _structured_is_item_marker(header, cells[column]):
+                            add_requirement_once(requirements, _structured_requirement(header, cells[column], ref))
+                    for entry in requirements_by_entity.get(_atlas_identity(target_name), []):
+                        applies_to = entry["requirement"].get("applies_to") or []
+                        if applies_to and not any(_atlas_identity(name) == _atlas_identity(source_name) for name in applies_to):
+                            continue
+                        add_requirement_once(requirements, entry["requirement"])
+                        entry["attached"] = True
+                    matching = [edge for edge in fragment["edges"] if edge["from"] == from_id and edge["to"] == to_id]
+                    if kind == "reverse_origin" and not requirements:
+                        if matching:
+                            for edge in matching:
+                                edge["source_refs"] = _merge_refs(edge["source_refs"], [ref])
+                                row_edges.append(edge["id"])
+                        else:
+                            # A reverse list documents a connection but cannot
+                            # establish its requirements or availability.
+                            requirements = [_structured_requirement("Requisitos", "Não documentados na lista de origens", ref)]
+                            requirements[0].update(operator="unknown", group="unknown", condition={
+                                "op": "unknown", "original": "A lista de origens não informa os requisitos.",
+                                "source_refs": [ref]})
+                        if matching:
+                            continue
+                    for requirement in requirements:
+                        if requirement.get("operator") == "unknown":
+                            add_issue(table, "unknown_requirement",
+                                f"A condição {requirement.get('field') or 'desconhecida'} não tem semântica determinada na fonte.",
+                                "Confira a regra no trecho original; a disponibilidade continuará desconhecida.",
+                                row=row, ref=ref, severity="warning",
+                                card_numbers=[node_by_key[_atlas_identity(source_name)]["card_number"], node_by_key[_atlas_identity(target_name)]["card_number"]],
+                                field=requirement.get("field"), value=requirement.get("original"))
+                    signature = tuple(sorted(_atlas_requirement_identity(item) for item in requirements))
+                    edge_key = (from_id, to_id, signature)
+                    edge = edge_by_key.get(edge_key)
+                    if edge:
+                        edge["source_refs"] = _merge_refs(edge["source_refs"], [ref])
+                        for requirement in requirements:
+                            add_requirement_once(edge["requirements"], requirement)
+                    else:
+                        edge = {"id": f"edge-{len(fragment['edges']) + 1}", "from": from_id, "to": to_id,
+                                "label": requirement_label(requirements),
+                                "path_kind": "normal", "requirements": requirements,
+                                "missable": False, "spoiler": False, "source_refs": [ref]}
+                        edge_by_key[edge_key] = edge
+                        fragment["edges"].append(edge)
+                    row_edges.append(edge["id"])
+            if row_edges:
+                covered_relation_rows.add(row_key)
+                row_outcomes["|".join(row_key)] = {"table_id": table_id, "row_id": row_key[1],
+                    "status": "corroborated" if kind == "reverse_origin" else "materialized",
+                    "edge_ids": list(dict.fromkeys(row_edges))}
+                fragment["source_refs"] = _merge_refs(fragment["source_refs"], [ref])
 
     # Uma tabela de requisito sem evolução correspondente é uma pendência real,
     # mas agora ela aponta para a entidade/linha, em vez do falso missing_endpoint
@@ -2859,12 +2890,24 @@ def _materialize_structured_atlas(source: dict, system_title: str, game: dict,
             context_label=context_label, requirement_mode=requirement.get("mode", ""),
             requirement_text=requirement.get("text", ""),
         )
-    covered_rows += attached_requirement_rows
+    covered_rows += attached_requirement_rows + len(covered_relation_rows)
+    relation_rows = len(covered_relation_rows)
+    for table in tables:
+        label = atlas_entities.clean_label(_structured_requirement_context_label(table))
+        node = node_by_key.get(_atlas_identity(label))
+        if node:
+            parents = [part for part in table.get("path") or [] if part != label]
+            if parents:
+                node["stage"] = re.sub(r"\s+Digimon$", "", parents[-1], flags=re.I)
+    for edge in fragment["edges"]:
+        if sum(other["from"] == edge["from"] and other["to"] == edge["to"] for other in fragment["edges"]) > 1:
+            edge["path_kind"] = "alternative"
     quality = {"selected_tables": len(selected), "selected_rows": selected_rows,
                "covered_rows": covered_rows, "relation_rows": relation_rows,
                "requirement_rows": len(requirement_entries),
                "attached_requirement_rows": attached_requirement_rows,
                "excluded_rows": excluded_rows,
+               "row_outcomes": list(row_outcomes.values()),
                "pending_table_ids": sorted(set(pending)),
                "pending_items": pending_items, "warning_items": warning_items,
                "complete": not pending}
