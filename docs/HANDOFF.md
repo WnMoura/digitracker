@@ -2,9 +2,10 @@
 
 ## Estado atual — Atlas, rodada 12/09/2026
 
-Base local: `main`, commit `517830b`, tag `v0.11.6`. As alterações abaixo
-compõem a release `v0.11.7`; o push remoto é uma operação separada. Não
-confundir o build de teste com uma release publicada no GitHub.
+Base local: `main`, com a implementação do Atlas na linha `v0.11.7`. A tag
+`v0.11.7` existente é apenas local e aponta para o commit anterior desta
+rodada; não houve push nem release no GitHub. A próxima tag só deve ser criada
+depois das validações externas pendentes.
 
 - `atlas_entities.py` separa listas explícitas de origens/destinos e remove
   marcadores de nota do nome. Nomes editoriais exatos vencem a pontuação;
@@ -17,6 +18,9 @@ confundir o build de teste com uma release publicada no GitHub.
 - `smart_guide.reconcile_system_ids` reaproveita IDs de entidades/rotas iguais
   na substituição aprovada, preservando imagens, objetivos e marcações. Uma
   imagem de um card agrupado antigo não passa para uma entidade individual.
+- Rascunhos estruturados que ainda tragam um card composto (por exemplo,
+  `Agumon, Guilmon`) agora ficam bloqueados com `kind=combined_entity_card`,
+  número do card e ação de correção; não são aprovados silenciosamente.
 - `atlas_images.py` aceita contexto/jogo e domínio de wiki opcionais; padrão
   continua só o nome. Filtra evidência de contexto, domínio, entidade e vídeos
   versus/gameplay; prioriza ilustrações da própria fonte quando compatíveis.
@@ -33,8 +37,8 @@ confundir o build de teste com uma release publicada no GitHub.
   e componentes fortemente conectados para ciclos. Autozoom mínimo 85%; em
   largura estreita usa lista. Prévia não deixa seu aviso ocupar o mapa inteiro.
 
-Validação: **621 testes pytest**, `node --check ui/app.js`, `git diff --check`
-e `tests/atlas_ui_smoke.cjs` passaram. O smoke usa Edge com dados sintéticos e
+Validação local: **622 testes pytest**, `compileall`, `node --check ui/app.js`,
+`git diff --check` e `tests/atlas_ui_smoke.cjs` passaram. O smoke usa Edge com dados sintéticos e
 valida 1600×900, 1280×720, largura 820, prévia, modal de contexto, busca, marcação,
 150 nós e ciclo. Build PyInstaller concluído em
 `dist-check/atlas-v0.11.7/DigiTracker.exe`; os novos módulos e CSS estão incluídos.
@@ -45,17 +49,23 @@ Auditoria local (não versionada): a captura salva do FAQ 64658 foi materializad
 com **mapeamentos de colunas explícitos de teste, sem chamar IA**: 144 cartões
 anteriores → 91 entidades, 198 caminhos, nenhum nome agrupado por vírgula;
 593 linhas selecionadas contabilizadas, das quais 328 excluídas por papel
-documentado. Isso não comprova o fluxo ponta a ponta com Gemini. O guia publicado
-em Downloads não foi modificado. Capturas da cópia local estão em
+documentado. O rascunho legado de 144 entidades foi revisado e contém 20 cards
+compostos; portanto ele não é reutilizado como resultado válido, embora 144/144
+IDs, 68 associações de imagem e o objetivo existente sejam preserváveis. A
+captura de seis páginas (FAQ 71975) contém 248 tabelas e 323 linhas de evolução;
+as tabelas especiais sem endpoints ficam pendentes para classificação explícita.
+Isso não comprova o fluxo ponta a ponta com Gemini. O guia publicado em Downloads
+não foi modificado. Capturas da cópia local estão em
 `docs/screenshots/atlas-context/atlas-real-1600.png`, `atlas-real-1280.png` e
 `imagens-contexto.png`. As imagens nessas capturas são as antigas já salvas,
 não evidência de conclusão de um novo preenchimento.
 
-Limite desta validação: a execução controlada de novos downloads externos foi
-bloqueada pela autorização/limite da sessão. Não contornar com outra rota de
-rede. A fila persistente foi testada com respostas simuladas; ainda validar
-download/associação reais e o contrato v5 com a chave/modelo do usuário antes
-de afirmar cobertura real de todas as imagens. Uma wiki/jogo sem resultado
+Limite desta validação: a execução controlada de novas chamadas ao Gemini e de
+downloads externos requer autorização explícita para enviar a captura e baixar
+três imagens representativas. Não contornar com outra rota de rede. A fila
+persistente foi testada com respostas simuladas; ainda validar download/
+associação reais e o contrato com a chave/modelo do usuário antes de afirmar
+cobertura real de todas as imagens. Uma wiki/jogo sem resultado
 compatível continua pendente; não relaxar silenciosamente o contexto escolhido.
 
 Para aplicar a correção a um guia antigo: **Fontes e manutenção → Reprocessar

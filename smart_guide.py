@@ -691,6 +691,40 @@ def reconcile_system_ids(candidate: dict, previous: dict) -> dict:
     return result
 
 
+def _structured_composite_card_issues(system: dict, source: dict) -> list[dict]:
+    """Aponta cards compostos que uma reimportação estruturada não pode publicar.
+
+    O materializador atual separa alternativas diretamente nas células da
+    captura. Esta guarda existe para rascunhos antigos/provedores legados que
+    ainda devolvam ``"A, B"`` como um único card; não tenta adivinhar a relação
+    entre as entidades e deixa a correção localizada na revisão da fonte.
+    """
+    if not isinstance(source, dict) or source.get("source_format") not in {
+        "gamefaqs-json-v1", "digitracker-source-v1",
+    }:
+        return []
+    issues = []
+    for node in system.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        label = str(node.get("label") or "").strip()
+        if not re.search(r"\s*,\s*|\s+[+&/]\s+", label):
+            continue
+        refs = list(node.get("source_refs") or [])
+        issues.append({
+            "id": f"atlas-issue-composite-{len(issues) + 1:04d}",
+            "severity": "blocking", "kind": "combined_entity_card",
+            "table_id": "", "table_title": "", "page": int((refs[0] or {}).get("page") or 0) if refs else 0,
+            "row_id": "", "row_number": 0, "row_preview": label,
+            "message": f"O card #{int(node.get('card_number') or 0):03d} reúne mais de uma entidade: {label}.",
+            "action": "Reprocesse a fonte estruturada; cada entidade precisa de um card próprio e nenhuma relação deve ser inventada.",
+            "source_ref": dict(refs[0]) if refs else {"source_id": source.get("id", ""), "section": 0, "block": 0, "page": 0},
+            "card_numbers": [int(node.get("card_number") or 0)] if int(node.get("card_number") or 0) > 0 else [],
+            "label": label,
+        })
+    return issues
+
+
 def default_system_state() -> dict:
     return {
         "schema_version": SCHEMA_VERSION, "active_system": "", "goals": {},
@@ -1133,10 +1167,27 @@ class SmartGuideStore:
         if len(normalized) != 1:
             raise SmartGuideError("A fonte precisa documentar ao menos dois nós e uma relação.")
         validate_system_references({"systems": normalized}, source.get("sections") or [])
+        diagnostics_value = deepcopy(diagnostics or {})
+        composite_issues = _structured_composite_card_issues(normalized[0], source)
+        if composite_issues:
+            existing_items = list(diagnostics_value.get("pending_items") or [])
+            existing_ids = {str(item.get("id") or "") for item in existing_items if isinstance(item, dict)}
+            existing_items.extend(item for item in composite_issues
+                                  if item.get("id") not in existing_ids)
+            diagnostics_value["pending_items"] = existing_items
+            diagnostics_value["pending_composite_cards"] = [
+                {"card_number": item["card_numbers"][0], "label": item["label"]}
+                for item in composite_issues if item.get("card_numbers")
+            ]
+        blocking_items = [item for item in diagnostics_value.get("pending_items") or []
+                          if isinstance(item, dict) and item.get("severity", "blocking") == "blocking"]
         draft = {"system": normalized[0], "source_id": source_id, "job_id": job_id,
                  "created_at": _now(), "base_revision": self.current(slug).get("revision_id", ""),
-                 "diagnostics": deepcopy(diagnostics or {}),
-                 "approval_blocked": bool((diagnostics or {}).get("pending_table_ids")),}
+                 "diagnostics": diagnostics_value,
+                 "approval_blocked": bool(diagnostics_value.get("pending_table_ids") or
+                                           diagnostics_value.get("unmapped_table_ids") or
+                                           diagnostics_value.get("pending_composite_cards") or
+                                           blocking_items),}
         _atomic_json(self._path(slug, f"atlas_drafts/{source_id}.json"), draft)
         self.update_system_source(slug, source_id, status="suggested", error="")
         return draft

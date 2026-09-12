@@ -90,6 +90,25 @@ def test_pendencia_de_extracao_bloqueia_aprovacao(store):
         store.approve_atlas_draft("game", sid)
 
 
+def test_reimportacao_estruturada_bloqueia_card_combinado(store):
+    structured = {"format": "gamefaqs-json-v1", "pages": []}
+    source = store.add_system_source(
+        "game", "FAQ estruturado", "gamefaqs", SECTIONS,
+        {"source_format": "gamefaqs-json-v1"}, structured=structured,
+    )
+    store.update_system_source("game", source["id"], status="running", job_id="job1")
+    candidate = system()
+    candidate["nodes"][0]["label"] = "Agumon, Guilmon"
+    draft = store.save_atlas_draft("game", source["id"], candidate, "job1")
+    assert draft["approval_blocked"] is True
+    assert draft["diagnostics"]["pending_composite_cards"] == [
+        {"card_number": 1, "label": "Agumon, Guilmon"}
+    ]
+    assert draft["diagnostics"]["pending_items"][0]["kind"] == "combined_entity_card"
+    with pytest.raises(smart_guide.SmartGuideError, match="pendentes"):
+        store.approve_atlas_draft("game", source["id"])
+
+
 def test_delete_system_archives_its_source_but_keeps_capture(store):
     sid = pending(store)
     draft = store.save_atlas_draft("game", sid, system(), "job1")
