@@ -30,13 +30,41 @@ const {chromium} = require("playwright");
       const firstVersion = state.versionFor(data, values);
       data.progress.value_versions["progress:complete:block-a"] = 7;
       const replayVersion = state.versionFor(data, values);
-      return {fallbackId, firstVersion, replayVersion};
+
+      const requirementData = {
+        system_state: {
+          completed_requirements: ["shared-condition"],
+          completed_requirement_targets: [
+            "requirement:system-a:edge-a:shared-condition",
+            "requirement:system-a:edge-b:shared-condition",
+          ],
+          requirements_scoped: true,
+          value_versions: {},
+        },
+      };
+      const patchedRequirement = state.patchConfirmedValue(requirementData, {
+        ok: true,
+        kind: "requirement",
+        target: "requirement:system-a:edge-a:shared-condition",
+        value: false,
+        value_version: 3,
+      });
+      return {
+        fallbackId,
+        firstVersion,
+        replayVersion,
+        legacyRequirementKept: patchedRequirement.system_state.completed_requirements.includes("shared-condition"),
+        remainingScopedTargets: patchedRequirement.system_state.completed_requirement_targets,
+      };
     });
     assert.match(stateChecks.fallbackId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
       "requestId fallback must use a UUID v4 generated with crypto.getRandomValues");
     assert.equal(stateChecks.firstVersion, 2, "Initial target version was not captured");
     assert.equal(stateChecks.replayVersion, 2,
       "Queued operations must keep their original expected version so reconnect exposes a conflict instead of overwriting PC state");
+    assert.equal(stateChecks.legacyRequirementKept, true,
+      "Legacy requirement projection must remain marked while another scoped route with the same requirement id is still complete");
+    assert.deepEqual(stateChecks.remainingScopedTargets, ["requirement:system-a:edge-b:shared-condition"]);
 
     assert.match(await page.evaluate(() => document.querySelector("#tabs button.active")?.textContent || ""), /Início/);
     await page.locator("#tabs [data-tab='guide']").click();
