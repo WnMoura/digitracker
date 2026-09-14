@@ -2,18 +2,25 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import ipaddress
 import secrets
 import socket
+import sqlite3
 import threading
 import time
 from collections import defaultdict, deque
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import Flask, g, jsonify, request, send_file, send_from_directory
 from waitress import create_server
+
+try:  # Optional at runtime; the LAN server remains usable when discovery is unavailable.
+    from zeroconf import ServiceInfo, Zeroconf
+except ImportError:  # pragma: no cover - exercised by the packaged dependency.
+    ServiceInfo = Zeroconf = None
 
 
 def local_addresses():
@@ -33,30 +40,228 @@ def _digest(value):
     return hashlib.sha256(str(value).encode()).hexdigest()
 
 
+class DeviceRegistry:
+    """Durable records for remembered companion devices.
+
+    Browser cookies hold the random tokens.  The PC keeps only token hashes, so
+    a copied local database cannot be used to create a browser session.
+    """
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._migrate()
+
+    def _migrate(self):
+        with self._connection() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS companion_meta (
+                    name TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            row = conn.execute("SELECT value FROM companion_meta WHERE name = 'schema_version'").fetchone()
+            try:
+                version = int(row[0]) if row else 0
+            except (TypeError, ValueError):
+                version = 0
+            if version > self.SCHEMA_VERSION:
+                raise RuntimeError("Cadastro de aparelhos foi criado por uma versão mais nova do DigiTracker.")
+            if version < 1:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS companion_devices (
+                        device_id TEXT PRIMARY KEY,
+                        account_id TEXT NOT NULL,
+                        token_hash TEXT NOT NULL UNIQUE,
+                        name TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        seen_at REAL NOT NULL,
+                        expires_at REAL NOT NULL,
+                        revoked_at REAL
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_companion_device_token ON companion_devices(token_hash)")
+                conn.execute(
+                    "INSERT INTO companion_meta(name, value) VALUES ('schema_version', ?) "
+                    "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                    (str(self.SCHEMA_VERSION),),
+                )
+
+    def _connection(self):
+        return sqlite3.connect(self.path, timeout=5)
+
+    def installation_id(self):
+        with self._connection() as conn:
+            row = conn.execute("SELECT value FROM companion_meta WHERE name = 'installation_id'").fetchone()
+            if row:
+                return row[0]
+            value = secrets.token_urlsafe(12)
+            conn.execute("INSERT INTO companion_meta(name, value) VALUES ('installation_id', ?)", (value,))
+            return value
+
+    def remember(self, account_id, name, token, now=None):
+        now = time.time() if now is None else now
+        device_id = secrets.token_urlsafe(18)
+        item = {
+            "id": device_id, "account_id": str(account_id), "name": str(name)[:80] or "Navegador móvel",
+            "created_at": now, "seen_at": now, "expires_at": now + 90 * 86400, "revoked_at": None,
+        }
+        with self._connection() as conn:
+            conn.execute("""
+                INSERT INTO companion_devices
+                    (device_id, account_id, token_hash, name, created_at, seen_at, expires_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+            """, (device_id, item["account_id"], _digest(token), item["name"], now, now, item["expires_at"]))
+        return item
+
+    def restore_status(self, token, account_id, now=None):
+        now = time.time() if now is None else now
+        if not token:
+            return None, "missing_device"
+        with self._connection() as conn:
+            row = conn.execute("""
+                SELECT device_id, account_id, name, created_at, seen_at, expires_at, revoked_at
+                FROM companion_devices WHERE token_hash = ?
+            """, (_digest(token),)).fetchone()
+            if not row:
+                return None, "unknown_device"
+            item = dict(zip(("id", "account_id", "name", "created_at", "seen_at", "expires_at", "revoked_at"), row))
+            if item["account_id"] != str(account_id):
+                return None, "account_changed"
+            if item["revoked_at"] is not None:
+                return None, "revoked"
+            if item["expires_at"] < now:
+                return None, "expired"
+            expires_at = now + 90 * 86400
+            conn.execute("UPDATE companion_devices SET seen_at = ?, expires_at = ? WHERE device_id = ?",
+                         (now, expires_at, item["id"]))
+            item.update({"seen_at": now, "expires_at": expires_at})
+            return item, "ok"
+
+    def restore(self, token, account_id, now=None):
+        return self.restore_status(token, account_id, now)[0]
+
+    def devices(self, account_id, now=None):
+        now = time.time() if now is None else now
+        with self._connection() as conn:
+            rows = conn.execute("""
+                SELECT device_id, name, created_at, seen_at, expires_at, revoked_at
+                FROM companion_devices
+                WHERE account_id = ? AND revoked_at IS NULL AND expires_at >= ?
+                ORDER BY seen_at DESC
+            """, (str(account_id), now)).fetchall()
+        return [dict(zip(("id", "name", "created_at", "seen_at", "expires_at", "revoked_at"), row)) for row in rows]
+
+    def rename(self, device_id, account_id, name):
+        value = str(name or "").strip()[:80]
+        if not value:
+            raise ValueError("Informe um nome para o aparelho.")
+        with self._connection() as conn:
+            changed = conn.execute("""
+                UPDATE companion_devices SET name = ?
+                WHERE device_id = ? AND account_id = ? AND revoked_at IS NULL
+            """, (value, str(device_id), str(account_id))).rowcount
+        if not changed:
+            raise ValueError("Aparelho não encontrado.")
+        return value
+
+    def revoke(self, device_id, account_id):
+        with self._connection() as conn:
+            conn.execute("""
+                UPDATE companion_devices SET revoked_at = ?
+                WHERE device_id = ? AND account_id = ?
+            """, (time.time(), str(device_id), str(account_id)))
+
+
 class CompanionServer:
-    def __init__(self, ui_root: Path, assets: Path, snapshot, command):
+    def __init__(self, ui_root: Path, assets: Path, snapshot, command, *, store_path: Path | None = None,
+                 account_provider=None, preferred_port: int = 47831):
         self.ui_root, self.assets = Path(ui_root), Path(assets).resolve()
         self.snapshot, self.command = snapshot, command
         self.server = None
-        self.host, self.port = "127.0.0.1", 0
+        self.host, self.port, self.preferred_port = "127.0.0.1", 0, int(preferred_port)
         self.pending, self.sessions = {}, {}
         self.pair_code, self.pair_expires = "", 0
         self.limits = defaultdict(deque)
         self.lock = threading.RLock()
+        self.account_provider = account_provider or (lambda: "local")
+        self.registry = DeviceRegistry(store_path or self.assets.parent / "companion.sqlite3")
+        self.installation_id = self.registry.installation_id()
+        self.zeroconf = self.mdns_info = None
         self.app = Flask(__name__, static_folder=None)
         self.app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
         self._routes()
+
+    def _account(self):
+        return str(self.account_provider() or "local")[:200]
+
+    def _scoped_request_id(self, session, slug, request_id):
+        raw_id = str(request_id or "").strip()
+        if not raw_id:
+            return ""
+        device = str((session or {}).get("device_id") or (session or {}).get("id") or "temporary")
+        scope = "|".join((self.installation_id, self._account(), device, str(slug or ""), raw_id))
+        return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
+    def _allowed_hosts(self):
+        values = {f"{self.host}:{self.port}"}
+        if self.mdns_info:
+            values.add(f"{self.mdns_name}:{self.port}")
+        return values
+
+    @property
+    def mdns_name(self):
+        return f"digitracker-{self.installation_id[:8]}.local"
+
+    def _new_session(self, item):
+        token = secrets.token_urlsafe(32)
+        self.sessions[_digest(token)] = {
+            "id": item.get("id") or _digest(token), "device_id": item.get("id", ""),
+            "account_id": self._account(), "name": item.get("name") or "Navegador móvel",
+            "expires": time.time() + 86400, "seen_at": time.time(),
+        }
+        return token
+
+    def _start_mdns(self):
+        if not Zeroconf or self.zeroconf:
+            return
+        try:
+            info = ServiceInfo(
+                "_digitracker._tcp.local.",
+                f"DigiTracker-{self.installation_id[:8]}._digitracker._tcp.local.",
+                addresses=[socket.inet_aton(self.host)], port=self.port,
+                properties={"installation": self.installation_id[:16]},
+                server=f"{self.mdns_name}.",
+            )
+            self.zeroconf = Zeroconf()
+            self.zeroconf.register_service(info)
+            self.mdns_info = info
+        except Exception:
+            if self.zeroconf:
+                self.zeroconf.close()
+            self.zeroconf = self.mdns_info = None
+
+    def _stop_mdns(self):
+        if self.zeroconf:
+            try:
+                if self.mdns_info:
+                    self.zeroconf.unregister_service(self.mdns_info)
+                self.zeroconf.close()
+            except Exception:
+                pass
+        self.zeroconf = self.mdns_info = None
 
     def _routes(self):
         app = self.app
 
         @app.before_request
         def guard():
-            expected = f"{self.host}:{self.port}"
-            if request.host != expected:
+            if request.host not in self._allowed_hosts():
                 return jsonify(ok=False, error="Host não autorizado."), 403
             if request.method != "GET":
-                if request.headers.get("Origin") != f"http://{expected}" or not request.is_json:
+                if request.headers.get("Origin") != f"http://{request.host}" or not request.is_json:
                     return jsonify(ok=False, error="Origem não autorizada."), 403
             now = time.time()
             key = (request.remote_addr, "pair" if request.path.startswith("/pair") else "api")
@@ -65,15 +270,19 @@ class CompanionServer:
                 while queue and queue[0] < now - 60:
                     queue.popleft()
                 if len(queue) >= (90 if key[1] == "pair" else 300):
-                    return jsonify(ok=False, error="Aguarde antes de tentar novamente."), 429
+                    response = jsonify(ok=False, error="Aguarde antes de tentar novamente.")
+                    response.status_code = 429
+                    response.headers["Retry-After"] = "1"
+                    return response
                 queue.append(now)
             if request.path.startswith(("/api/", "/assets/")):
                 token = _digest(request.cookies.get("dt_session", ""))
                 with self.lock:
                     session = self.sessions.get(token)
-                    if not session or session["expires"] < now:
+                    if not session or session["expires"] < now or session.get("account_id") != self._account():
                         return jsonify(ok=False, error="Conexão encerrada. Faça o pareamento novamente."), 401
                     session["seen_at"] = now
+                    g.companion_session = dict(session)
 
         @app.after_request
         def headers(response):
@@ -94,6 +303,12 @@ class CompanionServer:
         def style():
             return send_from_directory(self.ui_root, "style.css")
 
+        @app.route("/<path:relative>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+        def companion_static(relative):
+            if request.method != "GET" or relative not in {"app.js", "state.js", "storage.js"}:
+                return jsonify(ok=False, error="Arquivo não encontrado."), 404
+            return send_from_directory(self.ui_root, relative)
+
         @app.post("/pair")
         def pair():
             body = request.get_json()
@@ -105,8 +320,11 @@ class CompanionServer:
                 self.pair_code = ""  # one use
                 token = secrets.token_urlsafe(32)
                 key = _digest(token)
-                self.pending[key] = {"id": key, "name": str(body.get("name") or "Navegador móvel")[:80],
-                                     "expires": time.time() + 120, "approved": False}
+                self.pending[key] = {
+                    "id": key, "name": str(body.get("name") or "Navegador móvel")[:80],
+                    "expires": time.time() + 120, "approved": False,
+                    "remember": body.get("remember") is not False,
+                }
             response = jsonify(ok=True, pending=True)
             response.set_cookie("dt_pair", token, httponly=True, samesite="Strict", max_age=120)
             return response
@@ -120,25 +338,58 @@ class CompanionServer:
                     return jsonify(ok=False, error="Pareamento expirado ou recusado."), 403
                 if not item["approved"]:
                     return jsonify(ok=True, pending=True)
-                token = secrets.token_urlsafe(32)
-                self.sessions[_digest(token)] = {"id": _digest(token), "name": item["name"],
-                                                "expires": time.time() + 86400, "seen_at": time.time()}
+                device_token = ""
+                device = {"id": "", "name": item["name"]}
+                if item.get("remember", True):
+                    device_token = secrets.token_urlsafe(32)
+                    device = self.registry.remember(self._account(), item["name"], device_token)
+                token = self._new_session(device)
                 self.pending.pop(key)
             response = jsonify(ok=True, pending=False)
             response.set_cookie("dt_session", token, httponly=True, samesite="Strict", max_age=86400)
+            if device_token:
+                response.set_cookie("dt_device", device_token, httponly=True, samesite="Strict", max_age=90 * 86400)
             response.delete_cookie("dt_pair")
             return response
 
+        @app.post("/session/restore")
+        def restore_session():
+            device_token = request.cookies.get("dt_device", "")
+            item, reason = self.registry.restore_status(device_token, self._account())
+            if not item:
+                response = jsonify(ok=False, needs_pairing=True, code=reason,
+                                   error="Aparelho não autorizado. Leia um novo QR Code.")
+                response.delete_cookie("dt_session")
+                response.delete_cookie("dt_device")
+                return response, 401
+            with self.lock:
+                token = self._new_session(item)
+            response = jsonify(ok=True, restored=True, device={"id": item["id"], "name": item["name"]})
+            response.set_cookie("dt_session", token, httponly=True, samesite="Strict", max_age=86400)
+            return response
+
+        def snapshot_for_request(slug=""):
+            value = self.snapshot(slug)
+            if not isinstance(value, dict):
+                return value
+            value = dict(value)
+            value["companion"] = {
+                "installation_id": self.installation_id,
+                "account_scope": _digest(self._account())[:16],
+                "server_url": f"http://{request.host}",
+            }
+            return value
+
         @app.get("/api/state")
         def state():
-            return jsonify(self.snapshot(request.args.get("slug", "")))
+            return jsonify(snapshot_for_request(request.args.get("slug", "")))
 
         # Read-only projections for the detailed mobile experience.  The
         # callback intentionally returns the already-sanitised companion
         # snapshot: no route ever reads the guide/source files directly or
         # exposes raw HTML, private notes, drafts or session credentials.
         def public_state():
-            value = self.snapshot(request.args.get("slug", ""))
+            value = snapshot_for_request(request.args.get("slug", ""))
             if not isinstance(value, dict) or not value.get("ok"):
                 return None, (jsonify(value if isinstance(value, dict) else
                                       {"ok": False, "error": "Estado indisponível."}), 404)
@@ -150,16 +401,42 @@ class CompanionServer:
             except (TypeError, ValueError):
                 return default
 
+        @app.get("/api/revisions")
+        def revisions():
+            value, error = public_state()
+            if error:
+                return error
+            return jsonify(ok=True, revisions=value.get("revisions") or {},
+                           active_pc_slug=value.get("active_pc_slug", ""),
+                           selected_slug=(value.get("game") or {}).get("slug", ""))
+
+        @app.get("/api/media")
+        def media_state():
+            value, error = public_state()
+            if error:
+                return error
+            return jsonify(ok=True, media=value.get("media") or [],
+                           revision=(value.get("revisions") or {}).get("media", ""))
+
+        @app.get("/api/assistant")
+        def assistant_state():
+            value, error = public_state()
+            if error:
+                return error
+            return jsonify(ok=True, answer=value.get("answer") or {},
+                           revision=(value.get("revisions") or {}).get("assistant", ""))
+
         @app.get("/api/games")
         def games():
             value, error = public_state()
             if error:
                 return error
-            # A companion session is scoped to the PC's active library.  A
-            # slug query may select another permitted game for consultation,
-            # but it never changes the compact game's active session.
-            return jsonify(ok=True, games=[value.get("game") or {}],
-                           active_slug=(value.get("game") or {}).get("slug", ""))
+            # Selecting a slug changes only this mobile projection. The PC's
+            # active compact game is reported separately and never mutated.
+            return jsonify(ok=True, games=value.get("games") or [],
+                           active_slug=value.get("active_pc_slug", ""),
+                           selected_slug=(value.get("game") or {}).get("slug", ""),
+                           revision=(value.get("revisions") or {}).get("games", ""))
 
         @app.get("/api/guide")
         def guide():
@@ -168,7 +445,8 @@ class CompanionServer:
                 return error
             chapters = value.get("chapters") or []
             return jsonify(ok=True, chapters=chapters,
-                           progress=value.get("progress") or {},
+                           progress=value.get("progress") or {}, objective=value.get("objective") or {},
+                           revision=(value.get("revisions") or {}).get("guide", ""),
                            content_revision=value.get("content_revision", ""),
                            progress_revision=value.get("progress_revision", ""))
 
@@ -205,6 +483,7 @@ class CompanionServer:
                 return error
             return jsonify(ok=True, systems=value.get("systems") or [],
                            system_state=value.get("system_state") or {},
+                           revision=(value.get("revisions") or {}).get("atlas", ""),
                            content_revision=value.get("content_revision", ""),
                            progress_revision=value.get("progress_revision", ""))
 
@@ -327,24 +606,61 @@ class CompanionServer:
             if error:
                 return error
             ref_id = str(request.args.get("id", request.args.get("block_id", ""))).strip()
-            page = str(request.args.get("page", "")).strip()
+            selectors = {
+                key: str(request.args.get(key, "")).strip()
+                for key in ("page", "section", "block", "row_id", "table_id", "element_id")
+                if str(request.args.get(key, "")).strip()
+            }
+
+            def ref_matches(candidate):
+                if not isinstance(candidate, dict):
+                    return False
+                return all(str(candidate.get(key, "")) == wanted for key, wanted in selectors.items())
+
+            def editorial_block(block):
+                rows = list(block.get("rows") or [])
+                row_id = selectors.get("row_id")
+                if row_id:
+                    selected = [row for row in rows if isinstance(row, dict) and str(row.get("id", row.get("row_id", ""))) == row_id]
+                    rows = selected or rows[:20]
+                else:
+                    rows = rows[:20]
+                return {
+                    key: copy.deepcopy(block.get(key))
+                    for key in ("id", "type", "title", "text", "hidden", "source_refs")
+                    if block.get(key) is not None
+                } | {"items": copy.deepcopy((block.get("items") or [])[:20]), "rows": copy.deepcopy(rows)}
+
             matches = []
             for chapter in value.get("chapters") or []:
                 for block in chapter.get("blocks") or []:
-                    if ref_id and ref_id not in {str(block.get("id", "")), str(block.get("element_id", ""))}:
-                        continue
+                    direct = ref_id and ref_id in {str(block.get("id", "")), str(block.get("element_id", ""))}
                     refs = block.get("source_refs") or []
-                    if page and not any(str(ref.get("page", "")) == page for ref in refs if isinstance(ref, dict)):
+                    if ref_id and not direct and not selectors:
                         continue
-                    matches.append({"chapter_id": chapter.get("id", ""),
+                    if selectors and not any(ref_matches(ref) for ref in refs):
+                        continue
+                    if not ref_id and not selectors:
+                        continue
+                    matches.append({"kind": "guide", "chapter_id": chapter.get("id", ""),
                                    "chapter_title": chapter.get("title", ""),
-                                   "block": block})
-            if ref_id and not matches:
+                                   "block": editorial_block(block)})
+            # If the source coordinate is Atlas-only, return a safe structured
+            # summary instead of reaching into source files or exposing raw HTML.
+            if not matches:
                 for system in value.get("systems") or []:
                     for node in system.get("nodes") or []:
-                        if ref_id in {str(node.get("id", "")), str(node.get("entity_id", ""))}:
-                            matches.append({"system_id": system.get("id", ""), "system_title": system.get("title", ""), "node": node})
-            return jsonify(ok=True, references=matches[:100], total=len(matches),
+                        refs = node.get("source_refs") or []
+                        if (ref_id and ref_id in {str(node.get("id", "")), str(node.get("entity_id", ""))}) or (selectors and any(ref_matches(ref) for ref in refs)):
+                            matches.append({"kind": "atlas", "system_id": system.get("id", ""),
+                                            "system_title": system.get("title", ""),
+                                            "node": {key: copy.deepcopy(node.get(key)) for key in ("id", "label", "subtitle", "card_number", "source_refs")}})
+                    for edge in system.get("edges") or []:
+                        if selectors and any(ref_matches(ref) for ref in edge.get("source_refs") or []):
+                            matches.append({"kind": "atlas", "system_id": system.get("id", ""),
+                                            "system_title": system.get("title", ""),
+                                            "edge": {key: copy.deepcopy(edge.get(key)) for key in ("id", "label", "from", "to", "requirements", "source_refs")}})
+            return jsonify(ok=True, references=matches[:20], total=len(matches),
                            content_revision=value.get("content_revision", ""))
 
         @app.post("/api/action")
@@ -352,11 +668,35 @@ class CompanionServer:
             body = request.get_json()
             if not isinstance(body, dict):
                 return jsonify(ok=False, error="Comando inválido."), 400
+            body = dict(body)
+            client_request_id = str(body.get("request_id") or "").strip()
+            if client_request_id:
+                body["request_id"] = self._scoped_request_id(
+                    getattr(g, "companion_session", {}), body.get("slug") or "", client_request_id)
             try:
                 result = self.command(body)
+                if client_request_id and isinstance(result, dict) and result.get("request_id") == body.get("request_id"):
+                    result = dict(result)
+                    result["request_id"] = client_request_id
                 return jsonify(result), (409 if result.get("conflict") else 200)
             except (ValueError, KeyError, TypeError) as exc:
                 return jsonify(ok=False, error=str(exc)), 400
+
+        @app.post("/api/device/forget")
+        def forget_device():
+            token_key = _digest(request.cookies.get("dt_session", ""))
+            with self.lock:
+                session = self.sessions.pop(token_key, None)
+            if session and session.get("device_id"):
+                self.registry.revoke(session["device_id"], self._account())
+                with self.lock:
+                    for key, value in list(self.sessions.items()):
+                        if value.get("device_id") == session["device_id"]:
+                            self.sessions.pop(key, None)
+            response = jsonify(ok=True)
+            response.delete_cookie("dt_session")
+            response.delete_cookie("dt_device")
+            return response
 
         @app.get("/assets/<path:relative>")
         def media(relative):
@@ -365,17 +705,24 @@ class CompanionServer:
                 return jsonify(ok=False, error="Imagem não encontrada."), 404
             return send_file(path)
 
-    def start(self, host):
+    def start(self, host, port=None):
         if self.server:
             return self.status()
         address = ipaddress.ip_address(host)
         if host not in local_addresses() or not address.is_private or address.is_loopback:
             raise ValueError("Escolha um endereço da rede local deste PC.")
+        selected_port = self.preferred_port if port in (None, "") else int(port)
+        if not 1024 <= selected_port <= 65535:
+            raise ValueError("Escolha uma porta entre 1024 e 65535.")
         self.host = host
-        self.server = create_server(self.app, host=host, port=0, threads=6,
-                                    clear_untrusted_proxy_headers=True, max_request_body_size=65536)
+        try:
+            self.server = create_server(self.app, host=host, port=selected_port, threads=6,
+                                        clear_untrusted_proxy_headers=True, max_request_body_size=65536)
+        except OSError as exc:
+            raise ValueError(f"A porta {selected_port} já está em uso. Escolha outra porta.") from exc
         self.port = self.server.effective_port
         threading.Thread(target=self.server.run, daemon=True).start()
+        self._start_mdns()
         return self.new_pairing()
 
     def new_pairing(self):
@@ -388,37 +735,70 @@ class CompanionServer:
     def status(self, include_qr=False):
         result = {"ok": True, "running": bool(self.server), "addresses": local_addresses(),
                   "url": f"http://{self.host}:{self.port}" if self.server else "",
-                  "pending": [], "devices": []}
+                  "canonical_url": f"http://{self.mdns_name}:{self.port}" if self.server and self.mdns_info else "",
+                  "port": self.port if self.server else self.preferred_port,
+                  "preferred_port": self.preferred_port,
+                  "mdns": bool(self.mdns_info), "pending": [], "devices": []}
         with self.lock:
             result["pending"] = [dict(v) for v in self.pending.values() if v["expires"] > time.time()]
-            result["devices"] = [dict(v) for v in self.sessions.values() if v["expires"] > time.time()]
+            connected = {
+                value.get("device_id"): value for value in self.sessions.values()
+                if value["expires"] > time.time() and value.get("account_id") == self._account()
+            }
+            result["devices"] = []
+            for item in self.registry.devices(self._account()):
+                result["devices"].append({
+                    **item, "status": "connected" if item["id"] in connected else "remembered",
+                    "session_expires": connected.get(item["id"], {}).get("expires", 0),
+                })
+            for value in self.sessions.values():
+                if value["expires"] > time.time() and not value.get("device_id") and value.get("account_id") == self._account():
+                    result["devices"].append({**value, "status": "temporary"})
             if include_qr and self.pair_code:
                 import qrcode
                 stream = io.BytesIO()
-                qrcode.make(result["url"] + "/#pair=" + self.pair_code).save(stream, format="PNG")
+                pair_base = result.get("canonical_url") or result["url"]
+                result["pairing_url"] = pair_base + "/#pair=" + self.pair_code
+                qrcode.make(result["pairing_url"]).save(stream, format="PNG")
                 result["qr"] = "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()
         return result
 
-    def approve(self, request_id, approved=True):
+    def approve(self, request_id, approved=True, remember=True):
         with self.lock:
             item = self.pending.get(request_id)
             if not item or item["expires"] < time.time():
                 raise ValueError("Pedido expirado.")
             if approved:
                 item["approved"] = True
+                item["remember"] = bool(remember)
             else:
                 self.pending.pop(request_id)
         return self.status()
 
     def revoke(self, device_id):
         with self.lock:
-            self.sessions.pop(device_id, None)
+            session = self.sessions.pop(device_id, None)
+            actual_id = (session or {}).get("device_id") or str(device_id)
+            for key, item in list(self.sessions.items()):
+                if item.get("device_id") == actual_id:
+                    self.sessions.pop(key, None)
+        if actual_id:
+            self.registry.revoke(actual_id, self._account())
+        return self.status()
+
+    def rename(self, device_id, name):
+        value = self.registry.rename(device_id, self._account(), name)
+        with self.lock:
+            for item in self.sessions.values():
+                if item.get("device_id") == str(device_id):
+                    item["name"] = value
         return self.status()
 
     def stop(self):
         if self.server:
             self.server.close()
             self.server = None
+        self._stop_mdns()
         with self.lock:
             self.pending.clear()
             self.sessions.clear()

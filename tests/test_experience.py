@@ -117,6 +117,23 @@ def test_pair_requires_pc_approval_and_revocation(server):
     assert request(client, "/api/state").status_code == 401
 
 
+def test_remembered_device_restores_after_service_restart_and_revocation(server):
+    client = client_for(server)
+    pair(server, client)
+    device_id = next(iter(server.sessions.values()))["device_id"]
+    assert device_id
+    # Stopping the LAN service intentionally discards short-lived sessions but
+    # keeps the hashed remembered-device record in SQLite.
+    server.stop()
+    assert request(client, "/api/state").status_code == 401
+    assert request(client, "/session/restore", {}).json["restored"]
+    assert request(client, "/api/state").status_code == 200
+    server.revoke(device_id)
+    server.stop()
+    restored = request(client, "/session/restore", {})
+    assert restored.status_code == 401 and restored.json["needs_pairing"]
+
+
 def test_pair_single_use_expired_and_invalid_body(server):
     client = client_for(server)
     pair(server, client)
@@ -139,12 +156,16 @@ def test_companion_blocks_host_csrf_arbitrary_paths(server):
 def test_companion_static_files_and_only_approved_assets(server, tmp_path):
     server.ui_root.mkdir()
     (server.ui_root / "index.html").write_text("Companion")
+    (server.ui_root / "app.js").write_text("export {}")
+    (server.ui_root / "state.js").write_text("export {}")
     server.assets.mkdir()
     (server.assets / "map.png").write_bytes(b"test")
     client = client_for(server)
     assert request(client, "/").status_code == 200
     assert request(client, "/assets/map.png").status_code == 401
     pair(server, client)
+    assert request(client, "/app.js").status_code == 200
+    assert request(client, "/state.js").status_code == 200
     assert request(client, "/assets/map.png").status_code == 200
     server.stop()
     assert request(client, "/api/state").status_code == 401
@@ -191,3 +212,74 @@ def test_library_invalid(value):
 def test_library_deduplication():
     value = {"format": "digitracker-library", "version": 1, "provider": "retroachievements", "games": [{"id": 1}, {"id": 1}, {"id": 2}]}
     assert validate_library(value) == [1, 2]
+
+
+def test_companion_request_identity_is_scoped_to_device_account_and_game(server):
+    a = {"id": "session-a", "device_id": "phone-a"}
+    b = {"id": "session-b", "device_id": "phone-b"}
+    first = server._scoped_request_id(a, "game-a", "same-client-id")
+    assert first == server._scoped_request_id(a, "game-a", "same-client-id")
+    assert first != server._scoped_request_id(b, "game-a", "same-client-id")
+    assert first != server._scoped_request_id(a, "game-b", "same-client-id")
+
+
+def test_companion_registry_records_schema_version(tmp_path):
+    registry = companion.DeviceRegistry(tmp_path / "companion.sqlite3")
+    with registry._connection() as conn:
+        row = conn.execute("SELECT value FROM companion_meta WHERE name = 'schema_version'").fetchone()
+    assert row and int(row[0]) == companion.DeviceRegistry.SCHEMA_VERSION
+
+
+def test_companion_light_revisions_and_resource_endpoints(tmp_path):
+    snapshot = {
+        "ok": True,
+        "game": {"slug": "a", "title": "A"},
+        "games": [{"slug": "a", "title": "A"}, {"slug": "b", "title": "B"}],
+        "active_pc_slug": "b",
+        "revisions": {"guide": "g1", "atlas": "a1", "items": "i1", "media": "m1", "achievements": "h1", "assistant": "q1", "games": "l1"},
+        "chapters": [], "progress": {}, "objective": {}, "systems": [], "system_state": {},
+        "items": [], "items_revision": 0,
+        "media": [{"id": "cover", "url": "/assets/cover.png", "title": "Cover"}],
+        "achievements": [], "answer": {"answer": "ok"},
+    }
+    service = companion.CompanionServer(tmp_path / "ui", tmp_path / "assets", lambda slug: dict(snapshot), lambda body: {"ok": True})
+    service.host, service.port = "127.0.0.1", 8766
+    client = client_for(service)
+    pair(service, client)
+    revisions = request(client, "/api/revisions?slug=a").json
+    assert revisions["revisions"]["media"] == "m1" and revisions["active_pc_slug"] == "b"
+    games = request(client, "/api/games?slug=a").json
+    assert [row["slug"] for row in games["games"]] == ["a", "b"]
+    assert games["active_slug"] == "b" and games["selected_slug"] == "a"
+    assert request(client, "/api/media?slug=a").json["media"][0]["id"] == "cover"
+    assert request(client, "/api/assistant?slug=a").json["answer"]["answer"] == "ok"
+
+
+def test_remembered_device_restore_reports_explicit_reason(tmp_path):
+    registry = companion.DeviceRegistry(tmp_path / "companion.sqlite3")
+    assert registry.restore_status("", "account")[1] == "missing_device"
+    assert registry.restore_status("unknown", "account")[1] == "unknown_device"
+    token = "remember-me"
+    item = registry.remember("account", "Phone", token, now=100)
+    assert registry.restore_status(token, "other", now=101)[1] == "account_changed"
+    registry.revoke(item["id"], "account")
+    assert registry.restore_status(token, "account", now=102)[1] == "revoked"
+
+
+def test_companion_reference_returns_editorial_fragment_only(tmp_path):
+    snapshot = {
+        "ok": True, "game": {"slug": "a"}, "games": [{"slug": "a"}],
+        "chapters": [{"id": "c1", "title": "Chapter", "blocks": [{
+            "id": "b1", "type": "text", "title": "Exact line", "text": "Published editorial text",
+            "source_refs": [{"page": 7, "section": 2, "block": 4}],
+        }]}],
+        "systems": [], "media": [], "progress": {}, "system_state": {}, "items": [], "achievements": [], "answer": {},
+    }
+    service = companion.CompanionServer(tmp_path / "ui", tmp_path / "assets", lambda slug: dict(snapshot), lambda body: {"ok": True})
+    service.host, service.port = "127.0.0.1", 8766
+    client = client_for(service); pair(service, client)
+    result = request(client, "/api/reference?slug=a&page=7&section=2&block=4").json
+    assert result["total"] == 1
+    block = result["references"][0]["block"]
+    assert block["title"] == "Exact line" and block["text"] == "Published editorial text"
+    assert "html" not in block and "raw" not in block

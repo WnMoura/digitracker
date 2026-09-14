@@ -151,7 +151,7 @@ const S = {
   guideChapter: 0,
   guideQuery: "",
   guideFilter: "all",
-  guideAtlas: { systemId: "", nodeId: "", group: "all", tag: "all", availability: "all", spoilers: false, search: "", mode: "focus", zoom: 1, panX: 24, panY: 24 },
+  guideAtlas: { systemId: "", nodeId: "", edgeId: "", incomingEdgeId: "", outgoingEdgeId: "", group: "all", tag: "all", availability: "all", spoilers: false, search: "", indexSearch: "", indexOpen: true, indexAutoCollapsed: false, inspectorOpen: true, inspectorAutoCollapsed: false, mode: "focus", zoom: 1, panX: 24, panY: 24 },
   guideImageFill: {},
   smartGuideAuto: true,
   smartGuideConsent: false,
@@ -470,6 +470,10 @@ const backend = {
   async atlasSourceReview(slug, sourceId) {
     return window.pywebview.api.get_atlas_source_review(slug, sourceId);
   },
+  async reprocessGuideSystem(slug, systemId) {
+    if (S.mode === "demo") return { ok: false, error: "A demonstração não possui captura original para reprocessar." };
+    return window.pywebview.api.reprocess_guide_system(slug, systemId);
+  },
   async startAtlasSource(slug, sourceId, selection) {
     return window.pywebview.api.start_atlas_source(slug, sourceId, selection || {});
   },
@@ -496,16 +500,22 @@ const backend = {
   },
   async updateGuideRequirement(slug, systemId, edgeId, requirementId, completed) {
     if (S.mode === "demo") {
-      const list = new Set(S.dashboardGame.smart_guide.system_state.completed_requirements || []);
-      if (completed) list.add(requirementId); else list.delete(requirementId);
-      S.dashboardGame.smart_guide.system_state.completed_requirements = [...list];
+      const state = S.dashboardGame.smart_guide.system_state;
+      const list = new Set(state.completed_requirements || []);
+      const scoped = new Set(state.completed_requirement_targets || []);
+      const target = `requirement:${systemId}:${edgeId}:${requirementId}`;
+      if (completed) { list.add(requirementId); scoped.add(target); }
+      else { scoped.delete(target); if (![...scoped].some((value) => value.endsWith(`:${requirementId}`))) list.delete(requirementId); }
+      state.completed_requirements = [...list];
+      state.completed_requirement_targets = [...scoped];
+      state.requirements_scoped = true;
       return { ok: true, state: S.dashboardGame.smart_guide.system_state };
     }
     return window.pywebview.api.update_guide_requirement(slug, systemId, edgeId, requirementId, !!completed);
   },
-  async searchGuideSystemMedia(slug, systemId, nodeId, query, page = 0, sourceId = '') {
+  async searchGuideSystemMedia(slug, systemId, nodeId, query, page = 0, sourceId = '', options = {}) {
     if (S.mode === "demo") return { ok: true, results: [], query, provider: "demo" };
-    return window.pywebview.api.search_guide_system_media(slug, systemId, nodeId, query || "", page, sourceId);
+    return window.pywebview.api.search_guide_system_media(slug, systemId, nodeId, query || "", page, sourceId, options);
   },
   async startGuideSystemImageFill(slug, systemId, sourceId = '', options = {}) {
     if (S.mode === "demo") return { ok: false, error: "A prévia não realiza downloads. Use o Atlas no aplicativo para preencher as imagens." };
@@ -1716,7 +1726,7 @@ function atlasJobsHTML(game) {
   return `<div class="atlas-jobs">${cards}</div>`;
 }
 
-function guideSystemsHTML(game) {
+function guideSystemsHTMLLegacy(game) {
   const bundle = game.smart_guide || {}, systems = atlasSystems(game).filter(item => item.status !== "rejected");
   const jobs = atlasJobsHTML(game);
   if (!systems.length) return `${jobs}<section class="atlas-empty"><span>◇</span><h3>Crie o primeiro sistema visual</h3><p>Importe uma fonte e revise as rotas e requisitos do seu jogo.</p><button id="atlas-create">＋ Novo sistema</button></section>`;
@@ -1813,7 +1823,7 @@ function guideSystemsHTML(game) {
     <label class="atlas-spoilers"><input id="atlas-spoilers" type="checkbox" ${A.spoilers ? "checked" : ""}> Mostrar spoilers</label></div></details>`;
   return `${jobTray}<section class="atlas-shell atlas-v2 ${review ? "has-review" : ""} ${mode === "list" ? "list-view" : ""}" style="--atlas-card-width:${ATLAS_CARD_WIDTH}px;--atlas-card-height:${ATLAS_CARD_HEIGHT}px;--atlas-zoom:${A.zoom};--atlas-x:${A.panX}px;--atlas-y:${A.panY}px">
     ${review}<div class="atlas-workspace">
-      <header class="atlas-toolbar"><h2>Atlas</h2><select id="atlas-system" aria-label="Sistema">${systems.map(item => `<option value="${esc(item.id)}" ${item.id === system.id ? "selected" : ""}>${esc(item.title)}</option>`).join("")}</select><label class="atlas-search"><span aria-hidden="true">⌕</span><input id="atlas-search" type="search" value="${esc(A.search || "")}" placeholder="Buscar no mapa" aria-label="Buscar nome ou número do card"></label><button id="atlas-sources" title="Fontes e revisões" aria-label="Fontes e revisões">▤</button><button class="primary" id="atlas-create">Novo ＋</button></header>
+      <header class="atlas-toolbar"><h2>Atlas</h2><select id="atlas-system" aria-label="Sistema">${systems.map(item => `<option value="${esc(item.id)}" ${item.id === system.id ? "selected" : ""}>${esc(item.title)}</option>`).join("")}</select><label class="atlas-search"><span aria-hidden="true">⌕</span><input id="atlas-search" type="search" value="${esc(A.search || "")}" placeholder="Buscar no mapa" aria-label="Buscar nome ou número do card"></label><button id="atlas-sources" title="Fontes e revisões" aria-label="Fontes e revisões">▤</button><button class="danger" id="atlas-delete-header" title="Excluir este guia">Excluir guia</button><button class="primary" id="atlas-create">Novo ＋</button></header>
       <div class="atlas-contextbar"><span>${mode === "focus" ? `Rotas de <b>${esc(selected?.label || "—")}</b>` : `${visibleNodes.length} cartões`}</span>${mode === "focus" && pages > 1 ? `<nav class="atlas-branches" aria-label="Mais conexões"><button data-atlas-branch="-1" ${A.branchPage === 0 ? "disabled" : ""}>‹</button><span>${A.branchPage + 1}/${pages}</span><button data-atlas-branch="1" ${A.branchPage + 1 === pages ? "disabled" : ""}>Mais conexões ›</button></nav>` : ""}${filters}</div>
       <div class="atlas-viewport" id="atlas-viewport" data-view-key="${esc([system.id, mode, A.nodeId, A.branchPage, A.group, A.tag, A.availability, A.search].join(":"))}" data-selected-id="${esc(A.nodeId)}">
         <div class="atlas-world" style="width:${layout.width}px;height:${layout.height}px"><svg width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="atlas-arrow-route" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#25deeb" stroke-width="1.5"/></marker><marker id="atlas-arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#63748c" stroke-width="1.5"/></marker></defs>${edgesHTML}</svg>${nodesHTML}</div>
@@ -1823,6 +1833,121 @@ function guideSystemsHTML(game) {
       <div class="atlas-image-status"><button id="atlas-fill-images" data-testid="atlas-image-fill">▧ ${running ? "Acompanhar imagens" : fill.phase === "cancelled" || fill.phase === "interrupted" ? "Retomar imagens" : "Preencher imagens"}</button><span>${filled}/${allNodes.length} com imagem${fill.phase === "waiting_retry" ? " · Nova tentativa agendada" : running ? " · Buscando…" : ""}</span>${(fill.changes || []).length && !running && !fill.undo ? '<button id="atlas-undo-images">↶ Desfazer lote</button>' : ""}${A.draftSource ? '<button id="atlas-back-published">Voltar ao publicado</button>' : ""}</div>
     </div>${details}
   </section>`;
+}
+
+/* Atlas C+D: a rota é deliberadamente pequena e legível. O índice e a visão
+   geral continuam expondo todas as entidades sem desenhar a rede inteira. */
+function guideSystemsHTML(game) {
+  const bundle = game.smart_guide || {};
+  const systems = atlasSystems(game).filter((item) => item.status !== "rejected");
+  const jobs = atlasJobsHTML(game);
+  if (!systems.length) return `${jobs}<section class="atlas-empty"><span>◇</span><h3>Crie o primeiro sistema visual</h3><p>Importe uma fonte e revise as rotas e requisitos do seu jogo.</p><button id="atlas-create">＋ Novo sistema</button></section>`;
+  const A = S.guideAtlas;
+  const system = systems.find((item) => item.id === A.systemId)
+    || systems.find((item) => item.status === "approved") || systems[0];
+  if (A.systemId !== system.id) {
+    A.systemId = system.id; A.nodeId = ""; A.edgeId = ""; A.incomingEdgeId = ""; A.outgoingEdgeId = "";
+    // The app sidebar and inspector consume roughly 280 + 280 px.  This
+    // viewport threshold corresponds to the contract's 1160 px internal Atlas
+    // width, so a 1280 px window starts with the index collapsed.
+    A.mode = "focus"; A.indexOpen = window.innerWidth >= 1460; A.indexAutoCollapsed = false; A.inspectorOpen = true; A.inspectorAutoCollapsed = false; A.viewKey = "";
+  }
+  const state = bundle.system_state || {};
+  const rawMode = A.mode || "focus";
+  const mode = window.innerWidth <= 820 ? "list" : rawMode === "map" || rawMode === "overview" ? "overview" : rawMode === "list" ? "list" : "routes";
+  const model = window.AtlasViewModel.buildAtlasViewModel({
+    system, systemState: state,
+    selection: { nodeId: A.nodeId, incomingEdgeId: A.incomingEdgeId || A.edgeId, outgoingEdgeId: A.outgoingEdgeId, mode },
+    filters: { group: A.group, tag: A.tag, availability: A.availability,
+      spoilers: A.spoilers, search: A.search },
+  });
+  const selected = model.selected;
+  A.nodeId = model.selectedId || "";
+  A.edgeId = model.selectedIncomingRoute?.id || "";
+  A.incomingEdgeId = A.edgeId;
+  A.outgoingEdgeId = model.selectedOutgoingRoute?.id || "";
+  const completed = model.completed;
+  const mediaFor = (node) => {
+    if (!node) return null;
+    const id = (system._draftMedia || {})[node.id] ?? (state.node_media || {})[`${system.id}:${node.id}`];
+    return (bundle.media || []).find((item) => item.id === id);
+  };
+  const number = model.number;
+  const refsHTML = (refs) => esc(atlasRefsLabel(refs));
+  const displayNodes = mode === "routes" ? model.routeCards.map((card) => card.node) : model.visibleNodes;
+  const displayEdges = mode === "routes" ? model.routeEdges : model.overviewEdges;
+  const layout = window.AtlasLayout.layoutAtlasRoute({
+    cards: model.routeCards, connections: displayEdges, nodes: displayNodes,
+    selectedId: model.selectedId, mode, viewport: document.querySelector("#atlas-viewport"),
+  });
+  const nodeHTML = displayNodes.map((node) => {
+    const pos = layout.positions.get(node.id) || { x: 0, y: 0 };
+    const media = mediaFor(node);
+    const goal = state.goals?.[system.id] === node.id;
+    const routeCard = model.routeCards.find((card) => card.node.id === node.id);
+    const role = routeCard?.role || (node.id === model.selectedId ? "selected" : "overview");
+    const missing = !media?.url;
+    return `<button class="atlas-node atlas-node-cd ${node.id === model.selectedId ? "selected" : ""} ${model.statusFor(node)} ${goal ? "goal" : ""} role-${role} ${missing ? "missing-media" : ""}" data-atlas-node="${esc(node.id)}" data-atlas-card-number="${number(node)}" aria-label="Card ${number(node)}: ${esc(node.label)}" aria-pressed="${node.id === model.selectedId}" style="left:${pos.x}px;top:${pos.y}px">
+      <span class="atlas-node-id">#${String(number(node)).padStart(3, "0")}</span>
+      <span class="atlas-node-art">${media?.url ? `<img src="${esc(media.url)}" alt="" draggable="false">` : '<i aria-hidden="true">◇</i>'}</span>
+      <span class="atlas-node-copy"><b>${esc(node.label)}</b><small>${esc(node.stage || node.group || "Entidade")}</small><em>▤ ${refsHTML(node.source_refs) || "Fonte local"}</em></span>
+      ${missing ? '<span class="atlas-missing-media">Sem imagem</span>' : ""}${goal ? '<span class="atlas-goal-badge">OBJETIVO</span>' : ""}
+    </button>`;
+  }).join("");
+  const routeEdgeIds = new Set(model.routeEdges.map((edge) => edge.id));
+  const edgesHTML = displayEdges.map((edge) => {
+    const from = layout.positions.get(edge.from), to = layout.positions.get(edge.to);
+    if (!from || !to) return "";
+    const status = model.edgeStatus(edge, completed);
+    const active = routeEdgeIds.has(edge.id);
+    const label = status.unknown ? "?" : status.total ? `${status.done}/${status.total}` : "→";
+    const labelRect = layout.edgeLabelRects?.get(edge.id) || { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 };
+    const path = layout.edgePaths?.get(edge.id) || atlasEdgePath(edge, layout);
+    return `<g class="atlas-edge-group ${active ? "route" : "muted"}"><path class="atlas-edge ${active ? "route" : "muted"} ${edge.path_kind === "alternative" ? "alternative" : ""}" data-atlas-edge="${esc(edge.id)}" d="${esc(path)}" marker-end="url(#atlas-arrow-${active ? "route" : "muted"})"><title>${esc(model.byId.get(edge.from)?.label || "Origem")} → ${esc(model.byId.get(edge.to)?.label || "Destino")}${edge.label ? ` · ${esc(edge.label)}` : ""}</title></path><text x="${labelRect.x}" y="${labelRect.y}" class="atlas-edge-label" text-anchor="middle">${label}</text></g>`;
+  }).join("");
+  const altButton = (item) => `<button class="atlas-alt-chip" data-atlas-route="${esc(item.edge.id)}" data-atlas-node="${esc(item.node.id)}" title="Abrir rota ${esc(item.node.label)}">${mediaFor(item.node)?.url ? `<img src="${esc(mediaFor(item.node).url)}" alt="">` : "◇"}<span>${esc(item.node.label)}</span><small>#${String(number(item.node)).padStart(3, "0")}</small></button>`;
+  const alternatives = mode === "routes" ? `<div class="atlas-alternatives" aria-label="Rotas alternativas">
+    ${model.alternativeOrigins.length ? `<section><h4>Outras origens <span>· ${model.alternativeOrigins.length}</span></h4><div>${model.alternativeOrigins.slice(0, 4).map(altButton).join("")}${model.alternativeOrigins.length > 4 ? `<button class="atlas-alt-more" data-atlas-index-open>+${model.alternativeOrigins.length - 4} outras</button>` : ""}</div></section>` : ""}
+    ${model.alternativeDestinations.length ? `<section><h4>Outros destinos <span>· ${model.alternativeDestinations.length}</span></h4><div>${model.alternativeDestinations.slice(0, 4).map(altButton).join("")}${model.alternativeDestinations.length > 4 ? `<button class="atlas-alt-more" data-atlas-index-open>+${model.alternativeDestinations.length - 4} outros</button>` : ""}</div></section>` : ""}
+  </div>` : "";
+  const indexQuery = String(A.indexSearch || "").trim().toLocaleLowerCase("pt-BR");
+  const indexNodes = model.visibleNodes.filter((node) => !indexQuery
+    || `${node.label} #${String(number(node)).padStart(3, "0")} ${number(node)}`
+      .toLocaleLowerCase("pt-BR").includes(indexQuery));
+  const indexHTML = `<aside class="atlas-entity-index ${A.indexOpen === false ? "collapsed" : ""}" id="atlas-entity-index" aria-label="Entidades do sistema">
+    <div class="atlas-index-heading"><b>ENTIDADES</b><button data-atlas-index-toggle aria-expanded="${A.indexOpen !== false}">${A.indexOpen === false ? "›" : "‹"}</button></div>
+    ${A.indexOpen === false ? "" : `<label class="atlas-index-search"><span>⌕</span><input id="atlas-index-search" type="search" placeholder="Buscar entidade ou #ID" value="${esc(A.indexSearch || "")}" aria-label="Buscar entidade no índice"></label><small class="atlas-index-count">${indexNodes.length} de ${model.allNodes.length} entidades</small><div class="atlas-index-list">${indexNodes.map((node) => `<button class="atlas-index-row ${node.id === model.selectedId ? "selected" : ""}" data-atlas-node="${esc(node.id)}"><span class="atlas-index-thumb">${mediaFor(node)?.url ? `<img src="${esc(mediaFor(node).url)}" alt="">` : "◇"}</span><span><b>${esc(node.label)}</b><small>#${String(number(node)).padStart(3, "0")} · ${esc(node.stage || node.group || "Entidade")}</small></span></button>`).join("") || '<p class="atlas-index-empty">Nenhuma entidade corresponde à busca.</p>'}</div>`}
+  </aside>`;
+  const chosenPath = model.selectedRoute || model.selectedIncomingRoute || model.selectedOutgoingRoute;
+  const chosenStatus = chosenPath ? model.edgeStatus(chosenPath, completed) : null;
+  const requirements = chosenPath?.requirements || [];
+  const sourceRefs = chosenPath?.source_refs || selected?.source_refs || system.source_refs;
+  const details = selected ? `<aside class="atlas-inspector atlas-inspector-cd" aria-label="Detalhes da rota" data-scroll="atlas-inspector-${esc(model.selectedId)}">
+    <div class="atlas-inspector-title"><div><h3>${esc(selected.label)}</h3><p>${chosenPath ? "Rota selecionada" : "Entidade selecionada"}</p></div><span>#${String(number(selected)).padStart(3, "0")}</span></div>
+    <div class="atlas-inspector-art">${mediaFor(selected)?.url ? `<img src="${esc(mediaFor(selected).url)}" alt="${esc(selected.label)}">` : '<span aria-hidden="true">◇</span>'}</div>
+    ${model.incoming.length ? `<label class="atlas-path-label">Origem desta rota<select id="atlas-path" aria-label="Origem desta rota">${model.incoming.map((edge) => `<option value="${esc(edge.id)}" ${edge.id === model.selectedIncomingRoute?.id ? "selected" : ""}>${esc(model.byId.get(edge.from)?.label || "Origem")} → ${esc(selected.label)}${edge.label ? ` · ${esc(edge.label)}` : ""}</option>`).join("")}</select></label>` : ""}
+    <div class="atlas-requirements"><h4>Requisitos desta rota ${chosenStatus?.total ? `<span>${chosenStatus.unknown ? "?" : `${chosenStatus.done}/${chosenStatus.total}`}</span>` : ""}</h4>
+    ${chosenPath?.label ? `<p class="atlas-route-kind">${esc(chosenPath.label)}</p>` : ""}
+    ${requirements.map((req) => `<label class="${req.operator === "unknown" || req.condition?.op === "unknown" ? "unknown" : ""}"><input type="checkbox" data-testid="atlas-requirement" data-atlas-requirement="${esc(req.id)}" data-edge="${esc(chosenPath.id)}" ${req.operator === "unknown" || req.condition?.op === "unknown" || system._draftSource ? "disabled" : ""} ${model.isRequirementCompleted(chosenPath, req) ? "checked" : ""}><span>${req.mode === "item" ? '<em class="atlas-requirement-mode">Item do jogo</em>' : ""}${esc(req.text)}</span></label>`).join("") || '<p>Sem requisitos documentados para esta rota.</p>'}
+    ${chosenStatus?.unknown ? '<p class="atlas-rule-warning">Disponibilidade desconhecida. Consulte a regra e a cota no trecho original.</p>' : ""}</div>
+    ${system.source_id ? `<button class="atlas-source" data-atlas-source="${esc(selected.id)}">Consultar trecho · ${refsHTML(sourceRefs) || "Fonte local"} ↗</button>` : ""}
+    <div class="atlas-inspector-actions"><button class="primary" id="atlas-goal" ${system._draftSource ? "disabled" : ""}>${state.goals?.[system.id] === selected.id ? "✓ Objetivo fixado" : "♧ Fixar objetivo"}</button><button id="atlas-media">▧ Trocar imagem</button><button id="atlas-edit">✎ Editar sistema</button></div>
+    <details class="atlas-source-info"><summary>ⓘ Fontes e manutenção</summary><p>${esc(system.description || system.title)}</p><button id="atlas-reprocess-source">Reprocessar fonte salva</button><button id="atlas-replace-source">Importar outra fonte</button>${!system._draftSource ? '<button class="danger" id="atlas-delete">Excluir sistema</button>' : ""}</details>
+  </aside>` : '<aside class="atlas-inspector empty">Nenhum cartão corresponde à busca.</aside>';
+  const diagnostics = system._draftDiagnostics || {};
+  const pendingCount = (diagnostics.pending_items || []).length || (diagnostics.pending_table_ids || []).length;
+  const review = system.status === "suggested" ? `<div class="atlas-review"><span>REVISAR PRÉVIA</span><p>${model.allNodes.length} cartões · ${model.allEdges.length} caminhos${pendingCount ? ` · ${pendingCount} pendências` : ""}</p><div class="atlas-review-actions"><button id="atlas-open-diagnostics">Ver detalhes</button><button id="atlas-review-pending-source">Revisar tabelas</button><button id="atlas-approve" ${pendingCount ? "disabled" : ""}>Aprovar sistema</button><button id="atlas-reject">Rejeitar</button></div></div>` : "";
+  const fill = S.guideImageFill[`${game.slug}:${system.id}:${system._draftSource || ""}`] || {};
+  const running = ["running", "waiting_retry", "queued"].includes(fill.phase);
+  const filled = model.allNodes.filter((node) => mediaFor(node)?.url).length;
+  const activeJobs = (bundle.atlas_jobs || []).filter((job) => ["running", "error", "interrupted", "suggested", "awaiting_source_review"].includes(job.status));
+  const jobTray = activeJobs.length ? `<details class="atlas-job-tray"><summary>Atividade das fontes · ${activeJobs.length}${activeJobs.some((job) => job.status === "error") ? " · Há uma análise com erro" : ""}</summary>${jobs}</details>` : "";
+  const groups = model.groups, tags = model.tags;
+  const filters = `<details class="atlas-filter-menu" ${A.filtersOpen ? "open" : ""}><summary>☷ Filtros</summary><div><label>Estágio / grupo<select id="atlas-group"><option value="all">Todos</option>${groups.map((group) => `<option value="${esc(group)}" ${A.group === group ? "selected" : ""}>${esc(group)}</option>`).join("")}</select></label><label>Tags<select id="atlas-tag"><option value="all">Todas</option>${tags.map((tag) => `<option value="${esc(tag)}" ${A.tag === tag ? "selected" : ""}>${esc(tag)}</option>`).join("")}</select></label><label>Disponibilidade<select id="atlas-availability">${[["all", "Todas"], ["available", "Disponível"], ["blocked", "Pendente"], ["unknown", "Desconhecida"]].map(([id, label]) => `<option value="${id}" ${A.availability === id ? "selected" : ""}>${label}</option>`).join("")}</select></label><label class="atlas-spoilers"><input id="atlas-spoilers" type="checkbox" ${A.spoilers ? "checked" : ""}> Mostrar spoilers</label></div></details>`;
+  const viewKey = [system.id, mode, A.nodeId, A.incomingEdgeId || A.edgeId, A.outgoingEdgeId, A.indexOpen, A.group, A.tag, A.availability, A.search, A.indexSearch].join(":");
+  const inspectorClosed = A.inspectorOpen === false && mode !== "list";
+  return `${jobTray}<section class="atlas-shell atlas-v2 atlas-cd ${review ? "has-review" : ""} ${mode === "list" ? "list-view" : ""} ${mode === "overview" ? "overview-view" : "routes-view"} ${inspectorClosed ? "inspector-closed" : ""}" style="--atlas-card-width:${layout.cardWidth}px;--atlas-card-height:${layout.cardHeight}px;--atlas-zoom:${A.zoom};--atlas-x:${A.panX}px;--atlas-y:${A.panY}px">
+    ${review}<div class="atlas-workspace"><header class="atlas-toolbar"><h2>Atlas</h2><select id="atlas-system" aria-label="Sistema">${systems.map((item) => `<option value="${esc(item.id)}" ${item.id === system.id ? "selected" : ""}>${esc(item.title)}</option>`).join("")}</select><label class="atlas-search"><span aria-hidden="true">⌕</span><input id="atlas-search" type="search" value="${esc(A.search || "")}" placeholder="Buscar no mapa" aria-label="Buscar nome ou número do card"></label><button id="atlas-sources" title="Fontes e revisões" aria-label="Fontes e revisões">▤</button><button data-atlas-inspector-toggle aria-expanded="${!inspectorClosed}" title="${inspectorClosed ? "Abrir detalhes" : "Ocultar detalhes"}">${inspectorClosed ? "Detalhes" : "Ocultar"}</button><button class="danger" id="atlas-delete-header" title="Excluir este guia">Excluir guia</button><button class="primary" id="atlas-create">Novo ＋</button></header><div class="atlas-contextbar"><span>${mode === "routes" ? `Rotas de <b>${esc(selected?.label || "—")}</b>` : `${model.visibleNodes.length} entidades visíveis`}</span>${mode === "routes" && (model.alternativeOrigins.length || model.alternativeDestinations.length) ? `<span class="atlas-alternative-summary">${model.alternativeOrigins.length ? `${model.alternativeOrigins.length} origem(ns)` : ""}${model.alternativeOrigins.length && model.alternativeDestinations.length ? " · " : ""}${model.alternativeDestinations.length ? `${model.alternativeDestinations.length} destino(s)` : ""}</span>` : ""}${filters}</div><div class="atlas-cd-body ${A.indexOpen === false ? "index-collapsed" : ""}"><div class="atlas-cd-index-wrap">${indexHTML}</div><div class="atlas-cd-graph"><div class="atlas-viewport" id="atlas-viewport" data-view-key="${esc(viewKey)}" data-selected-id="${esc(A.nodeId)}"><div class="atlas-world" style="width:${layout.width}px;height:${layout.height}px"><svg width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="atlas-arrow-route" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#25deeb" stroke-width="1.5"/></marker><marker id="atlas-arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#63748c" stroke-width="1.5"/></marker></defs>${edgesHTML}</svg>${nodeHTML}</div>${!model.matches.length ? '<p class="atlas-no-results">Nenhuma entidade corresponde aos filtros.</p>' : ""}</div>${alternatives}<footer class="atlas-map-footer"><div class="atlas-zoom"><button data-atlas-zoom="out" aria-label="Diminuir zoom">−</button><output id="atlas-zoom-value">${Math.round(A.zoom * 100)}%</output><button data-atlas-zoom="in" aria-label="Aumentar zoom">＋</button></div><div class="atlas-mode-tabs" aria-label="Visualização"><button data-atlas-mode="focus" class="${mode === "routes" ? "active" : ""}" aria-pressed="${mode === "routes"}">Rotas</button><button data-atlas-mode="map" class="${mode === "overview" ? "active" : ""}" aria-pressed="${mode === "overview"}">Visão geral</button><button data-atlas-mode="list" class="${mode === "list" ? "active" : ""}" aria-pressed="${mode === "list"}">Lista</button></div><button data-atlas-zoom="fit">⛶ Ajustar</button></footer></div></div><div class="atlas-image-status"><button id="atlas-fill-images" data-testid="atlas-image-fill">▧ ${running ? "Acompanhar imagens" : fill.phase === "cancelled" || fill.phase === "interrupted" ? "Retomar imagens" : "Preencher imagens"}</button><span>${filled}/${model.allNodes.length} com imagem${fill.phase === "waiting_retry" ? " · Nova tentativa agendada" : running ? " · Buscando…" : ""}</span>${(fill.changes || []).length && !running && !fill.undo ? '<button id="atlas-undo-images">↶ Desfazer lote</button>' : ""}${A.draftSource ? '<button id="atlas-back-published">Voltar ao publicado</button>' : ""}</div></div>${inspectorClosed ? "" : details}</section>`;
 }
 
 /* Leitor focado da Jornada. As fontes permanecem preservadas, mas sua gestão
@@ -1949,7 +2074,7 @@ async function atualizarGuia(action, blockId, value) {
 
 function openGuideMedia(query = "", context = null) {
   const localMedia = S.dashboardGame?.smart_guide?.media || [];
-  S.GM = { query, context, source: context ? "web" : "openverse", results: context ? localMedia.map((item) => ({ ...item, thumbnail: item.url, _local: true })) : [], busy: false, error: "" };
+  S.GM = { query, context, source: context ? "web" : "openverse", sites: "", results: context ? localMedia.map((item) => ({ ...item, thumbnail: item.url, _local: true })) : [], busy: false, error: "" };
   renderGuideMedia();
   if (query) searchGuideMedia();
 }
@@ -1974,12 +2099,14 @@ function renderGuideMedia() {
     <div class="gf-head"><div><div class="gf-title">REVISAR RECURSO VISUAL</div><div class="gf-sub">Nada é anexado sem sua aprovação.</div></div><button class="gf-close" id="gm-x">✕</button></div>
     <div class="gf-body"><div class="cv-sources">${G.context ? `<button class="cv-src ${G.source === "web" ? "on" : ""}" data-gm-source="web">Web / Google</button><button class="cv-src ${G.source === "library" ? "on" : ""}" data-gm-source="library">Biblioteca local</button>` : ""}<button class="cv-src ${G.source === "openverse" ? "on" : ""}" data-gm-source="openverse">Openverse</button><button class="cv-src ${G.source === "wikimedia" ? "on" : ""}" data-gm-source="wikimedia">Wikimedia</button><button class="cv-src" id="gm-broad">Busca ampla ↗</button></div>
       <div class="search-box"><span>⌕</span><input id="gm-q" value="${esc(G.query)}" placeholder="O que ajudaria a explicar esta etapa?"><button class="cv-go" id="gm-go">Buscar</button></div>
+      ${G.context ? `<label class="media-site-filter">Sites específicos (opcional)<input id="gm-sites" value="${esc(G.sites || "")}" placeholder="Ex.: wikimon.net, digimon.fandom.com"><small>Separe os domínios por vírgula. A busca usará somente esses sites.</small></label>` : ""}
       <div class="media-manual"><input id="gm-url" placeholder="Cole aqui a URL direta encontrada na busca ampla"><label><input id="gm-rights" type="checkbox"> Confirmo que posso usar esta imagem</label><button id="gm-url-save">Revisar e salvar URL</button></div>
       <label class="media-local"><span>＋ Adicionar imagem local</span><input id="gm-file" type="file" accept="image/*"></label>
       ${G.busy ? `<div class="status-msg">Buscando mídia com licença identificável…</div>` : ""}${G.error ? `<div class="gf-error">${esc(G.error)}</div>` : ""}
       <div class="media-results">${G.results.map((m, i) => `<article><img src="${esc(m.thumbnail || m.thumb || m.url)}" alt=""><div><b>${esc(m.title || "Imagem encontrada")}</b><span>${esc(m.creator || m.host || m.source_name || "Origem externa")}</span><small>${esc(m.license || (m.width ? `${m.width}×${m.height || "?"}` : "Licença não informada"))}</small><button data-gm-approve="${i}">${m._local ? "Usar esta imagem" : "Aprovar e salvar"}</button></div></article>`).join("")}</div>
     </div></div>`;
   $("#gm-x").onclick = closeGuideMedia;
+  $("#gm-sites")?.addEventListener("input", (event) => { G.sites = event.currentTarget.value; });
   modal.querySelectorAll("[data-gm-source]").forEach((b) => b.onclick = () => { G.source = b.dataset.gmSource; if (G.source === "library") G.results = (S.dashboardGame?.smart_guide?.media || []).map((item) => ({ ...item, thumbnail: item.url, _local: true })); renderGuideMedia(); if (G.source !== "library") searchGuideMedia(); });
   $("#gm-go").onclick = () => { G.query = ($("#gm-q")?.value || "").trim(); searchGuideMedia(); };
   $("#gm-q").onkeydown = (e) => { if (e.key === "Enter") { G.query = e.currentTarget.value.trim(); searchGuideMedia(); } };
@@ -2017,7 +2144,7 @@ async function searchGuideMedia() {
   if (G.source === "library") return;
   G.busy = true; G.error = ""; renderGuideMedia();
   const res = await (G.source === "web" && G.context
-    ? backend.searchGuideSystemMedia(S.activeSlug, G.context.systemId, G.context.nodeId, G.query, 0, G.context.sourceId || '')
+    ? backend.searchGuideSystemMedia(S.activeSlug, G.context.systemId, G.context.nodeId, G.query, 0, G.context.sourceId || '', { sites: G.sites || "" })
     : backend.searchGuideMedia(G.query, G.source)).catch((e) => ({ ok: false, error: String(e) }));
   if (!S.GM) return;
   G.busy = false; G.results = res?.results || []; G.error = res?.ok ? "" : (res?.error || "Falha na busca."); renderGuideMedia();
@@ -2117,15 +2244,16 @@ async function openAtlasSourceReview(sourceId, initialReview = null, title = "Fo
     const role = roleLabels[table.semantic_role] || "Revisão necessária · confirmar classificação";
     return `<label class="atlas-source-table-row ${pending ? "is-pending" : ""} ${table.semantic_role === "requirement" ? "is-requirement" : table.semantic_role === "reference" ? "is-reference" : ""}"><input type="checkbox" data-source-table="${esc(table.id)}" ${selected.has(table.id) ? "checked" : ""}><span><b>${esc(table.title || table.path?.join(" › ") || "Tabela sem título")}</b><small>p. ${esc(table.page)} · ${esc(table.rows)} linhas · ${esc((table.headers || []).join(" · ") || "sem cabeçalho")}</small><em>${esc(role)}</em><em>ID da tabela: ${esc(table.id || "não disponível")}</em><em>${(table.sample || []).slice(0, 2).map((row) => esc((row.cells || []).join(" | "))).join("  •  ")}</em>${pending ? `<strong>⚠ Esta tabela gerou a pendência atual</strong>` : ""}</span></label>`;
   }).join("");
+  const legacyTextMode = !!review.legacy_text_mode && !(review.tables || []).length;
   modal.innerHTML = `<div class="atlas-source-review-panel" role="dialog" aria-modal="true" aria-label="Revisão da fonte do Atlas">
-    <header><div><span>ATLAS / REVISÃO DA FONTE</span><h2>${esc(review.title || title)}</h2><p>Confirme as tabelas que serão interpretadas. O HTML original permanece local e não é executado.</p></div><button id="atlas-source-review-close">×</button></header>
+    <header><div><span>ATLAS / REVISÃO DA FONTE</span><h2>${esc(review.title || title)}</h2><p>${legacyTextMode ? "A captura antiga não possui tabelas estruturadas. O texto preservado será reprocessado com a correção de entidades compostas." : "Confirme as tabelas que serão interpretadas. O conteúdo original permanece local e não é executado."}</p></div><button id="atlas-source-review-close">×</button></header>
     ${review.edition_warning ? `<div class="atlas-source-warning"><b>⚠ Edição da fonte</b><p>${esc(review.edition_warning)}</p></div>` : ""}
     ${pendingTables.size ? `<div class="atlas-source-warning blocking"><b>⚠ ${pendingTables.size} tabela(s) pendente(s) destacada(s)</b><p>Desmarque uma tabela se ela não fizer parte do objetivo ou mantenha-a selecionada para tentar um novo mapeamento.</p></div>` : ""}
     <div class="atlas-source-review-stats"><b>${esc(review.pages || 0)} páginas</b><b>${esc(review.stats?.tables || review.tables?.length || 0)} tabelas</b><b>${esc(review.stats?.table_rows || 0)} linhas de tabela</b>${review.edition_signals?.length ? `<span>${review.edition_signals.map((signal) => esc(signal)).join(" · ")}</span>` : ""}</div>
     <div class="atlas-source-review-actions"><button id="atlas-source-select-all">Selecionar tudo</button><button id="atlas-source-select-none">Limpar seleção</button><button id="atlas-source-export-json">Exportar JSON</button><button id="atlas-source-export-md">Exportar Markdown</button></div>
     ${hierarchy ? `<details class="atlas-source-hierarchy"><summary>Árvore editorial (${esc(review.headings?.length || 0)} títulos)</summary><div>${hierarchy}</div></details>` : ""}
-    <div class="atlas-source-table-list">${rows || `<p>Não foram encontradas tabelas nesta captura.</p>`}</div>
-    <footer><p>Objetivo: <b>${esc(title || review.title || "Sistema visual")}</b>. Cabeçalhos e notas do contexto acompanham as tabelas selecionadas.</p><button id="atlas-source-review-cancel">Cancelar</button><button class="primary" id="atlas-source-review-start">Confirmar e analisar</button></footer>
+    <div class="atlas-source-table-list">${rows || `<p>${legacyTextMode ? "Nenhuma tabela foi detectada; todos os trechos textuais preservados serão enviados para a análise compatível." : "Não foram encontradas tabelas nesta captura."}</p>`}</div>
+    <footer><p>Objetivo: <b>${esc(title || review.title || "Sistema visual")}</b>. ${legacyTextMode ? "A análise usará os trechos textuais da captura." : "Cabeçalhos e notas do contexto acompanham as tabelas selecionadas."}</p><button id="atlas-source-review-cancel">Cancelar</button><button class="primary" id="atlas-source-review-start">${legacyTextMode ? "Reprocessar texto" : "Confirmar e analisar"}</button></footer>
   </div>`;
   document.body.appendChild(modal);
   const close = () => modal.remove();
@@ -2141,8 +2269,8 @@ async function openAtlasSourceReview(sourceId, initialReview = null, title = "Fo
     const button = $("#atlas-source-review-start", modal); button.disabled = true; button.textContent = "Iniciando…";
     const selection = { table_ids: inputs().filter((input) => input.checked).map((input) => input.dataset.sourceTable) };
     const result = await backend.startAtlasSource(S.activeSlug, sourceId, selection).catch((error) => ({ ok: false, error: String(error), error_kind: "internal" }));
-    if (!result?.ok) { button.disabled = false; button.textContent = "Confirmar e analisar"; return toast(result?.error || "Não foi possível iniciar a análise.", true); }
-    close(); atlasImportProgress(title || review.title, "gamefaqs"); await finishAtlasSourceImport(result, title || review.title);
+    if (!result?.ok) { button.disabled = false; button.textContent = legacyTextMode ? "Reprocessar texto" : "Confirmar e analisar"; return toast(result?.error || "Não foi possível iniciar a análise.", true); }
+    close(); atlasImportProgress(title || review.title, loaded.source?.kind === "pdf" ? "pdf" : "gamefaqs"); await finishAtlasSourceImport(result, title || review.title);
   };
 }
 
@@ -2279,12 +2407,14 @@ function openAtlasDiagnostics(system) {
     return parts.join(" · ") || "referência não disponível";
   };
   const cardLabel = (item) => (item.card_numbers || []).filter(Boolean).map((number) => `<button type="button" class="atlas-diagnostic-card-link" data-atlas-diagnostic-card="${Number(number)}">Card #${String(number).padStart(3, "0")}</button>`).join(' <span aria-hidden="true">→</span> ') || "Nenhum card materializado";
+  const compositeDetails = (item) => item.kind !== "combined_entity_card" ? "" : `<div class="atlas-diagnostic-composite"><b>Correção proposta</b>${item.components?.length ? `<p>Entidades individuais: ${item.components.map((label) => esc(label)).join(" · ")}</p>` : `<p>${esc(item.split_reason || "A fonte não confirma a separação; a decisão continua pendente.")}</p>`}${item.reusable_paths?.length ? `<p>Caminhos a reutilizar: ${item.reusable_paths.map((path) => `${esc(path.from)} → ${esc(path.to)}${path.from_card ? ` (#${String(path.from_card).padStart(3, "0")})` : ""}`).join(" · ")}</p>` : "<p>Nenhum caminho individual equivalente foi encontrado nesta prévia.</p>"}${item.redundant_paths?.length ? `<p>Remover na nova revisão: ${item.redundant_paths.map((path) => `${esc(path.from)} → ${esc(path.to)}`).join(" · ")}</p>` : ""}<p>Imagem: ${esc(item.impact?.image || "preservação será avaliada")}; objetivo: ${esc(item.impact?.objective || "seleção explícita se necessário")}; requisitos concluídos: ${Number(item.impact?.completed_requirements || 0)}.</p></div>`;
   const itemHTML = (item, warning = false) => `<article class="atlas-diagnostic-item ${warning ? "warning" : "blocking"}">
     <div class="atlas-diagnostic-kicker"><span>${warning ? "AVISO" : "PENDÊNCIA"}</span><b>${cardLabel(item)}</b></div>
     <h4>${esc(item.message || "Interpretação incompleta")}</h4>
     <p>${esc(item.action || "Revise o trecho e processe novamente.")}</p>
     <small>${esc(item.table_title || "Tabela")} · ${esc(refs(item))}${item.kind ? ` · ${esc(item.kind)}` : ""}</small>
     ${item.row_preview ? `<pre>${esc(item.row_preview)}</pre>` : ""}
+    ${compositeDetails(item)}
   </article>`;
   $("#atlas-diagnostics")?.remove();
   root.insertAdjacentHTML("beforeend", `<div class="gf-backdrop" id="atlas-diagnostics"><div class="gf-panel atlas-diagnostics-panel" role="dialog" aria-modal="true" aria-label="Diagnóstico do Atlas">
@@ -2310,7 +2440,16 @@ function closeGuideSystemEditor() { document.getElementById("guide-system-editor
 
 function normalizeGuideEditorCardNumbers() {
   const nodes = S.GSE?.nodes || [];
-  nodes.forEach((node, index) => { node.card_number = index + 1; });
+  const used = new Set();
+  let next = Math.max(0, ...nodes.map((node) => Number(node.card_number) || 0)) + 1;
+  nodes.forEach((node) => {
+    const current = Number(node.card_number) || 0;
+    if (current > 0 && !used.has(current)) {
+      node.card_number = current; used.add(current); return;
+    }
+    while (used.has(next)) next += 1;
+    node.card_number = next; used.add(next); next += 1;
+  });
 }
 
 function syncGuideSystemEditor() {
@@ -2319,6 +2458,7 @@ function syncGuideSystemEditor() {
   E.description = $("#gse-description")?.value || "";
   E.group_label = $("#gse-group-label")?.value || "Grupo";
   E.layout = $("#gse-layout")?.value || "layered";
+  if ($("#gse-goal-replacement")) E._goal_replacement = $("#gse-goal-replacement").value || "";
   document.querySelectorAll("[data-gse-node]").forEach((row) => {
     const node = E.nodes[Number(row.dataset.gseNode)]; if (!node) return;
     node.label = row.querySelector("[data-node-label]")?.value || "";
@@ -2348,15 +2488,17 @@ function renderGuideSystemEditor() {
   if (!modal) { modal = document.createElement("div"); modal.id = "guide-system-editor"; modal.className = "modal-bg"; document.body.appendChild(modal); }
   normalizeGuideEditorCardNumbers();
   const E = S.GSE, options = (selected) => E.nodes.map((node) => `<option value="${esc(node.id)}" ${node.id === selected ? "selected" : ""}>${esc(node.label || "Sem nome")}</option>`).join("");
+  const objectiveIssue = (E._draftDiagnostics?.pending_items || []).find((item) => item?.kind === "objective_replacement");
+  const objectiveField = objectiveIssue ? `<label class="wide gse-objective-replacement"><b>Objetivo removido</b><small>${esc(objectiveIssue.message || "Selecione o card que substituirá o objetivo publicado.")}</small><select id="gse-goal-replacement" required><option value="">Escolha um card substituto…</option>${E.nodes.map((node) => `<option value="${esc(node.id)}" ${node.id === E._goal_replacement ? "selected" : ""}>#${String(Number(node.card_number || 0)).padStart(3, "0")} · ${esc(node.label || "Sem nome")}</option>`).join("")}</select></label>` : "";
   modal.innerHTML = `<div class="system-editor-panel" role="dialog" aria-modal="true" aria-label="Editor de sistema visual">
     <header><div><span>EDITOR GENÉRICO</span><h2>${E.id ? "Editar sistema visual" : "Criar sistema visual"}</h2></div><button id="gse-close">×</button></header>
-    <div class="system-editor-scroll"><section class="system-editor-basics"><label>Título<input id="gse-title" value="${esc(E.title)}"></label><label>Rótulo dos grupos<input id="gse-group-label" value="${esc(E.group_label)}"></label><label>Layout<select id="gse-layout"><option value="layered" ${E.layout === "layered" ? "selected" : ""}>Em camadas</option><option value="vertical" ${E.layout === "vertical" ? "selected" : ""}>Vertical</option><option value="radial" ${E.layout === "radial" ? "selected" : ""}>Radial</option></select></label><label class="wide">Descrição<textarea id="gse-description">${esc(E.description)}</textarea></label></section>
+    <div class="system-editor-scroll"><section class="system-editor-basics"><label>Título<input id="gse-title" value="${esc(E.title)}"></label><label>Rótulo dos grupos<input id="gse-group-label" value="${esc(E.group_label)}"></label><label>Layout<select id="gse-layout"><option value="layered" ${E.layout === "layered" ? "selected" : ""}>Em camadas</option><option value="vertical" ${E.layout === "vertical" ? "selected" : ""}>Vertical</option><option value="radial" ${E.layout === "radial" ? "selected" : ""}>Radial</option></select></label><label class="wide">Descrição<textarea id="gse-description">${esc(E.description)}</textarea></label>${objectiveField}</section>
     <section><div class="system-editor-title"><div><span>01</span><h3>Nós</h3><p>Entidades, estados, classes, receitas ou etapas. O número do card é automático e acompanha a ordem.</p></div><button id="gse-add-node">＋ Adicionar nó</button></div><div class="system-editor-list">${E.nodes.map((node, index) => { const number = Number(node.card_number || index + 1) || index + 1; return `<article data-gse-node="${index}"><div class="row-index"><b>#${String(number).padStart(3, "0")}</b><small>card</small></div><div class="node-fields"><input data-node-label value="${esc(node.label)}" placeholder="Nome"><input data-node-stage value="${esc(node.stage)}" placeholder="Estágio"><input data-node-group value="${esc(node.group)}" placeholder="Grupo"><input data-node-tags value="${esc((node.tags || []).join(", "))}" placeholder="Tags separadas por vírgula"><input class="wide" data-node-subtitle value="${esc(node.subtitle)}" placeholder="Descrição curta"><input class="wide" data-node-media-query value="${esc(node.media_query || "")}" placeholder="Consulta sugerida para imagem"><label><input data-node-spoiler type="checkbox" ${node.spoiler ? "checked" : ""}> spoiler</label></div><button data-remove-node="${index}" title="Remover">×</button></article>`; }).join("")}</div></section>
     <section><div class="system-editor-title"><div><span>02</span><h3>Caminhos e condições</h3><p>Relações documentadas entre os nós.</p></div><button id="gse-add-edge">＋ Adicionar caminho</button></div><div class="system-editor-list">${E.edges.map((edge, index) => `<article data-gse-edge="${index}"><div class="row-index">${index + 1}</div><div class="edge-fields"><select data-edge-from>${options(edge.from)}</select><span>→</span><select data-edge-to>${options(edge.to)}</select><input data-edge-label value="${esc(edge.label)}" placeholder="Rótulo do caminho"><select data-edge-kind><option value="normal" ${edge.path_kind === "normal" ? "selected" : ""}>Normal</option><option value="alternative" ${edge.path_kind === "alternative" ? "selected" : ""}>Alternativo</option><option value="optional" ${edge.path_kind === "optional" ? "selected" : ""}>Opcional</option></select><textarea class="wide" data-edge-requirement placeholder="Um requisito documentado por linha">${esc((edge.requirements || []).map((item) => item.text).join("\n"))}</textarea><label><input data-edge-missable type="checkbox" ${edge.missable ? "checked" : ""}> perdível</label></div><button data-remove-edge="${index}" title="Remover">×</button></article>`).join("")}</div></section></div>
     <footer><p>A fonte original não será modificada. Esta edição cria uma nova revisão atômica.</p><button id="gse-cancel">Cancelar</button><button class="primary" id="gse-save">Publicar nova revisão</button></footer>
   </div>`;
   $("#gse-close").onclick = closeGuideSystemEditor; $("#gse-cancel").onclick = closeGuideSystemEditor;
-  $("#gse-add-node").onclick = () => { syncGuideSystemEditor(); E.nodes.push({ id: `manual-${Date.now()}`, card_number: E.nodes.length + 1, label: "Novo nó", subtitle: "", stage: "", group: "", tags: [], attributes: {}, media_query: "", spoiler: false, source_refs: [] }); renderGuideSystemEditor(); };
+  $("#gse-add-node").onclick = () => { syncGuideSystemEditor(); const next = Math.max(0, ...E.nodes.map((node) => Number(node.card_number) || 0)) + 1; E.nodes.push({ id: `manual-${Date.now()}`, card_number: next, label: "Novo nó", subtitle: "", stage: "", group: "", tags: [], attributes: {}, media_query: "", spoiler: false, source_refs: [] }); renderGuideSystemEditor(); };
   $("#gse-add-edge").onclick = () => { syncGuideSystemEditor(); if (E.nodes.length < 2) return toast("Adicione ao menos dois nós.", true); E.edges.push({ id: "", from: E.nodes[0].id, to: E.nodes[1].id, label: "", path_kind: "normal", requirements: [], missable: false, spoiler: false, source_refs: [] }); renderGuideSystemEditor(); };
   modal.querySelectorAll("[data-remove-node]").forEach((button) => button.onclick = () => { syncGuideSystemEditor(); const removed = E.nodes.splice(Number(button.dataset.removeNode), 1)[0]; E.edges = E.edges.filter((edge) => edge.from !== removed.id && edge.to !== removed.id); normalizeGuideEditorCardNumbers(); renderGuideSystemEditor(); });
   modal.querySelectorAll("[data-remove-edge]").forEach((button) => button.onclick = () => { syncGuideSystemEditor(); E.edges.splice(Number(button.dataset.removeEdge), 1); renderGuideSystemEditor(); });
@@ -2396,6 +2538,34 @@ let atlasResizeObserver;
 function atlasMeasureWorkspace(forceFit = false) {
   const shell = $(".atlas-v2"), main = shell?.closest(".atlas-main"), viewport = $("#atlas-viewport");
   if (!shell || !main || !viewport) return;
+  if (window.innerWidth >= 1460
+      && (S.guideAtlas.indexAutoCollapsed || S.guideAtlas.inspectorAutoCollapsed)) {
+    S.guideAtlas.indexOpen = true;
+    S.guideAtlas.indexAutoCollapsed = false;
+    S.guideAtlas.inspectorOpen = true;
+    S.guideAtlas.inspectorAutoCollapsed = false;
+    S.guideAtlas.viewKey = "";
+    renderDashboard({ force: true });
+    return;
+  }
+  // The route needs at least 664 px of usable canvas for three full cards and
+  // their 40+ px gaps.  Reclaim the index before reducing the cards or zoom;
+  // this is the C+D responsive rule and avoids the clipped 1280 px layout.
+  if (!shell.classList.contains("list-view") && window.innerWidth > 820
+      && viewport.clientWidth < 664 && document.querySelectorAll(".atlas-node-cd").length > 2) {
+    if (S.guideAtlas.indexOpen !== false) {
+      S.guideAtlas.indexOpen = false;
+      S.guideAtlas.indexAutoCollapsed = true;
+    }
+    else if (S.guideAtlas.inspectorOpen !== false) {
+      S.guideAtlas.inspectorOpen = false;
+      S.guideAtlas.inspectorAutoCollapsed = true;
+    }
+    else return;
+    S.guideAtlas.viewKey = "";
+    renderDashboard({ force: true });
+    return;
+  }
   if (window.innerWidth > 820) {
     const top = shell.getBoundingClientRect().top - main.getBoundingClientRect().top + main.scrollTop;
     shell.style.setProperty("--atlas-shell-height", `${Math.max(420, main.clientHeight - top - 8)}px`);
@@ -2422,8 +2592,9 @@ function openAtlasImageFill(game, system, start) {
   const close = () => { modal.remove(); if (previousFocus?.isConnected) previousFocus.focus(); else $("#atlas-fill-images")?.focus(); };
   const example = system.nodes.find(node => node.id === S.guideAtlas.nodeId && !node.spoiler)?.label
     || system.nodes.find(node => !node.spoiler)?.label || "Entidade";
+  const existingSites = Array.isArray(options.sites) ? options.sites : String(options.sites || "").split(/[,;\n]+/).map((site) => site.trim()).filter(Boolean);
   modal.innerHTML = `<section class="atlas-image-dialog" role="dialog" aria-modal="true" aria-labelledby="atlas-image-title"><header><div><h2 id="atlas-image-title">Imagens do Atlas</h2><p>Escolha o contexto da busca. Ele será aplicado a cada entidade deste sistema.</p></div><button data-close aria-label="Fechar">×</button></header>
-    ${active ? '<div class="atlas-image-progress" aria-live="polite"><b data-fill-counter></b><progress></progress><p data-fill-message></p></div><ul class="atlas-image-issues"></ul>' : `<form id="atlas-image-form"><label>Jogo ou contexto (opcional)<input id="atlas-image-context" value="${esc(options.context || "")}" placeholder="Ex.: Digimon World 3"></label><label>Wiki / site (opcional)<input id="atlas-image-wiki" value="${esc(options.wiki || "")}" placeholder="Ex.: wikimon.net ou URL da wiki"></label><label>Exemplo da busca<output id="atlas-image-example"></output></label><label class="atlas-image-replace"><input id="atlas-image-replace" type="checkbox"> Refazer também as imagens existentes com este contexto.</label><p>As buscas continuam enquanto o DigiTracker estiver aberto. Você pode fechar esta janela, pausar ou retomar depois.</p><p>O jogo e a wiki informados restringem os resultados. Se não houver uma imagem compatível, o card continua pendente: ajuste o contexto ou escolha uma imagem manualmente. A fila só conclui quando todos têm imagem.</p></form>`}
+    ${active ? '<div class="atlas-image-progress" aria-live="polite"><b data-fill-counter></b><progress></progress><p data-fill-message></p></div><ul class="atlas-image-issues"></ul>' : `<form id="atlas-image-form"><label>Jogo ou contexto (opcional)<input id="atlas-image-context" value="${esc(options.context || "")}" placeholder="Ex.: Digimon World 3"></label><label>Wiki / site (opcional)<input id="atlas-image-wiki" value="${esc(options.wiki || "")}" placeholder="Ex.: wikimon.net ou URL da wiki"></label><label>Sites específicos (opcional)<input id="atlas-image-sites" value="${esc(existingSites.filter((site) => site !== options.wiki).join(", "))}" placeholder="Ex.: wikimon.net, digimon.fandom.com"><small>Separe os domínios por vírgula. A busca ficará restrita a esses sites.</small></label><label>Exemplo da busca<output id="atlas-image-example"></output></label><label class="atlas-image-replace"><input id="atlas-image-replace" type="checkbox"> Refazer também as imagens existentes com este contexto.</label><p>As buscas continuam enquanto o DigiTracker estiver aberto. Você pode fechar esta janela, pausar ou retomar depois.</p><p>O jogo, a wiki e os sites informados restringem os resultados. Se não houver uma imagem compatível, o card continua pendente: ajuste o contexto ou escolha uma imagem manualmente. A fila só conclui quando todos têm imagem.</p></form>`}
     <footer><button data-close>${active ? "Continuar navegando" : "Cancelar"}</button><button class="primary" id="atlas-image-start">${active ? "Pausar preenchimento" : "Preencher todos os cartões"}</button></footer></section>`;
   document.body.appendChild(modal);
   modal.querySelectorAll("[data-close]").forEach(button => button.onclick = close);
@@ -2441,8 +2612,14 @@ function openAtlasImageFill(game, system, start) {
     const context = modal.querySelector("#atlas-image-context")?.value.trim() || "";
     let wiki = modal.querySelector("#atlas-image-wiki")?.value.trim() || "";
     if (wiki) { try { wiki = new URL(wiki.includes("://") ? wiki : `https://${wiki}`).hostname; } catch (_) {} }
+    const sites = modal.querySelector("#atlas-image-sites")?.value.trim() || "";
     const output = modal.querySelector("#atlas-image-example");
-    if (output) output.textContent = [context, example, wiki ? `site:${wiki}` : ""].filter(Boolean).join(" ");
+    const siteTokens = sites.split(/[,;\n]+/).map((site) => site.trim()).filter(Boolean).slice(0, 8).map((site) => {
+      try { return new URL(site.includes("://") ? site : `https://${site}`).hostname; }
+      catch (_) { return site.replace(/^https?:\/\//i, "").split("/")[0]; }
+    }).filter(Boolean);
+    const directSites = [wiki, ...siteTokens].filter(Boolean).filter((site, index, values) => values.indexOf(site) === index).map((site) => `https://${site}${site.endsWith(".fandom.com") ? "/wiki/" : "/"}${encodeURIComponent(example.trim().replace(/\s+/g, "_"))}`);
+    if (output) output.textContent = [context, example, ...directSites].filter(Boolean).join(" · ");
   };
   modal.querySelectorAll("input").forEach(input => input.addEventListener("input", updateExample));
   updateExample();
@@ -2465,7 +2642,7 @@ function openAtlasImageFill(game, system, start) {
       if (["running", "queued", "waiting_retry"].includes(latest.phase)) await backend.cancelGuideSystemImageFill(game.slug, system.id, system._draftSource || "");
       close(); return;
     }
-    const result = await start({context: modal.querySelector("#atlas-image-context").value, wiki: modal.querySelector("#atlas-image-wiki").value,
+    const result = await start({context: modal.querySelector("#atlas-image-context").value, wiki: modal.querySelector("#atlas-image-wiki").value, sites: modal.querySelector("#atlas-image-sites")?.value || "",
       replace_existing: modal.querySelector("#atlas-image-replace").checked});
     if (result) close(); else button.disabled = false;
   };
@@ -2505,6 +2682,7 @@ function bindGuideAtlas(game) {
   const selectPath = async edgeId => {
     S.guideAtlas.search = "";
     S.guideAtlas.edgeId = edgeId;
+    S.guideAtlas.incomingEdgeId = edgeId;
     S.guideAtlas.branchPage = 0;
     if (!system._draftSource && S.mode !== "demo") { const result = await appCall("set_guide_system_path", game.slug, system.id, edgeId); if (!result.ok) toast(result.error, true); }
     await rerender();
@@ -2546,8 +2724,32 @@ function bindGuideAtlas(game) {
   }
   $("#atlas-back-published")?.addEventListener("click", () => { S.guideAtlas.draftSource = ""; rerender(); });
   root.querySelectorAll("[data-atlas-mode]").forEach((button) => button.addEventListener("click", () => { S.guideAtlas.mode = button.dataset.atlasMode; S.guideAtlas.viewKey = ""; rerender(); }));
+  root.querySelectorAll("[data-atlas-index-toggle]").forEach((button) => button.addEventListener("click", () => {
+    S.guideAtlas.indexOpen = S.guideAtlas.indexOpen === false;
+    S.guideAtlas.indexAutoCollapsed = false;
+    S.guideAtlas.viewKey = "";
+    rerender();
+  }));
+  root.querySelectorAll("[data-atlas-index-open]").forEach((button) => button.addEventListener("click", () => {
+    S.guideAtlas.indexOpen = true; S.guideAtlas.viewKey = ""; rerender();
+  }));
+  root.querySelectorAll("[data-atlas-inspector-toggle]").forEach((button) => button.addEventListener("click", () => {
+    S.guideAtlas.inspectorOpen = S.guideAtlas.inspectorOpen === false;
+    S.guideAtlas.inspectorAutoCollapsed = false;
+    S.guideAtlas.viewKey = "";
+    rerender();
+  }));
+  let indexSearchTimer;
+  $("#atlas-index-search")?.addEventListener("input", (event) => {
+    const value = event.target.value;
+    clearTimeout(indexSearchTimer);
+    indexSearchTimer = setTimeout(async () => {
+      S.guideAtlas.indexSearch = value; await rerender();
+      $("#atlas-index-search")?.focus();
+    }, 160);
+  });
   $("#atlas-list-toggle")?.addEventListener("click", () => { S.guideAtlas.mode = S.guideAtlas.mode === "list" ? "map" : "list"; rerender(); });
-  $("#atlas-system")?.addEventListener("change", (event) => { Object.assign(S.guideAtlas, {systemId: event.target.value, nodeId: "", edgeId: "", group: "all", tag: "all", mode: "focus", branchPage: 0, viewKey: ""}); rerender(); });
+  $("#atlas-system")?.addEventListener("change", (event) => { Object.assign(S.guideAtlas, {systemId: event.target.value, nodeId: "", edgeId: "", incomingEdgeId: "", outgoingEdgeId: "", indexSearch: "", indexOpen: window.innerWidth >= 1460, indexAutoCollapsed: false, inspectorOpen: true, inspectorAutoCollapsed: false, group: "all", tag: "all", mode: "focus", branchPage: 0, viewKey: ""}); rerender(); });
   $("#atlas-group")?.addEventListener("change", (event) => { S.guideAtlas.group = event.target.value; rerender(); });
   $("#atlas-tag")?.addEventListener("change", (event) => { S.guideAtlas.tag = event.target.value; rerender(); });
   $("#atlas-availability")?.addEventListener("change", (event) => { S.guideAtlas.availability = event.target.value; rerender(); });
@@ -2564,7 +2766,7 @@ function bindGuideAtlas(game) {
   });
   $("#atlas-spoilers")?.addEventListener("change", (event) => { S.guideAtlas.spoilers = event.target.checked; rerender(); });
   root.querySelectorAll("[data-atlas-node]").forEach((button) => {
-    button.onclick = () => { S.guideAtlas.nodeId = button.dataset.atlasNode; S.guideAtlas.search = ""; S.guideAtlas.branchPage = 0; S.guideAtlas.edgeId = ""; rerender(); };
+    button.onclick = () => { S.guideAtlas.nodeId = button.dataset.atlasNode; S.guideAtlas.search = ""; S.guideAtlas.branchPage = 0; S.guideAtlas.edgeId = ""; S.guideAtlas.incomingEdgeId = ""; S.guideAtlas.outgoingEdgeId = ""; rerender(); };
     button.onkeydown = (event) => {
       const current = button.dataset.atlasNode;
       const edge = event.key === "ArrowRight" ? system?.edges?.find((item) => item.from === current)
@@ -2572,6 +2774,14 @@ function bindGuideAtlas(game) {
       const target = edge ? (event.key === "ArrowRight" ? edge.to : edge.from) : "";
       if (target) { event.preventDefault(); S.guideAtlas.nodeId = target; rerender().then(() => root.querySelector(`[data-atlas-node="${target}"]`)?.focus()); }
     };
+  });
+  root.querySelectorAll("[data-atlas-edge]").forEach((path) => path.onclick = () => {
+    const edge = system?.edges?.find((item) => item.id === path.dataset.atlasEdge);
+    if (!edge) return;
+    if (edge.to === S.guideAtlas.nodeId) { S.guideAtlas.edgeId = edge.id; S.guideAtlas.incomingEdgeId = edge.id; S.guideAtlas.outgoingEdgeId = ""; }
+    else if (edge.from === S.guideAtlas.nodeId) { S.guideAtlas.outgoingEdgeId = edge.id; S.guideAtlas.edgeId = ""; S.guideAtlas.incomingEdgeId = ""; }
+    else { S.guideAtlas.nodeId = edge.to; S.guideAtlas.edgeId = edge.id; S.guideAtlas.incomingEdgeId = edge.id; S.guideAtlas.outgoingEdgeId = ""; }
+    rerender();
   });
   root.querySelectorAll("[data-atlas-zoom]").forEach((button) => button.onclick = () => {
     const action = button.dataset.atlasZoom;
@@ -2611,6 +2821,20 @@ function bindGuideAtlas(game) {
       return true;
     });
   });
+  root.querySelectorAll("[data-atlas-route]").forEach((button) => button.onclick = async () => {
+    const edgeId = button.dataset.atlasRoute;
+    const edge = system?.edges?.find((item) => item.id === edgeId);
+    if (!edge) return;
+    S.guideAtlas.search = ""; S.guideAtlas.branchPage = 0;
+    if (edge.to === S.guideAtlas.nodeId) { S.guideAtlas.edgeId = edge.id; S.guideAtlas.incomingEdgeId = edge.id; S.guideAtlas.outgoingEdgeId = ""; }
+    else if (edge.from === S.guideAtlas.nodeId) { S.guideAtlas.outgoingEdgeId = edge.id; S.guideAtlas.edgeId = ""; S.guideAtlas.incomingEdgeId = ""; }
+    else { S.guideAtlas.nodeId = edge.to; S.guideAtlas.edgeId = edge.id; S.guideAtlas.incomingEdgeId = edge.id; S.guideAtlas.outgoingEdgeId = ""; }
+    if (!system._draftSource && S.mode !== "demo") {
+      const result = await appCall("set_guide_system_path", game.slug, system.id, edge.id);
+      if (!result?.ok) return toast(result?.error || "Falha ao selecionar a rota.", true);
+    }
+    await rerender();
+  });
   $("#atlas-undo-images")?.addEventListener("click", async (event) => {
     if (!system?.id) return;
     event.currentTarget.disabled = true;
@@ -2639,10 +2863,18 @@ function bindGuideAtlas(game) {
   $("#atlas-reprocess-source")?.addEventListener("click", async () => {
     if (S.mode === "demo") return toast("A demonstração não possui captura original para reprocessar.");
     if (!system.source_id || system.source_id === "legacy-main") return openAtlasSourceWizard(system);
-    const result = await backend.atlasSourceReview(game.slug, system.source_id).catch(error => ({ok:false, error:String(error)}));
-    if (!result.ok) return toast(result.error || "Não foi possível abrir a fonte salva.", true);
-    if (!(result.review?.tables || []).length) return openAtlasSourceWizard(system);
-    openAtlasSourceReview(system.source_id, result.review, system.title);
+    const button = $("#atlas-reprocess-source");
+    if (button) { button.disabled = true; button.textContent = "Reprocessando…"; }
+    const result = await backend.reprocessGuideSystem(game.slug, system.id)
+      .catch(error => ({ok:false, error:String(error)}));
+    if (button) { button.disabled = false; button.textContent = "Reprocessar fonte salva"; }
+    if (!result?.ok) return toast(result?.error || "Não foi possível reprocessar a fonte salva.", true);
+    if (result.phase === "awaiting_source_review") {
+      await rerender();
+      openAtlasSourceReview(result.source_id || system.source_id, result.review, result.source?.title || system.title);
+      return;
+    }
+    await rerender();
   });
   const deleteSystem = async () => {
     if (system._draftSource) return toast("Rejeite a prévia antes de excluir um sistema.", true);
@@ -2682,6 +2914,20 @@ function showMissableDetails(game) {
   });
 }
 
+function resetAtlasPresentationOnOpen(previousTab) {
+  if (previousTab === "atlas") return;
+  const A = S.guideAtlas;
+  A.mode = "focus";
+  A.edgeId = "";
+  A.incomingEdgeId = "";
+  A.outgoingEdgeId = "";
+  A.indexOpen = window.innerWidth >= 1460;
+  A.indexAutoCollapsed = false;
+  A.inspectorOpen = true;
+  A.inspectorAutoCollapsed = false;
+  A.viewKey = "";
+}
+
 function bindSidebar() {
   root.querySelector('[data-open-missables]')?.addEventListener('click', () => showMissableDetails(S.dashboardGame));
   bindGuideAtlas(S.dashboardGame);
@@ -2712,7 +2958,13 @@ function bindSidebar() {
     if (empty) empty.textContent = query ? "Nenhum jogo encontrado." : "Nenhum jogo ainda.";
   });
   root.querySelectorAll(".ptab").forEach((b) => {
-    b.onclick = () => { S.tab = b.dataset.tab; if (S.tab === "journey") S.guideReader = false; renderDashboard(); };
+    b.onclick = () => {
+      const previousTab = S.tab;
+      S.tab = b.dataset.tab;
+      if (S.tab === "atlas") resetAtlasPresentationOnOpen(previousTab);
+      if (S.tab === "journey") S.guideReader = false;
+      renderDashboard();
+    };
   });
   root.querySelectorAll("[data-ach-filter]").forEach((b) => {
     b.onclick = () => {
@@ -4698,10 +4950,12 @@ function spatialMove(direction) {
 
 function cyclePanelTab(dir) {
   if (S.view !== "dashboard" || S.compact) return;
+  const previousTab = S.tab;
   if (["mastery", "walk"].includes(S.tab)) S.tab = "achievements";
   if (["overview", "tips"].includes(S.tab)) S.tab = "journey";
   const i = Math.max(0, ABAS.indexOf(S.tab));
   S.tab = ABAS[(i + dir + ABAS.length) % ABAS.length];
+  if (S.tab === "atlas") resetAtlasPresentationOnOpen(previousTab);
   renderDashboard({ force: true }).then(() => $(".ptab.active")?.focus());
 }
 
@@ -5006,7 +5260,7 @@ const DEMO = [
       progress: { completed: ["demo-b1"], favorites: ["demo-b5"], revealed_spoilers: [], notes: {"demo-b3":"Fazer o farm antes do chefe."}, checkpoint: "demo-b1", history: [], session_minutes: 30 },
       effective_progress: { completed: ["demo-b1"], favorites: ["demo-b5"], revealed_spoilers: [], notes: {"demo-b3":"Fazer o farm antes do chefe."}, checkpoint: "demo-b1", history: [], session_minutes: 30 },
       next_objective: { chapter_id:"demo-c1", chapter:"Preparação antes da rota", block_id:"demo-b2", type:"checklist", title:"Preparação rápida", text:"Escolha uma arma de ataque à distância." },
-      system_state: {active_system:"sys_demo",goals:{sys_demo:"node_metal"},completed_requirements:["req_level"],node_media:{"sys_demo:node_veemon":"media_cover","sys_demo:node_greymon":"media_hero","sys_demo:node_metal":"media_card"},preferences:{}},
+      system_state: {active_system:"sys_demo",goals:{sys_demo:"node_metal"},completed_requirements:["req_level"],completed_requirement_targets:[],requirements_scoped:false,node_media:{"sys_demo:node_veemon":"media_cover","sys_demo:node_greymon":"media_hero","sys_demo:node_metal":"media_card"},preferences:{}},
       system_objective: {system_id:"sys_demo",system_title:"Linhas de progressão documentadas",node_id:"node_metal",title:"MetalGreymon",next_requirement:{id:"req_tech",text:"Técnica 15 ou superior"},requirements_total:2,requirements_completed:0},
       revisions: [{revision_id:"demo-r1",created_at:1770000000,provider:"local",model:"structured-fallback"}], media: [
         {id:"media_cover",url:"/ui/assets/demo-digital-dungeon-cover.png",title:"Arte demonstrativa",license:"Demonstração local"},

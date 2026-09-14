@@ -11,13 +11,13 @@
 <body>
   <div class="mobile-app" id="mobile-app">
     <header class="mobile-topbar">
-      <button class="mobile-icon-button" id="mobile-menu" type="button" aria-label="Abrir biblioteca" aria-controls="mobile-sheet">☰</button>
+      <button class="mobile-icon-button" id="mobile-menu" type="button" aria-label="Abrir biblioteca">☰</button>
       <div class="mobile-brand" aria-label="DigiTracker">
         <span class="brand-mark" aria-hidden="true">◇</span>
         <strong>Digi<span>Tracker</span></strong>
       </div>
       <div class="mobile-top-actions">
-        <button class="mobile-icon-button" id="mobile-search-toggle" type="button" aria-label="Buscar" aria-controls="mobile-search">⌕</button>
+        <button class="mobile-icon-button" id="mobile-search-toggle" type="button" aria-label="Buscar">⌕</button>
         <small id="connection" role="status">Conectando…</small>
       </div>
     </header>
@@ -39,14 +39,14 @@
     </main>
 
     <nav id="tabs" aria-label="Navegação" hidden>
-      <button data-tab="now" type="button"><span class="nav-icon" aria-hidden="true">⌂</span><span>Início</span></button>
+      <button data-tab="home" type="button"><span class="nav-icon" aria-hidden="true">⌂</span><span>Início</span></button>
       <button data-tab="guide" type="button"><span class="nav-icon" aria-hidden="true">▤</span><span>Guia</span></button>
       <button data-tab="atlas" type="button"><span class="nav-icon" aria-hidden="true">◇</span><span>Atlas</span></button>
       <button data-tab="items" type="button"><span class="nav-icon" aria-hidden="true">▣</span><span>Itens</span></button>
-      <button data-tab="achievements" type="button"><span class="nav-icon" aria-hidden="true">♜</span><span>Conquistas</span></button>
+      <button data-tab="more" type="button"><span class="nav-icon" aria-hidden="true">☷</span><span>Mais</span></button>
     </nav>
     <div id="message" role="status" data-testid="save-status"></div>
   </div>
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

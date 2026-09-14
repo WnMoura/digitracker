@@ -4,6 +4,7 @@ config/secrets.json
 # Preferências locais (auto-import, jogos dispensados)
 config/settings.json
 config/experience.sqlite3*
+config/companion.sqlite3*
 config/guides/
 assets/guides/
 backups/

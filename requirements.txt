@@ -8,6 +8,8 @@ Pillow>=10.0
 Flask>=3.1,<4
 waitress>=3.0,<4
 qrcode>=8,<9
+# Descoberta opcional do companion na rede local.
+zeroconf>=0.136,<1
 pyzipper>=0.3.6,<0.4
 # Importar guias direto do GameFAQs: curl_cffi imita o TLS de um Chrome atual;
 # cloudscraper fica como fallback e BeautifulSoup lê o HTML.

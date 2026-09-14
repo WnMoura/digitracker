@@ -7,6 +7,30 @@ from urllib.parse import unquote, urlparse
 from atlas_entities import clean_label, identity, split_entities
 
 
+def _site_hosts(value) -> list[str]:
+    """Normalize a comma/line separated allow-list of public site hosts."""
+    if isinstance(value, (list, tuple, set)):
+        values = [str(item or "").strip() for item in value]
+    else:
+        values = re.split(r"[,;\n]+", str(value or ""))
+    hosts = []
+    for item in values:
+        item = item.strip()
+        if not item:
+            continue
+        parsed = urlparse(item if "://" in item else "https://" + item)
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
+            raise ValueError("Informe domínios públicos, sem usuário ou senha.")
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}", host):
+            raise ValueError("Informe domínios válidos, por exemplo wikimon.net.")
+        if host.endswith((".local", ".localhost", ".internal")):
+            raise ValueError("Informe somente sites públicos.")
+        if host not in hosts:
+            hosts.append(host)
+    return hosts[:8]
+
+
 def normalize_options(value: dict | None = None) -> dict:
     raw = value if isinstance(value, dict) else {}
     context = re.sub(r"\s+", " ", str(raw.get("context") or "")).strip()[:180]
@@ -21,7 +45,10 @@ def normalize_options(value: dict | None = None) -> dict:
             raise ValueError("Informe o domínio ou URL da wiki, por exemplo wikimon.net.")
         if host.endswith((".local", ".localhost", ".internal")):
             raise ValueError("Informe o domínio público da wiki.")
-    return {"context": context, "wiki": host,
+    sites = _site_hosts(raw.get("sites"))
+    if host and host not in sites:
+        sites.insert(0, host)
+    return {"context": context, "wiki": host, "sites": sites[:8],
             "replace_existing": bool(raw.get("replace_existing", False))}
 
 
@@ -29,8 +56,8 @@ def entity_query(label: str, query_override: str = "", *, options: dict | None =
     value = query_override if str(query_override or "").strip() else clean_label(label)
     settings = normalize_options(options)
     parts = [settings["context"], str(value or "").strip()]
-    if settings["wiki"]:
-        parts.append("site:" + settings["wiki"])
+    for host in settings.get("sites") or ([settings["wiki"]] if settings.get("wiki") else []):
+        parts.append("site:" + host)
     return re.sub(r"\s+", " ", " ".join(filter(None, parts))).strip()[:600]
 
 
@@ -70,9 +97,10 @@ def valid_candidate(candidate: dict, label: str, options: dict | None = None) ->
     if any(host == bad or host.endswith("." + bad) for host in (source_host, image_host)
            for bad in ("youtube.com", "youtu.be", "ytimg.com", "tiktok.com")):
         return False
-    wiki = settings["wiki"]
-    # A CDN is allowed only with a page reference on the requested wiki.
-    if wiki and not any(host == wiki or host.endswith("." + wiki) for host in (source_host, image_host)):
+    sites = settings.get("sites") or ([settings["wiki"]] if settings.get("wiki") else [])
+    # A CDN is allowed only with a page reference on one of the requested sites.
+    if sites and not any(host == site or host.endswith("." + site)
+                         for host in (source_host, image_host) for site in sites):
         return False
     return True
 

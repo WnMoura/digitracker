@@ -1,366 +1,514 @@
 "use strict";
 
+import {guideBlocks, mediaUrl, namespaceFor, nodeById, normalized, patchConfirmedValue, rebaseNextDependent, requestId, systemById, targetKey, versionFor} from "./state.js";
+import {createStorage} from "./storage.js";
+
 const content = document.getElementById("content");
 const tabs = document.getElementById("tabs");
-const M = {
-  data: null, tab: "now", chapter: 0, pending: false, pendingTarget: "",
-  pendingTargets: new Set(), paired: false, undo: null, requestSeq: 0,
-  controller: null,
-};
+const connection = document.getElementById("connection");
+const messageBox = document.getElementById("message");
+const M = {data: null, revisions: {}, storage: null, namespace: "", loadedNamespace: "", connected: false, refreshing: false, retry: 0, retryTimer: 0, flushing: null, message: "", error: false, drafts: {question: "", items: {}}, p: defaults()};
 
-const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
-  "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
-}[char]));
+function defaults() {
+  return {view: "home", history: [], gameSlug: "", guideMode: "read", guideBlockId: "", atlasMode: "systems", atlasQuery: "", atlasSystemId: "", atlasNodeId: "", atlasEdgeId: "", itemFilter: "all", itemQuery: "", itemId: "", search: false, searchReturn: null, query: "", library: false, moreMode: "menu", assistant: false, source: null, conflict: null, forget: null, scroll: {}, recent: [], pending: []};
+}
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const num = (node, fallback = 0) => String(Number(node?.card_number || fallback || 0)).padStart(3, "0");
+const sourceName = (refs) => (refs || []).map((ref) => ref?.page ? `p.${ref.page}` : ref?.row_id || ref?.table_id || ref?.section || "").filter(Boolean).join(" · ");
+const pending = (key) => M.p.pending.includes(key);
+const slug = () => M.p.gameSlug || M.data?.game?.slug || "";
+function queryMatches(query, ...values) {
+  const q = normalized(query).trim();
+  if (!q) return true;
+  const id = q.match(/^#\s*(\d+)$/)?.[1];
+  if (id) return values.some((value) => /^\d+$/.test(String(value ?? "").trim()) && Number(value) === Number(id));
+  return normalized(values.map((value) => String(value ?? "")).join(" ")).includes(q);
+}
 
-function localImage(url) {
-  const raw = String(url ?? "").trim();
-  if (!raw) return "";
-  if (raw.startsWith("/assets/")) return esc(raw);
-  if (raw.startsWith("assets/")) return esc(`/${raw}`);
+function notify(text, error = false) {
+  M.message = String(text || ""); M.error = Boolean(error);
+  messageBox.textContent = M.message; messageBox.hidden = !M.message;
+  messageBox.classList.toggle("error", M.error);
+}
+function image(raw) {
+  raw = String(raw || "").trim(); if (!raw) return "";
+  try { const url = new URL(raw, location.origin); return url.origin === location.origin && url.pathname.startsWith("/assets/") ? esc(url.pathname + url.search) : ""; } catch (_) { return ""; }
+}
+function cover(game) {
+  const url = image(typeof game?.art === "string" ? game.art : game?.art?.url || game?.art?.src);
+  return url ? `<img class="game-cover" src="${url}" alt="">` : `<span class="game-cover fallback">◇</span>`;
+}
+function nodeImage(system, node) {
+  return mediaUrl(M.data, M.data?.system_state?.node_media?.[`${system.id}:${node.id}`] || node?.media_id, node?.image?.url || node?.image?.src);
+}
+function games() { return M.data?.games?.length ? M.data.games.filter((row) => row?.slug) : [M.data?.game].filter(Boolean); }
+function setConnected(value) {
+  M.connected = value;
+  connection.textContent = !M.data?.ok ? "Conexão necessária" : !value ? "Reconectando…" : M.p.pending.length ? `${M.p.pending.length} pendente(s)` : "PC sincronizado";
+}
+function rememberRecent(kind, id, title, detail = "") {
+  M.p.recent = [{kind, id, title, detail}, ...M.p.recent.filter((row) => row.kind !== kind || row.id !== id)].slice(0, 5); persist();
+}
+
+let saveTimer = 0;
+function persist() {
+  if (!M.storage?.available || !M.namespace) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { const value = globalThis.structuredClone ? structuredClone(M.p) : JSON.parse(JSON.stringify(M.p)); delete value.pending; delete value.forget; M.storage.setPresentation(M.namespace, value).catch(() => notify("Não foi possível guardar a navegação neste aparelho.", true)); }, 120);
+}
+async function restorePresentation() {
+  if (!M.namespace || M.namespace === M.loadedNamespace) return;
+  const saved = await M.storage?.getPresentation(M.namespace);
+  const operations = await M.storage?.pending(M.namespace) || [];
+  M.p = {...defaults(), ...(saved || {}), gameSlug: slug(), pending: [...new Set(operations.map((row) => row.target))]}; M.loadedNamespace = M.namespace;
+}
+function selections() {
+  const blocks = guideBlocks(M.data);
+  if (!blocks.some((row) => row.id === M.p.guideBlockId)) M.p.guideBlockId = M.data?.objective?.block_id || M.data?.progress?.checkpoint || blocks[0]?.id || "";
+  const systems = M.data?.systems || [];
+  if (!systems.some((row) => row.id === M.p.atlasSystemId)) M.p.atlasSystemId = M.data?.system_state?.active_system || systems[0]?.id || "";
+  const system = systemById(M.data, M.p.atlasSystemId);
+  if (!nodeById(system, M.p.atlasNodeId)) M.p.atlasNodeId = M.data?.system_state?.goals?.[system?.id] || system?.nodes?.[0]?.id || "";
+  if (!(system?.edges || []).some((row) => row.id === M.p.atlasEdgeId)) M.p.atlasEdgeId = (system?.edges || []).find((row) => row.to === M.p.atlasNodeId || row.from === M.p.atlasNodeId)?.id || "";
+  M.p.gameSlug = slug();
+}
+function viewKey() {
+  if(M.p.view==="guide")return `guide:${M.p.guideMode}:${M.p.guideMode==="read"?M.p.guideBlockId:"list"}`;
+  if(M.p.view==="atlas")return `atlas:${M.p.atlasMode}:${M.p.atlasSystemId}:${M.p.atlasMode==="route"?M.p.atlasNodeId:"list"}`;
+  if(M.p.view==="items")return `items:${M.p.itemId||"list"}:${M.p.itemFilter}`;
+  if(M.p.view==="more")return `more:${M.p.moreMode}`;
+  return "home";
+}
+function rememberScroll() { M.p.scroll={...(M.p.scroll||{}),[viewKey()]:Math.max(0,Math.round(window.scrollY||0))}; }
+function storedScroll() { return Number(M.p.scroll?.[viewKey()]||0); }
+function focusSnapshot(rootNode=content) {
+  const active=document.activeElement;if(!active||!rootNode.contains(active))return null;
+  let selector="";
+  if(active.id)selector=`#${CSS.escape(active.id)}`;
+  else if(active.dataset?.itemInput)selector=`[data-item-input="${CSS.escape(active.dataset.itemInput)}"]`;
+  else if(active.name)selector=`[name="${CSS.escape(active.name)}"]`;
+  return selector?{selector,start:active.selectionStart,end:active.selectionEnd}:null;
+}
+function restoreFocus(snapshot) { if(!snapshot)return;requestAnimationFrame(()=>{const field=content.querySelector(snapshot.selector);if(!field)return;field.focus({preventScroll:true});try{if(snapshot.start!=null)field.setSelectionRange(snapshot.start,snapshot.end??snapshot.start)}catch(_){}}); }
+function retryAfterSeconds(response) {
+  const raw = response?.headers?.get?.("Retry-After");
+  if (!raw) return 0;
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric) && numeric >= 0) return Math.min(60, numeric);
+  const date = Date.parse(raw);
+  return Number.isFinite(date) ? Math.max(0, Math.min(60, (date - Date.now()) / 1000)) : 0;
+}
+async function api(path, body) {
+  const response = await fetch(path, {method: body === undefined ? "GET" : "POST", headers: body === undefined ? {} : {"Content-Type":"application/json"}, body: body === undefined ? undefined : JSON.stringify(body), credentials:"same-origin"});
+  let value = {}; try { value = await response.json(); } catch (_) {}
+  if (!response.ok || value.ok === false) { const error = new Error(value.error || "Não foi possível falar com o DigiTracker."); error.status=response.status; error.value=value; error.retryAfter=retryAfterSeconds(response); throw error; }
+  return value;
+}
+async function restoreSession() {
+  try { await api("/session/restore", {}); return "restored"; }
+  catch (error) { return error.status === 401 && error.value?.needs_pairing ? "needs-pairing" : "temporary"; }
+}
+function retry(minimum = 0) {
+  clearTimeout(M.retryTimer); const backoff=[1,2,4,8,15,30][Math.min(M.retry++,5)];
+  const seconds=Math.max(Number(minimum)||0,backoff);
+  M.retryTimer=setTimeout(()=>M.data?poll(true):refresh(true),seconds*1000+Math.floor(Math.random()*250));
+}
+function query(path) { const mark=path.includes("?")?"&":"?"; return `${path}${mark}slug=${encodeURIComponent(slug())}`; }
+async function paged(path, key) {
+  const rows=[]; let offset=0, total=0;
+  do { const response=await api(query(`${path}?offset=${offset}&limit=100`)); const page=response[key]||[]; rows.push(...page); total=Number(response.total??rows.length); offset+=page.length; if(!page.length)break; } while(rows.length<total);
+  return rows;
+}
+function scrubPresentation() {
+  const visibleGuide=new Set(guideBlocks(M.data).filter(row=>!row.hidden).map(row=>row.id));
+  const visibleAtlas=new Set((M.data?.systems||[]).flatMap(system=>(system.nodes||[]).map(node=>node.id)));
+  const visibleItems=new Set((M.data?.items||[]).map(item=>item.id));
+  M.p.recent=(M.p.recent||[]).filter(row=>row.kind==="guide"?visibleGuide.has(row.id):row.kind==="atlas"?visibleAtlas.has(row.id):row.kind==="item"?visibleItems.has(row.id):false).slice(0,5);
+}
+async function refresh(draw = true) {
+  if (M.refreshing || document.hidden) return; M.refreshing=true;
   try {
-    const parsed = new URL(raw, location.origin);
-    return parsed.origin === location.origin && parsed.pathname.startsWith("/assets/")
-      ? esc(`${parsed.pathname}${parsed.search}`) : "";
-  } catch (_) { return ""; }
+    const response=await fetch(`/api/state${slug()?`?slug=${encodeURIComponent(slug())}`:""}`,{credentials:"same-origin"});
+    let value={}; try{value=await response.json();}catch(_){}
+    if(response.status===401){const restored=await restoreSession();if(restored==="restored"){M.refreshing=false;return refresh(draw);}if(restored==="needs-pairing"){setConnected(false);if(draw)disconnected("Este aparelho precisa ser pareado novamente.");return;} }
+    if(!response.ok||!value.ok){const error=new Error(value.error||"Conexão indisponível.");error.retryAfter=retryAfterSeconds(response);throw error;}
+    const ns=namespaceFor(value,slug()||value.game?.slug), changed=ns!==M.namespace;
+    M.data=value;M.revisions={...(value.revisions||{})};M.namespace=ns;M.retry=0;setConnected(true);
+    if(changed)await restorePresentation();selections();scrubPresentation();
+    if(draw)render();flush().catch(()=>{});
+  } catch(error){setConnected(false);if(draw&&!M.data)disconnected(error.message);retry(error.retryAfter);}
+  finally{M.refreshing=false;}
 }
-
-function gameArt(game) {
-  const art = game?.art;
-  if (typeof art === "string") return art;
-  if (art && typeof art === "object") return art.box || art.cover || art.title || art.ingame || "";
-  return game?.icon || "";
-}
-
-function progressInfo(game, data) {
-  const mastery = game?.mastery || {};
-  const completion = game?.completion || {};
-  const completed = Array.isArray(data?.progress?.completed) ? data.progress.completed.length : 0;
-  const total = Number(completion.total ?? mastery.total ?? 0) || 0;
-  const earned = Number(completion.earned ?? mastery.earned ?? completed) || 0;
-  const percent = Number(completion.percent ?? (total ? earned / total * 100 : mastery.percent ?? 0));
-  return { completed, total, earned, percent: Math.max(0, Math.min(100, Math.round(percent || 0))) };
-}
-
-function coverHTML(game, className = "") {
-  const image = localImage(gameArt(game));
-  const title = esc(game?.title || "Jogo");
-  return image
-    ? `<div class="game-cover ${className}"><img src="${image}" alt="Capa de ${title}" loading="lazy"></div>`
-    : `<div class="game-cover fallback ${className}" aria-label="${title}"><span>◇</span></div>`;
-}
-
-function mediaURL(data, mediaId, fallback = "") {
-  const media = (data?.media || []).find((item) => item.id === mediaId);
-  return localImage(media?.url || media?.src || fallback);
-}
-
-function pageHeader(kicker, title, subtitle = "") {
-  return `<header class="mobile-page-head"><span class="eyebrow">${esc(kicker)}</span><h1>${esc(title)}</h1>${subtitle ? `<p>${esc(subtitle)}</p>` : ""}</header>`;
-}
-
-// A read-only fixture makes the companion easy to review before pairing it
-// with the PC: open /ui/companion/index.html?demo=1 from a local static server.
-// Production never enters this branch and continues to use /api/state.
-function demoSnapshot() {
-  const cover = "/assets/art/digimon_world/box.png";
-  const game = { slug: "demo-digimon-world", title: "Digimon World Re:Digitize", platform: "PSP", art: { box: cover }, mastery: { total: 44, earned: 12, percent: 12 }, completion: { total: 44, earned: 12 } };
-  const node = (id, label, stage, card, imageId) => ({ id, label, stage, card_number: card, media_id: imageId, subtitle: "Acompanhe este objetivo e as rotas disponíveis." });
-  const system = {
-    id: "demo-evolutions", title: "Evoluções", description: "Rotas ilustrativas para revisão no celular.", status: "approved",
-    nodes: [node("agumon", "Agumon", "Rookie", 1, "agumon"), node("greymon", "Greymon", "Champion", 2, "greymon"), node("metalgreymon", "MetalGreymon", "Ultimate", 3, "metalgreymon"), node("gabumon", "Gabumon", "Rookie", 4, "gabumon"), node("weregarurumon", "WereGarurumon", "Champion", 5, "weregarurumon")],
-    edges: [
-      { id: "demo-edge-agumon", from: "agumon", to: "greymon", requirements: [{ id: "req-training", mode: "requirement", text: "Treinamento documentado", condition: { op: "all" }, source_refs: [{ page: 4 }] }] },
-      { id: "demo-edge-greymon", from: "greymon", to: "metalgreymon", requirements: [{ id: "req-item", mode: "item", text: "Use Metal Banana", condition: { op: "item", item_name: "Metal Banana", action: "use" }, source_refs: [{ page: 5 }] }] },
-      { id: "demo-edge-gabumon", from: "gabumon", to: "weregarurumon", requirements: [{ id: "req-weight", mode: "requirement", text: "Peso: 15 ou mais", condition: { op: "minimum", field: "weight", value: 15 }, source_refs: [{ page: 7 }] }] },
-    ],
-  };
-  return {
-    ok: true, api_version: 2, version: "demo", definition_revision: "demo", content_revision: "demo", progress_revision: "demo",
-    game, games: [game, { slug: "demo-rumble", title: "Digimon Rumble Arena", platform: "PSP", art: { box: "/assets/art/digimon_rumble_arena/box.png" }, completion: { total: 32, earned: 9 } }, { slug: "demo-world-2", title: "Digimon World 2", platform: "PlayStation", art: { box: "/assets/art/digimon_world_2/box.png" }, completion: { total: 50, earned: 21 } }],
-    chapters: [{ id: "chapter-1", title: "Primeiros passos", blocks: [{ id: "demo-guide-1", type: "step", title: "Chegue à Cidade File", text: "Conclua a introdução e encontre o primeiro parceiro." }, { id: "demo-guide-2", type: "missable", title: "Não perca o treinamento", text: "Confira os requisitos antes de avançar." }] }, { id: "chapter-2", title: "Evoluções", blocks: [{ id: "demo-guide-3", type: "step", title: "Escolha sua rota", text: "Abra o Atlas para comparar destinos." }, { id: "demo-guide-4", type: "spoiler", title: "Detalhe oculto", text: "Revele quando quiser.", hidden: true }] }],
-    systems: [system], media: ["agumon", "greymon", "metalgreymon", "gabumon", "weregarurumon"].map((id) => ({ id, url: cover, title: id })),
-    progress: { completed: ["demo-guide-1"], checkpoint: "demo-guide-1", revealed_spoilers: [], value_versions: {} }, system_state: { completed_requirements: ["req-training"], goals: {}, node_media: {}, preferences: {}, value_versions: {} },
-    objective: { block_id: "demo-guide-2", title: "Não perca o treinamento", text: "Confira os requisitos antes de avançar." },
-    items: [{ id: "item-metal-banana", name: "Metal Banana", description: "Item de evolução", quantity: 1 }, { id: "item-sacred-wings", name: "Sacred Wings", description: "Item especial", quantity: null }, { id: "item-x-program", name: "X-Program", description: "Item de evolução", quantity: 0 }], items_revision: 1,
-    missables: [{ name: "Treinamento inicial", earned: false }], achievements: [{ id: "a1", name: "Primeiros passos", desc: "Inicie sua jornada.", points: 10, earned: true, hardcore: false }, { id: "a2", name: "Novo parceiro", desc: "Obtenha seu primeiro Digimon.", points: 15, earned: true, hardcore: false }, { id: "a3", name: "Treinador dedicado", desc: "Aumente um atributo para 100.", points: 20, earned: false, hardcore: false }, { id: "a4", name: "Evolução perfeita", desc: "Alcance uma evolução Ultimate.", points: 30, earned: false, hardcore: true }], answer: {},
-  };
-}
-
-function message(text, error = false) {
-  const el = document.getElementById("message");
-  el.textContent = text; el.dataset.error = error ? "true" : "false"; el.style.display = "block";
-  clearTimeout(message.timer); message.timer = setTimeout(() => { el.style.display = "none"; }, 5000);
-}
-
-function requestId() {
-  if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
-  return `mobile-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-async function apiRaw(path, body, options = {}) {
-  const controller = options.controller || new AbortController();
-  const timeout = setTimeout(() => controller.abort(), options.timeout || 12000);
+async function poll(draw = true) {
+  if(M.refreshing||document.hidden||!M.data)return;M.refreshing=true;
   try {
-    const response = await fetch(path, body === undefined ? { signal: controller.signal } : {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: controller.signal,
-    });
-    const data = await response.json().catch(() => ({}));
-    return { ...data, _httpStatus: response.status };
-  } finally { clearTimeout(timeout); }
+    let revisionState;
+    try { revisionState=await api(query("/api/revisions")); }
+    catch(error){if(error.status===401){const restored=await restoreSession();if(restored==="restored"){M.refreshing=false;return poll(draw);}if(restored==="needs-pairing"){setConnected(false);if(draw)disconnected("Este aparelho precisa ser pareado novamente.");return;}}throw error;}
+    const next=revisionState.revisions||{}, changed=Object.keys(next).filter(key=>next[key]!==M.revisions[key]);
+    if(changed.includes("guide")){const r=await api(query("/api/guide"));M.data.chapters=r.chapters||[];M.data.progress=r.progress||{};M.data.objective=r.objective||{};}
+    if(changed.includes("atlas")){const r=await api(query("/api/atlas/systems"));M.data.systems=r.systems||[];M.data.system_state=r.system_state||{};}
+    if(changed.includes("items"))M.data.items=await paged("/api/items","items");
+    if(changed.includes("media")){const r=await api(query("/api/media"));M.data.media=r.media||[];}
+    if(changed.includes("achievements"))M.data.achievements=await paged("/api/achievements","achievements");
+    if(changed.includes("assistant")){const r=await api(query("/api/assistant"));M.data.answer=r.answer||{};}
+    if(changed.includes("games")){const r=await api(query("/api/games"));M.data.games=r.games||[];M.data.active_pc_slug=r.active_slug||"";const selected=M.data.games.find(game=>game.slug===slug());if(selected)M.data.game=selected;}
+    M.revisions={...next};M.data.revisions={...next};M.retry=0;setConnected(true);selections();scrubPresentation();
+    if(draw&&changed.length)renderChanged(changed);
+    flush().catch(()=>{});
+  }catch(error){setConnected(false);retry(error.retryAfter);}
+  finally{M.refreshing=false;}
+}
+function disconnected(detail) {
+  tabs.hidden = true;
+  content.innerHTML = `<section class="mobile-empty"><span class="eyebrow">CONEXÃO</span><h1>O DigiTracker do PC não está disponível</h1><p>${esc(detail)}</p><button class="primary" data-act="retry">Tentar novamente</button></section>`;
 }
 
-async function api(path, body, options = {}) {
-  const data = await apiRaw(path, body, options);
-  if (data._httpStatus >= 400 || data.ok === false) throw Object.assign(new Error(data.error || "Não foi possível concluir."), { status: data._httpStatus, payload: data });
-  return data;
+function request(values, id = requestId()) {
+  return {api_version: 2, request_id: id, slug: slug(), kind: values.kind, action: values.action, value: values.value, target: values.target, expected_definition_revision: M.data?.definition_revision || "", expected_value_version: versionFor(M.data, values)};
 }
-
-function captureFocus() {
-  const active = document.activeElement;
-  if (!active || !content.contains(active)) return null;
-  const result = { id: active.id || "", value: "", start: 0, end: 0, details: [] };
-  if ("value" in active) { result.value = active.value; result.start = active.selectionStart ?? 0; result.end = active.selectionEnd ?? result.start; }
-  content.querySelectorAll("details[open]").forEach((item) => { const id = item.dataset.nodeId; if (id) result.details.push(id); });
-  return result;
+function addPending(key) { M.p.pending = [...new Set([...M.p.pending, key])]; setConnected(M.connected); }
+function dropPending(key) { M.p.pending = M.p.pending.filter((value) => value !== key); setConnected(M.connected); }
+async function queue(values, body, status = "pending") {
+  if (!M.storage?.available) { notify("O navegador não pode armazenar alterações offline. Tente novamente quando reconectar.", true); return false; }
+  const key = targetKey(values);
+  await M.storage.enqueue({id: body.request_id, namespace: M.namespace, createdAt: Date.now(), status, target: key, values, body});
+  addPending(key); notify("Pendente no telefone. Será enviada ao PC quando reconectar."); return true;
 }
-
-function restoreFocus(focus) {
-  if (!focus) return;
-  focus.details.forEach((id) => Array.from(content.querySelectorAll("details[data-node-id]"))
-    .find((item) => item.dataset.nodeId === id)?.setAttribute("open", ""));
-  if (!focus.id) return;
-  const active = document.getElementById(focus.id); if (!active) return;
-  active.focus({ preventScroll: true });
-  if ("value" in active) { active.value = focus.value; try { active.setSelectionRange(focus.start, focus.end); } catch (_) {} }
-}
-
-async function refresh(force = false) {
-  if (M.pendingTargets.size && !force) return;
-  const sequence = ++M.requestSeq; M.controller?.abort(); M.controller = new AbortController();
+async function submit(values) {
+  const key = targetKey(values), body = request(values);
+  if (M.demo) {
+    const result = {ok: true, kind: values.kind, target: key, value: values.value, item_id: values.target?.item_id,
+      value_version: versionFor(M.data, values) + 1};
+    M.data = patchConfirmedValue(M.data, result); notify("Guardado no modo demo."); render(); return;
+  }
+  if (!M.connected || !navigator.onLine) { await queue(values, body); render(); return; }
+  addPending(key); render();
   try {
-    const data = await api("/api/state", undefined, { controller: M.controller });
-    if (sequence !== M.requestSeq) return;
-    const changed = !M.data || M.data.version !== data.version || M.data.game?.slug !== data.game?.slug || JSON.stringify(M.data.answer) !== JSON.stringify(data.answer);
-    if (M.data?.game?.slug !== data.game?.slug) { M.chapter = 0; M.undo = null; }
-    M.data = data; M.paired = true; tabs.hidden = false;
-    document.getElementById("connection").textContent = "PC sincronizado";
-    document.body.dataset.tab = M.tab;
-    if (force || changed) render();
+    const result = await api("/api/action", body);
+    M.data=patchConfirmedValue(M.data,result);dropPending(key);notify("Salvo no PC.");persist();renderScreen();
   } catch (error) {
-    if (error.name === "AbortError") return;
-    document.getElementById("connection").textContent = "Sem conexão";
-    if (error.status === 401) {
-      M.paired = false; tabs.hidden = true;
-      content.innerHTML = '<section class="card connection-card"><span class="eyebrow">DIGITRACKER · CELULAR</span><h1>Conexão encerrada</h1><p>Leia um novo QR Code no PC para continuar.</p></section>';
-    } else if (force) message(error.message, true);
-  }
-}
-
-function targetFor(values) {
-  if (values.kind === "progress") return { block_id: values.block_id };
-  if (values.kind === "requirement") return { system_id: values.system_id, edge_id: values.edge_id, requirement_id: values.requirement_id };
-  if (values.kind === "item") return { item_id: values.item_id };
-  return {};
-}
-
-function valueVersionFor(target) {
-  if (target.block_id) return M.data?.progress?.value_versions?.[`progress:${target.action || "complete"}:${target.block_id}`];
-  if (target.requirement_id) return M.data?.system_state?.value_versions?.[`requirement:${target.system_id}:${target.edge_id}:${target.requirement_id}`];
-  return undefined;
-}
-
-async function action(values, source = null) {
-  if (!M.data) return;
-  const target = targetFor(values);
-  const targetKey = values.kind === "progress" ? `progress:${values.action}:${values.block_id}` : values.kind === "requirement" ? `requirement:${values.system_id}:${values.edge_id}:${values.requirement_id}` : `${values.kind}:${values.system_id || ""}:${values.node_id || values.item_id || ""}`;
-  if (M.pendingTargets.has(targetKey)) return;
-  const requestedValue = values.kind === "requirement" ? !!values.value : values.value;
-  M.pendingTargets.add(targetKey); M.pending = true; M.pendingTarget = targetKey; if (source) source.disabled = true;
-  try {
-    let result;
-    if (values.kind === "goal" || values.kind === "ask") result = await apiRaw("/api/action", { slug: M.data.game.slug, version: M.data.version, ...values });
-    else {
-      const expected = valueVersionFor({ ...target, action: values.action });
-      result = await apiRaw("/api/action", { api_version: 2, request_id: requestId(), slug: M.data.game.slug, expected_definition_revision: M.data.definition_revision || "", expected_value_version: expected ?? 0, expected_item_revision: M.data.items_revision ?? 0, target, ...values });
-    }
-    if (result.ok === false || result._httpStatus >= 400) {
-      if (source?.type === "checkbox" && values.kind === "requirement") source.checked = !requestedValue;
-      if (result.conflict) { message(`${result.error || "Esta marcação mudou em outro lugar."} Atualizando o card.`, true); await refresh(true); }
-      else message(result.error || "Não foi possível salvar.", true);
-      return;
-    }
-    message(result.idempotent ? "Marcação já sincronizada." : "Salvo no PC");
-    if (values.kind === "progress" && values.action === "complete") M.undo = { ...values, value: !values.value };
-  } catch (error) {
-    if (source?.type === "checkbox" && values.kind === "requirement") source.checked = !requestedValue;
-    message(error.message, true);
-  } finally {
-    M.pendingTargets.delete(targetKey); M.pending = M.pendingTargets.size > 0;
-    if (M.pendingTarget === targetKey) M.pendingTarget = "";
-    if (source) source.disabled = false;
-    await refresh(true);
-  }
-}
-
-function blockHTML(block, number) {
-  if (block.hidden) return `<article class="card" data-guide-block="${esc(block.id)}"><div class="card-topline"><span class="eyebrow">SPOILER</span><span class="card-id">GUIA #${String(number).padStart(3, "0")}</span></div><h3>Spoiler oculto</h3><button data-testid="guide-reveal" data-reveal="${esc(block.id)}" data-block-id="${esc(block.id)}">Revelar este trecho</button></article>`;
-  const done = (M.data.progress.completed || []).includes(block.id);
-  return `<article class="card ${["missable", "warning"].includes(block.type) ? "alert" : ""}" id="guide-${esc(block.id)}" data-guide-block="${esc(block.id)}" data-card-number="${String(number)}"><div class="card-topline"><span class="eyebrow">${esc(block.type === "missable" ? "Aviso do guia" : "Etapa")}</span><span class="card-id">#${String(number).padStart(3, "0")}</span></div><h2>${esc(block.title || "Etapa sem título")}</h2><p class="text">${esc(block.text)}</p>${(block.items || []).map((item) => `<p>• ${esc(item.text || item)}</p>`).join("")}<button class="check" data-testid="guide-complete" data-complete="${esc(block.id)}" data-block-id="${esc(block.id)}" data-value="${!done}"><b>${done ? "✓" : "○"}</b>${done ? "Concluído · desmarcar" : "Marcar como concluído"}</button><button data-checkpoint="${esc(block.id)}" data-block-id="${esc(block.id)}">Continuar daqui</button></article>`;
-}
-
-function itemRequirementHTML(requirement, system, edge, done) {
-  const mode = requirement.mode === "item" ? "ITEM DO JOGO" : requirement.mode === "jogress" ? "JOGRESS" : "REQUISITO";
-  const source = (requirement.source_refs || []).map((ref) => ref.page ? `p.${ref.page}` : `§${ref.section}.${ref.block}`).join(" · ");
-  return `<label class="requirement ${requirement.condition?.op === "unknown" ? "unknown" : ""}"><input type="checkbox" data-testid="atlas-requirement" data-requirement="${esc(requirement.id)}" data-condition-id="${esc(requirement.id)}" data-rule-id="${esc(edge.id)}" data-edge="${esc(edge.id)}" data-system="${esc(system.id)}" ${done ? "checked" : ""} ${requirement.condition?.op === "unknown" ? "disabled" : ""}><span><b>${esc(mode)}</b>${esc(requirement.text || "Sem descrição")}${source ? `<small>Fonte: ${esc(source)}</small>` : ""}</span></label>`;
-}
-
-function atlasHTML(data) {
-  const systems = data.systems || [];
-  if (!systems.length) return '<section class="card"><h2>Nenhum sistema publicado</h2><p>Crie e aprove um sistema no Atlas do PC. Prévias não são enviadas ao celular.</p></section>';
-  const completed = new Set(data.system_state?.completed_requirements || []);
-  return systems.map((system) => `<section class="card atlas-system"><div class="card-topline"><span class="eyebrow">Sistema visual</span><span class="card-id">${esc(system.id)}</span></div><h2>${esc(system.title)}</h2><p>${esc(system.description)}</p><div class="atlas-mobile-nodes">${(system.nodes || []).map((node, index) => {
-    const card = Number(node.card_number || index + 1);
-    const mediaId = data.system_state?.node_media?.[`${system.id}:${node.id}`] || node.media_id;
-    const image = mediaURL(data, mediaId, node.image?.url || node.image?.src);
-    const incoming = (system.edges || []).filter((edge) => edge.to === node.id);
-    const thumbnail = image ? `<span class="node-thumb"><img src="${image}" alt="" loading="eager"></span>` : `<span class="node-thumb fallback" aria-hidden="true">◇</span>`;
-    return `<details class="node" data-node-id="${esc(node.id)}" data-card-number="${String(card)}"><summary>${thumbnail}<span class="card-id">#${String(card).padStart(3, "0")}</span><span class="node-label">${esc(node.label)}</span><small>${esc(node.stage || node.group || "Detalhes")}</small></summary>${image ? `<img src="${image}" alt="${esc(node.label)}" loading="lazy">` : ""}<p>${esc(node.subtitle || "Acompanhe este objetivo e os caminhos disponíveis.")}</p><button data-goal="${esc(node.id)}" data-system="${esc(system.id)}" data-card-number="${String(card)}">◎ Fixar como objetivo</button>${incoming.map((edge, edgeIndex) => `<div class="atlas-path"><h3>Caminho ${edgeIndex + 1} · ${esc(system.nodes.find((value) => value.id === edge.from)?.label || "Origem")}</h3>${(edge.requirements || []).map((requirement) => itemRequirementHTML(requirement, system, edge, completed.has(requirement.id))).join("") || "<p class=muted>Nenhum requisito documentado.</p>"}</div>`).join("")}</details>`;
-  }).join("")}</div></section>`).join("");
-}
-
-function libraryGames(data) {
-  const rows = Array.isArray(data?.games) && data.games.length ? data.games : [data?.game].filter(Boolean);
-  return rows.filter((game) => game && game.slug);
-}
-
-function librarySheetHTML(data) {
-  const games = libraryGames(data);
-  return `<div class="mobile-sheet-backdrop" data-sheet-backdrop><section class="mobile-sheet" id="mobile-sheet" role="dialog" aria-modal="true" aria-labelledby="mobile-sheet-title"><div class="mobile-sheet-head"><div><span class="eyebrow">BIBLIOTECA</span><h2 id="mobile-sheet-title">Jogos sincronizados</h2></div><button class="mobile-icon-button" type="button" data-close-sheet aria-label="Fechar biblioteca">×</button></div><p class="mobile-sheet-note">O celular acompanha o jogo aberto no PC. Abra outro jogo no desktop para alternar a sessão.</p><div class="mobile-sheet-list">${games.map((game) => `<button class="mobile-game-row" type="button" data-library-game="${esc(game.slug)}">${coverHTML(game)}<span class="mobile-game-copy"><b>${esc(game.title || game.slug)}</b><small>${esc(game.platform || "Jogo")}</small></span><span aria-hidden="true">›</span></button>`).join("") || "<p>Nenhum jogo sincronizado.</p>"}</div></section></div>`;
-}
-
-function openLibrarySheet() {
-  if (!M.data || document.querySelector("[data-sheet-backdrop]")) return;
-  document.body.insertAdjacentHTML("beforeend", librarySheetHTML(M.data));
-  const backdrop = document.querySelector("[data-sheet-backdrop]");
-  const close = () => backdrop?.remove();
-  backdrop?.addEventListener("click", (event) => { if (event.target === backdrop) close(); });
-  backdrop?.querySelector("[data-close-sheet]")?.addEventListener("click", close);
-  backdrop?.querySelectorAll("[data-library-game]").forEach((button) => button.addEventListener("click", () => {
-    message(button.dataset.libraryGame === M.data.game?.slug ? "Este jogo já está aberto." : "Abra o jogo desejado no PC para trocar a sessão.");
-    close();
-  }));
-  backdrop?.querySelector("[data-close-sheet]")?.focus();
-}
-
-function render() {
-  const data = M.data; if (!data) return;
-  const focus = captureFocus();
-  tabs.querySelectorAll("button").forEach((button) => button.setAttribute("aria-current", button.dataset.tab === M.tab));
-  document.body.dataset.tab = M.tab;
-  const game = data.game || {};
-  const info = progressInfo(game, data);
-  const chapters = data.chapters || [];
-  M.chapter = chapters.length ? Math.min(M.chapter, chapters.length - 1) : 0;
-  const chapter = chapters[M.chapter];
-  let html = `<div class="mobile-screen mobile-${esc(M.tab)}">`;
-
-  if (M.tab === "now") {
-    html += `<section class="mobile-welcome"><span class="eyebrow">SEU UNIVERSO DE JOGOS</span><h1>Seu jogo, sempre com você.</h1><p>Guias, conquistas e mapas sincronizados com o PC.</p></section>`;
-    html += `<section class="mobile-hero">${coverHTML(game)}<div class="mobile-hero-copy"><span class="eyebrow">JOGANDO AGORA</span><h2>${esc(game.title || "Jogo ativo")}</h2><p>${esc(game.platform || "Plataforma não informada")} · progresso acompanhado</p><div class="progress-meta"><span>${info.earned} de ${info.total || "—"}</span><b>${info.percent}%</b></div><progress max="100" value="${info.percent}" aria-label="${info.percent}% concluído"></progress><button class="primary" data-open-guide>Continuar →</button></div></section>`;
-    html += `<div class="mobile-stat-grid"><div class="mobile-stat"><b>${(data.achievements || []).filter((item) => item.earned).length}</b><span>Conquistas</span></div><div class="mobile-stat"><b>${chapters.length}</b><span>Guias</span></div><div class="mobile-stat"><b>${(data.systems || []).length}</b><span>Sistemas</span></div></div>`;
-    const recent = libraryGames(data).filter((item) => item.slug !== game.slug).slice(0, 3);
-    if (recent.length) html += `<section class="mobile-section"><div class="mobile-section-head"><h2>Jogos recentes</h2><button class="mobile-link-button" type="button" data-open-library>Ver todos ›</button></div><div class="mobile-recent">${recent.map((item) => `<button class="mobile-game-row" type="button" data-library-game="${esc(item.slug)}">${coverHTML(item)}<span class="mobile-game-copy"><b>${esc(item.title || item.slug)}</b><small>${esc(item.platform || "Jogo")} · sincronizado</small></span><span aria-hidden="true">›</span></button>`).join("")}</div></section>`;
-    if ((data.missables || []).length) html += `<section class="card alert"><span class="eyebrow">Atenção · perdíveis</span>${data.missables.slice(0, 3).map((item) => `<p>${esc(item.name)}${item.earned ? " · Refazer em Hardcore" : ""}</p>`).join("")}</section>`;
-    html += `<section class="card"><div class="card-topline"><span class="eyebrow">PROGRESSO</span>${M.undo ? `<button data-undo>Desfazer</button>` : ""}</div><h2>Seu controle de progresso</h2><p>${(data.progress.completed || []).length} etapas concluídas. Requisitos e etapas são marcados manualmente.</p></section>`;
-  }
-
-  if (M.tab === "guide") {
-    html += pageHeader("GUIA", "Guia inteligente", "Navegue por capítulos, marque o que concluiu e retome do celular.");
-    html += `<div class="mobile-segmented" aria-label="Seções do guia"><button type="button">Índice</button><button type="button">Navegação</button><button type="button">Favoritos</button></div>`;
-    html += chapters.length ? `<label class="mobile-chapter-label" for="chapter">Capítulo<select id="chapter">${chapters.map((item, index) => `<option value="${index}" ${index === M.chapter ? "selected" : ""}>${index + 1}. ${esc(item.title)}</option>`).join("")}</select></label>${(chapter?.blocks || []).map((block, index) => blockHTML(block, index + 1)).join("")}<div class="actions"><button data-prev ${M.chapter === 0 ? "disabled" : ""}>← Anterior</button><button data-next ${M.chapter >= chapters.length - 1 ? "disabled" : ""}>Próximo →</button></div><form id="question-form" class="card"><span class="eyebrow">ASSISTENTE</span><h2>Perguntar sobre este trecho</h2><p>A pergunta e o trecho serão enviados ao provedor configurado no PC, sujeito a cobrança.</p><select name="block">${(chapter.blocks || []).filter((block) => !block.hidden).map((block) => `<option value="${esc(block.id)}">${esc(block.title || "Etapa")}</option>`).join("")}</select><textarea id="question" name="question" maxlength="2000" placeholder="Qual é o próximo passo?" required></textarea><button class="primary" ${data.answer?.running ? "disabled" : ""}>${data.answer?.running ? "Consultando…" : "Perguntar à IA"}</button>${data.answer?.answer ? `<p class="text">${esc(data.answer.answer)}</p>` : ""}${data.answer?.error ? `<p>${esc(data.answer.error)}</p>` : ""}</form>` : '<section class="card"><h2>O guia ainda não está pronto</h2><p>Importe e publique um guia no PC para continuar aqui.</p></section>';
-  }
-
-  if (M.tab === "atlas") {
-    html += pageHeader("ATLAS DE SISTEMAS", "Mapas e evoluções", "Entenda as rotas, requisitos e itens que levam a cada objetivo.");
-    html += `<div class="mobile-segmented" aria-label="Visualizações do Atlas"><button type="button">Sistemas</button><button type="button">Rotas</button><button type="button">Tabelas</button></div>${atlasHTML(data)}`;
-  }
-
-  if (M.tab === "items") {
-    const items = data.items || [];
-    html += pageHeader("INVENTÁRIO", "Itens do jogo", "Registre a posse dos itens usados por evoluções e outras regras.");
-    html += items.length ? `<section class="card"><div class="card-topline"><span class="eyebrow">CATÁLOGO</span><span class="card-id">${items.length} itens</span></div>${items.map((item) => `<article class="item-row"><div><div class="card-topline"><h2>${esc(item.name)}</h2><span class="card-id">${esc(item.id || "")}</span></div><p>${esc(item.description || "")}</p></div><div class="item-controls"><input id="item-${esc(item.id)}" data-testid="item-quantity" data-item-id="${esc(item.id)}" type="number" min="0" step="1" value="${item.quantity == null ? "" : Number(item.quantity)}" placeholder="—" aria-label="Quantidade de ${esc(item.name)}"><button data-testid="item-save" data-item-save="${esc(item.id)}">Salvar</button></div></article>`).join("")}</section>` : '<section class="card"><h2>Itens ainda não catalogados</h2><p>Quando uma fonte documentar itens, eles aparecerão aqui separados das criaturas e objetivos.</p></section>';
-  }
-
-  if (M.tab === "achievements") {
-    const rows = [...(data.achievements || [])].sort((a, b) => Number(a.hardcore) - Number(b.hardcore));
-    const earned = rows.filter((item) => item.earned).length;
-    html += pageHeader("CONQUISTAS", "Sua coleção", "Acompanhe os marcos do jogo e saiba o que ainda falta.");
-    html += `<section class="card"><div class="card-topline"><span class="eyebrow">PROGRESSO</span><b>${earned}/${rows.length || 0}</b></div><progress max="${rows.length || 1}" value="${earned}" aria-label="${earned} de ${rows.length} conquistas"></progress></section>`;
-    html += rows.map((item, index) => `<article class="card achievement-mobile"><span class="achievement-mark" aria-hidden="true">${item.hardcore ? "◆" : item.earned ? "◇" : "○"}</span><div><div class="card-topline"><h3>${esc(item.name)}</h3><span class="card-id">#${String(index + 1).padStart(3, "0")}</span></div><p>${esc(item.desc)}</p><small>${item.points || 0} pontos · ${item.hardcore ? "Hardcore" : item.earned ? "Softcore" : "Pendente"}${item.achievement_type === "missable" ? " · Perdível" : ""}</small></div></article>`).join("") || "<p>Nenhuma conquista sincronizada.</p>";
-  }
-
-  html += "</div>";
-  content.innerHTML = html;
-  restoreFocus(focus);
-  content.querySelector("[data-open-guide]")?.addEventListener("click", () => {
-    M.tab = "guide"; const id = data.objective?.block_id;
-    const index = chapters.findIndex((item) => (item.blocks || []).some((block) => block.id === id));
-    M.chapter = Math.max(0, index); render(); window.scrollTo(0, 0);
-  });
-  content.querySelectorAll("[data-open-library]").forEach((button) => button.addEventListener("click", openLibrarySheet));
-  content.querySelectorAll("[data-library-game]").forEach((button) => button.addEventListener("click", openLibrarySheet));
-  content.querySelector("#chapter")?.addEventListener("change", (event) => { M.chapter = Number(event.target.value); render(); });
-  content.querySelector("[data-prev]")?.addEventListener("click", () => { M.chapter -= 1; render(); window.scrollTo(0, 0); });
-  content.querySelector("[data-next]")?.addEventListener("click", () => { M.chapter += 1; render(); window.scrollTo(0, 0); });
-  content.querySelectorAll("[data-complete]").forEach((button) => button.addEventListener("click", () => action({ kind: "progress", action: "complete", block_id: button.dataset.complete, value: button.dataset.value === "true" }, button)));
-  content.querySelectorAll("[data-reveal]").forEach((button) => button.addEventListener("click", () => action({ kind: "progress", action: "reveal", block_id: button.dataset.reveal, value: true }, button)));
-  content.querySelectorAll("[data-checkpoint]").forEach((button) => button.addEventListener("click", () => action({ kind: "progress", action: "checkpoint", block_id: button.dataset.checkpoint, value: true }, button)));
-  content.querySelectorAll("[data-goal]").forEach((button) => button.addEventListener("click", () => action({ kind: "goal", system_id: button.dataset.system, node_id: button.dataset.goal }, button)));
-  content.querySelectorAll("[data-requirement]").forEach((input) => input.addEventListener("change", () => action({ kind: "requirement", system_id: input.dataset.system, edge_id: input.dataset.edge, requirement_id: input.dataset.requirement, value: input.checked }, input)));
-  content.querySelectorAll("[data-item-save]").forEach((button) => button.addEventListener("click", () => {
-    const input = document.getElementById(`item-${button.dataset.itemSave}`); const raw = String(input?.value ?? "").trim(); const quantity = raw === "" ? null : Number(raw);
-    if (quantity !== null && (!Number.isInteger(quantity) || quantity < 0)) return message("Informe uma quantidade inteira válida ou deixe em branco para não informado.", true);
-    action({ kind: "item", item_id: button.dataset.itemSave, value: quantity, expected_item_revision: data.items_revision }, button);
-  }));
-  content.querySelector("[data-undo]")?.addEventListener("click", async () => { const undo = M.undo; M.undo = null; await action(undo); M.undo = null; });
-  content.querySelector("#question-form")?.addEventListener("submit", (event) => { event.preventDefault(); const form = new FormData(event.target); action({ kind: "ask", block_id: form.get("block"), question: form.get("question") }); });
-}
-
-tabs.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => { M.tab = button.dataset.tab; render(); window.scrollTo(0, 0); }));
-
-document.getElementById("mobile-menu")?.addEventListener("click", openLibrarySheet);
-document.getElementById("mobile-search-toggle")?.addEventListener("click", () => {
-  const search = document.getElementById("mobile-search");
-  search.hidden = !search.hidden;
-  if (!search.hidden) document.getElementById("mobile-search-input")?.focus();
-});
-document.getElementById("mobile-search-close")?.addEventListener("click", () => { document.getElementById("mobile-search").hidden = true; });
-document.getElementById("mobile-search-input")?.addEventListener("input", (event) => {
-  const query = String(event.target.value || "").trim().toLocaleLowerCase("pt-BR");
-  if (!query) return;
-  const matches = [...content.querySelectorAll("[data-guide-block], .node, .item-row, .achievement-mobile")];
-  matches.forEach((item) => { item.hidden = !item.textContent.toLocaleLowerCase("pt-BR").includes(query); });
-});
-
-async function boot() {
-  const params = new URLSearchParams(location.search);
-  const code = new URLSearchParams(location.hash.slice(1)).get("pair"); history.replaceState(null, "", location.pathname + (params.get("demo") === "1" ? "?demo=1" : ""));
-  if (params.get("demo") === "1") {
-    M.data = demoSnapshot(); M.paired = false; tabs.hidden = false;
-    document.getElementById("connection").textContent = "Modo demo";
+    if (error.value?.conflict) { await queue(values, body, "conflict"); M.p.conflict = {id: body.request_id, target: key, values, body, server: error.value}; notify("Existe uma alteração diferente no PC.", true); }
+    else await queue(values, body);
     render();
-    return;
   }
-  if (code) {
-    try {
-      await api("/pair", { code, name: /iPad|Tablet/i.test(navigator.userAgent) ? "Tablet" : "Celular" });
-      content.innerHTML = '<section class="card connection-card"><span class="eyebrow">PAREAMENTO</span><h1>Confirme no PC</h1><p>Abra Celular no DigiTracker e aprove este dispositivo.</p></section>';
-      let waiting = true;
-      while (waiting) { await new Promise((resolve) => setTimeout(resolve, 1500)); waiting = (await api("/pair/status", {})).pending; }
-      await refresh(true);
-    } catch (error) { message(error.message, true); document.getElementById("connection").textContent = "Pareamento necessário"; }
-  } else await refresh(true);
+}
+async function flush() {
+  if (!M.connected || !M.storage?.available || M.flushing) return M.flushing;
+  M.flushing = (async () => {
+    const blocked = new Set();
+    const operations = await M.storage.pending(M.namespace);
+    for (let index = 0; index < operations.length; index += 1) {
+      const op = operations[index];
+      if (op.status === "conflict") { blocked.add(op.target); continue; }
+      if (blocked.has(op.target)) continue;
+      try {
+        // Replay the exact request first. A lost ACK is recovered through the
+        // persistent receipt for this request_id; a newer PC value must not be
+        // substituted before the server decides whether this intent conflicts.
+        const result = await api("/api/action", op.body);
+        M.data = patchConfirmedValue(M.data, result);
+        await M.storage.remove(op.id);
+        dropPending(op.target);
+
+        // Successive changes on the same semantic target are dependent. Only
+        // the next intent advances to this confirmed version. If it succeeds,
+        // it advances the following one in turn.
+        const dependent = rebaseNextDependent(operations, index, op.target, result.value_version);
+        if (dependent) {
+          operations[dependent.index] = dependent.operation;
+          await M.storage.update(dependent.operation.id, {
+            values: dependent.operation.values,
+            body: dependent.operation.body,
+          });
+        }
+        notify("Alteração pendente salva no PC.");
+      } catch (error) {
+        if (error.value?.conflict) { await M.storage.update(op.id, {status: "conflict", server: error.value}); M.p.conflict ||= {id: op.id, target: op.target, values: op.values, body: op.body, server: error.value}; blocked.add(op.target); }
+        else break;
+      }
+    }
+    persist(); M.p.conflict?render():renderScreen();
+  })();
+  try { await M.flushing; } finally { M.flushing = null; }
+}
+async function resolveConflict(mode) {
+  const row = M.p.conflict; if (!row) return;
+  if (mode === "pc") { await M.storage?.remove(row.id); dropPending(row.target); M.p.conflict = null; notify("A alteração do PC foi mantida."); return refresh(true); }
+  try {
+    const result = await api("/api/action", {...row.body, request_id: requestId(), expected_value_version: Number(row.server?.value_version || 0)});
+    M.data = patchConfirmedValue(M.data, result); await M.storage?.remove(row.id); dropPending(row.target); M.p.conflict = null; notify("Sua alteração foi aplicada no PC.");
+  } catch (error) { notify(error.message, true); }
+  render();
 }
 
-boot();
-setInterval(() => { if (M.paired && !document.hidden && !M.pendingTargets.size) refresh(); }, 3000);
+function sourceButton(refs) {
+  const ref = (refs || [])[0]; if (!ref) return "";
+  return `<button class="text-action" data-act="source" data-source="${esc(JSON.stringify(ref))}">Consultar fonte · ${esc(sourceName([ref]) || "trecho")}</button>`;
+}
+function home() {
+  const blocks = guideBlocks(M.data), guide = blocks.find((row) => row.id === M.data?.progress?.checkpoint) || blocks[0];
+  const system = systemById(M.data, M.data?.system_state?.active_system), goal = nodeById(system, M.data?.system_state?.goals?.[system?.id]);
+  const achievements = M.data.achievements || [], earned = achievements.filter((row) => row.earned).length;
+  return `<section class="mobile-game-hero">${cover(M.data.game)}<div><span class="eyebrow">JOGANDO AGORA</span><h1>${esc(M.data.game?.title || "Jogo atual")}</h1><p>${esc(M.data.game?.platform || "Jogo")}</p></div></section>
+  <section class="primary-panel"><span class="eyebrow">JORNADA</span><h2>${esc(guide?.title || "Comece sua jornada")}</h2><p>${esc(guide?.text || "Escolha um guia para continuar.")}</p><button class="primary" data-act="continue-guide">Continuar</button></section>
+  <section class="summary-grid"><button data-act="tab" data-tab="guide"><b>${(M.data.progress?.completed || []).length}</b><span>Etapas concluídas</span></button><button data-act="tab" data-tab="more" data-more="achievements"><b>${earned}/${achievements.length || 0}</b><span>Conquistas</span></button></section>
+  <section class="list-section"><div class="section-title"><h2>Objetivo do Atlas</h2><button class="text-action" data-act="tab" data-tab="atlas">Explorar</button></div>${goal ? `<button class="objective-row" data-act="atlas-node" data-system="${esc(system.id)}" data-node="${esc(goal.id)}"><span class="node-mini">${nodeImage(system, goal) ? `<img src="${nodeImage(system, goal)}" alt="">` : "◇"}</span><span><small>Card #${num(goal)}</small><b>${esc(goal.label)}</b><em>${esc(system.title)}</em></span><span>›</span></button>` : `<button class="objective-row" data-act="tab" data-tab="atlas"><span class="node-mini">◇</span><span><b>Explorar Atlas</b><em>Nenhum objetivo fixado.</em></span><span>›</span></button>`}</section>
+  <section class="list-section"><div class="section-title"><h2>Consultados recentemente</h2></div>${M.p.recent.map((row) => `<button class="simple-row" data-act="recent" data-kind="${esc(row.kind)}" data-id="${esc(row.id)}"><span>${row.kind === "atlas" ? "◇" : row.kind === "item" ? "▣" : "▤"}</span><span><b>${esc(row.title)}</b><small>${esc(row.detail)}</small></span><span>›</span></button>`).join("") || "<p class='muted'>As consultas feitas no celular aparecerão aqui.</p>"}</section>`;
+}
+function guideCard(block) {
+  if (!block) return `<section class="mobile-empty"><h1>Guia indisponível</h1><p>Publique um guia no PC para lê-lo no telefone.</p></section>`;
+  const all = guideBlocks(M.data), done = (M.data.progress?.completed || []).includes(block.id), favorite = (M.data.progress?.favorites || []).includes(block.id);
+  if (block.hidden) return `<article class="reading-card"><span class="eyebrow">SPOILER</span><h1>Spoiler oculto</h1><p>Revele este trecho quando quiser vê-lo.</p><button class="primary" data-act="reveal" data-block="${esc(block.id)}">Revelar trecho</button></article>`;
+  return `<article class="reading-card"><div class="card-meta"><span>ETAPA</span><b>#${String(all.findIndex((row) => row.id === block.id) + 1).padStart(3, "0")}</b></div><h1>${esc(block.title || "Etapa")}</h1>${block.text ? `<p>${esc(block.text)}</p>` : ""}${(block.items || []).map((item) => `<p>• ${esc(item.text || item)}</p>`).join("")}<div class="reading-actions"><button class="${done ? "selected-action" : "outline"}" data-act="complete" data-block="${esc(block.id)}" data-value="${done ? "false" : "true"}">${done ? "✓ Concluído" : "○ Concluir"}</button><button class="outline" data-act="checkpoint" data-block="${esc(block.id)}">Retomar daqui</button><button class="icon-text" data-act="favorite" data-block="${esc(block.id)}" data-value="${favorite ? "false" : "true"}" aria-label="Favoritar">${favorite ? "★" : "☆"}</button></div>${sourceButton(block.source_refs)}</article>`;
+}
+function assistant(block) {
+  if (!M.p.assistant) return "";
+  const answer = M.data.answer || {};
+  return `<section class="assistant-panel"><span class="eyebrow">ASSISTENTE</span><h2>Perguntar sobre este trecho</h2><p>A pergunta e o trecho serão enviados ao provedor configurado no PC.</p><form data-form="question"><textarea name="question" maxlength="2000" placeholder="Qual é o próximo passo?">${esc(M.drafts.question)}</textarea><input name="block" type="hidden" value="${esc(block?.id || "")}"><button class="primary" ${!M.connected || answer.running ? "disabled" : ""}>${answer.running ? "Consultando…" : "Perguntar à IA"}</button></form>${answer.answer ? `<p class="answer">${esc(answer.answer)}</p>` : ""}${answer.error ? `<p class="warning">${esc(answer.error)}</p>` : ""}</section>`;
+}
+function guide() {
+  const rows = guideBlocks(M.data), selected = rows.find((row) => row.id === M.p.guideBlockId) || rows[0], index = Math.max(0, rows.indexOf(selected)), mode = M.p.guideMode;
+  const list = mode === "favorites" ? rows.filter((row) => (M.data.progress?.favorites || []).includes(row.id)) : rows;
+  return `<section class="screen-heading"><span class="eyebrow">GUIA</span><h1>${mode === "read" ? "Leitura" : mode === "favorites" ? "Favoritos" : "Índice"}</h1></section><div class="mobile-segmented"><button class="${mode === "index" ? "active" : ""}" data-act="guide-mode" data-mode="index">Índice</button><button class="${mode === "read" ? "active" : ""}" data-act="guide-mode" data-mode="read">Leitura</button><button class="${mode === "favorites" ? "active" : ""}" data-act="guide-mode" data-mode="favorites">Favoritos</button></div>${mode === "read" ? `${guideCard(selected)}<div class="pager"><button class="outline" data-act="guide-step" data-dir="-1" ${index <= 0 ? "disabled" : ""}>← Anterior</button><button class="outline" data-act="guide-step" data-dir="1" ${index >= rows.length - 1 ? "disabled" : ""}>Próximo →</button></div><button class="assistant-trigger" data-act="assistant">✦ Perguntar sobre este trecho</button>${assistant(selected)}` : `<section class="list-section">${list.map((row) => `<button class="guide-index-row" data-act="guide-open" data-block="${esc(row.id)}"><span>#${String(rows.indexOf(row) + 1).padStart(3,"0")}</span><span><b>${esc(row.title || "Etapa")}</b><small>${esc(row.chapterTitle || "")}</small></span><span>${(M.data.progress?.completed || []).includes(row.id) ? "✓" : "›"}</span></button>`).join("") || "<p class='muted'>Nenhum favorito neste guia.</p>"}</section>`}`;
+}
+function requirements(system, edge) {
+  if (!edge) return "<p class='muted'>Escolha uma rota para consultar as condições.</p>";
+  if (!(edge.requirements || []).length) return "<p class='muted'>Sem requisitos nesta fonte.</p>";
+  const state = M.data.system_state || {};
+  const legacy = new Set(state.completed_requirements || []);
+  const scoped = new Set(state.completed_requirement_targets || []);
+  const scopedMode = Boolean(state.requirements_scoped || scoped.size);
+  return edge.requirements.map((rule) => {
+    if (rule.none || rule.text === "Prerequisites: None") return "<p class='requirement-note'>Sem requisitos nesta fonte.</p>";
+    const unknown = rule.condition?.op === "unknown" || rule.availability === "unknown", key = `requirement:${system.id}:${edge.id}:${rule.id}`;
+    const checked = scopedMode ? scoped.has(key) : legacy.has(rule.id);
+    return `<label class="mobile-requirement ${unknown ? "unknown" : ""}"><input type="checkbox" data-act="requirement" data-system="${esc(system.id)}" data-edge="${esc(edge.id)}" data-requirement="${esc(rule.id)}" ${checked ? "checked" : ""} ${unknown || pending(key) ? "disabled" : ""}><span><b>${esc(rule.mode === "item" ? "Item do jogo" : rule.mode === "jogress" ? "Combinação" : "Requisito")}</b>${esc(rule.text || "Condição sem descrição")}${unknown ? "<small>Disponibilidade desconhecida: a fonte não define esta regra.</small>" : ""}${sourceName(rule.source_refs) ? `<small>Fonte: ${esc(sourceName(rule.source_refs))}</small>` : ""}</span></label>`;
+  }).join("");
+}
+function routeNode(system, node, role, active) {
+  if (!node) return ""; const art = nodeImage(system, node);
+  return `<button class="route-node ${active ? "active" : ""}" data-act="atlas-node" data-system="${esc(system.id)}" data-node="${esc(node.id)}">${art ? `<img src="${art}" alt="">` : "<span class='route-fallback'>◇</span>"}<span><small>${esc(role)} · #${num(node)}</small><b>${esc(node.label)}</b><em>${esc(node.stage || node.group || "Entidade")}</em></span></button>`;
+}
+function atlasRoute(system, node) {
+  const edges = system.edges || [], incoming = edges.filter((row) => row.to === node.id), outgoing = edges.filter((row) => row.from === node.id);
+  const edge = edges.find((row) => row.id === M.p.atlasEdgeId) || incoming[0] || outgoing[0], origin = edge ? nodeById(system, edge.from) : null, destination = edge ? nodeById(system, edge.to) : null;
+  const from = edge?.to === node.id ? origin : null, to = edge?.from === node.id ? destination : null;
+  const alternatives = (rows, endpoint) => rows.filter((row) => row.id !== edge?.id).map((row) => { const item = nodeById(system, row[endpoint]); return item ? `<button class="alt-chip" data-act="atlas-edge" data-edge="${esc(row.id)}">${esc(item.label)} · #${num(item)}</button>` : ""; }).join("");
+  const alternativeList=(label,rows,endpoint)=>rows.length>1?`<details class="alternatives"><summary>${esc(label)} · ${rows.length-1}</summary><div>${alternatives(rows,endpoint)}</div></details>`:"";
+  return `<section class="atlas-route"><div class="atlas-route-head"><button class="text-action" data-act="atlas-mode" data-mode="entities">← Entidades</button><button class="text-action" data-act="atlas-mode" data-mode="systems">Sistemas</button></div><div class="route-stack">${routeNode(system, from, "Origem", false)}${from ? "<span class='route-arrow'>↓</span>" : ""}${routeNode(system, node, "Selecionado", true)}${to ? "<span class='route-arrow'>↓</span>" : ""}${routeNode(system, to, "Destino", false)}</div>${alternativeList("Outras origens",incoming,"from")}${alternativeList("Outros destinos",outgoing,"to")}<section class="route-detail">${nodeImage(system,node) ? `<img class="detail-image" src="${nodeImage(system,node)}" alt="${esc(node.label)}">` : ""}<div class="card-meta"><span>ENTIDADE</span><b>#${num(node)}</b></div><h2>${esc(node.label)}</h2><p>${esc(node.subtitle || node.stage || "Rota documentada no Atlas.")}</p><button class="primary" data-act="goal" data-system="${esc(system.id)}" data-node="${esc(node.id)}">${M.data.system_state?.goals?.[system.id] === node.id ? "✓ Objetivo fixado" : "Fixar objetivo"}</button><h3>Requisitos desta rota</h3>${requirements(system,edge)}${sourceButton(edge?.source_refs || node.source_refs)}</section></section>`;
+}
+function atlas() {
+  const systems = M.data.systems || [], atlasQuery = normalized(M.p.atlasQuery || "");
+  if (!systems.length) return "<section class='mobile-empty'><span class='eyebrow'>ATLAS</span><h1>Nenhum Atlas publicado</h1><p>Crie e aprove um sistema no PC para consultá-lo aqui.</p></section>";
+  const system = systemById(M.data, M.p.atlasSystemId) || systems[0], node = nodeById(system, M.p.atlasNodeId) || system.nodes?.[0];
+  const matchingSystems = systems.filter((row) => queryMatches(atlasQuery, row.title, row.id));
+  const matchingNodes = (system.nodes || []).filter((row) => queryMatches(atlasQuery, row.label, row.id, row.card_number, row.stage || row.group));
+  const atlasSearch = `<label class="local-search"><span aria-hidden="true">⌕</span><input id="atlas-local-search" type="search" value="${esc(M.p.atlasQuery || "")}" placeholder="Buscar sistema, entidade ou #ID" aria-label="Buscar no Atlas"></label>`;
+  let body = "";
+  if (M.p.atlasMode === "systems") body = `${atlasSearch}<section class="list-section">${matchingSystems.map((row) => `<button class="system-row" data-act="atlas-system" data-system="${esc(row.id)}"><span>◇</span><span><b>${esc(row.title)}</b><small>${row.nodes?.length || 0} entidades</small></span><span>›</span></button>`).join("") || "<p class='muted'>Nenhum sistema corresponde à busca.</p>"}</section>`;
+  else if (M.p.atlasMode === "entities") body = `${atlasSearch}<section class="list-section"><div class="section-title"><h2>${esc(system.title)}</h2><button class="text-action" data-act="atlas-mode" data-mode="systems">Sistemas</button></div>${matchingNodes.map((row,index) => `<button class="entity-row" data-act="atlas-node" data-system="${esc(system.id)}" data-node="${esc(row.id)}">${nodeImage(system,row) ? `<img src="${nodeImage(system,row)}" alt="">` : "<span class='node-mini'>◇</span>"}<span><small>#${num(row,index+1)}</small><b>${esc(row.label)}</b><em>${esc(row.stage || row.group || "Entidade")}</em></span><span>›</span></button>`).join("") || "<p class='muted'>Nenhuma entidade corresponde à busca.</p>"}</section>`;
+  else body = atlasRoute(system,node);
+  return `<section class="screen-heading"><span class="eyebrow">ATLAS DE SISTEMAS</span><h1>${M.p.atlasMode === "route" ? "Rota" : "Atlas"}</h1></section>${body}`;
+}
+function itemStatus(item){return item.quantity==null?"Quantidade desconhecida":Number(item.quantity)===0?"Não tenho":`Tenho · ${item.quantity}`;}
+function acquisitionText(row){if(typeof row==="string")return row;if(!row||typeof row!=="object")return "";return row.text||row.label||row.method||row.location||row.name||"";}
+function itemUses(item){
+  const uses=[];
+  for(const system of M.data.systems||[])for(const edge of system.edges||[])for(const rule of edge.requirements||[]){
+    const ids=[rule.item_id,rule.condition?.item_id,...(rule.items||[]).map(value=>value?.item_id||value?.id)].filter(Boolean).map(String);
+    if(!ids.includes(String(item.id)))continue;
+    const target=nodeById(system,edge.to);uses.push({system,edge,target,rule});
+  }
+  return uses;
+}
+function itemDetail(item){
+  if(!item)return `<section class="mobile-empty"><h1>Item indisponível</h1><button class="outline" data-act="item-back">Voltar à lista</button></section>`;
+  const value=item.quantity==null?"":Number(item.quantity), acquisitions=(item.acquisitions||[]).map(acquisitionText).filter(Boolean), uses=itemUses(item);
+  return `<button class="text-action back-row" data-act="item-back">← Itens</button><article class="item-detail"><div class="card-meta"><span>ITEM</span><b>${esc(item.category||item.item_kind||"")}</b></div><h1>${esc(item.name)}</h1><p>${esc(item.description||"")}</p><section class="item-quantity"><div><b>${esc(itemStatus(item))}</b><small>Deixe em branco para quantidade desconhecida; zero significa que você não possui o item.</small></div><label>Qtd.<input inputmode="numeric" type="number" min="0" step="1" data-item-input="${esc(item.id)}" value="${M.drafts.items[item.id]??value}" placeholder="—"></label><button class="primary" data-act="item-save" data-item="${esc(item.id)}">Salvar quantidade</button></section><section class="detail-section"><h2>Como obter</h2>${acquisitions.map(text=>`<p>• ${esc(text)}</p>`).join("")||"<p class='muted'>Nenhuma origem estruturada foi documentada para este item.</p>"}</section><section class="detail-section"><h2>Usado em</h2>${uses.map(({system,edge,target,rule})=>`<button class="simple-row" data-act="item-use" data-system="${esc(system.id)}" data-edge="${esc(edge.id)}" data-node="${esc(target?.id||edge.to||"")}"><span>◇</span><span><b>${esc(target?.label||edge.label||"Rota do Atlas")}</b><small>${esc(system.title)} · ${esc(rule.text||"Uso documentado")}</small></span><span>›</span></button>`).join("")||"<p class='muted'>Nenhum uso estruturado foi documentado no Atlas.</p>"}</section>${sourceButton(item.source_refs)}</article>`;
+}
+function items() {
+  const all=M.data.items||[], selected=all.find(item=>item.id===M.p.itemId);if(M.p.itemId)return itemDetail(selected);
+  const filter=M.p.itemFilter,itemQuery=normalized(M.p.itemQuery||"");
+  const rows=all.filter(item=>(filter==="have"?Number(item.quantity)>0:filter==="missing"?item.quantity===0||item.quantity==null:true)&&queryMatches(itemQuery,item.name,item.id,...(item.aliases||[])));
+  return `<section class="screen-heading"><span class="eyebrow">ITENS</span><h1>Inventário</h1></section><label class="local-search"><span aria-hidden="true">⌕</span><input id="item-local-search" type="search" value="${esc(M.p.itemQuery||"")}" placeholder="Buscar item ou #ID" aria-label="Buscar item"></label><div class="mobile-segmented"><button class="${filter==="all"?"active":""}" data-act="item-filter" data-filter="all">Todos</button><button class="${filter==="have"?"active":""}" data-act="item-filter" data-filter="have">Tenho</button><button class="${filter==="missing"?"active":""}" data-act="item-filter" data-filter="missing">Faltam</button></div><section class="list-section">${rows.map(item=>`<button class="item-list-row" data-act="item-open" data-item="${esc(item.id)}"><span>▣</span><span><b>${esc(item.name)}</b><small>${esc(itemStatus(item))}</small></span><span>›</span></button>`).join("")||"<p class='muted'>Nenhum item corresponde a este filtro.</p>"}</section>`;
+}
+function achievements() {
+  return `<section class="screen-heading"><span class="eyebrow">CONQUISTAS</span><h1>Conquistas</h1></section><section class="list-section">${(M.data.achievements || []).map((row,index) => `<article class="achievement-row"><span>${row.earned ? "✓" : row.hardcore ? "◆" : "○"}</span><div><b>${esc(row.name)}</b><p>${esc(row.desc || "")}</p><small>#${String(index+1).padStart(3,"0")} · ${row.earned ? "Conquistada" : "Pendente"}</small></div></article>`).join("") || "<p class='muted'>Nenhuma conquista sincronizada.</p>"}</section>`;
+}
+function more() {
+  if (M.p.moreMode === "achievements") return `<button class="text-action back-row" data-act="more-mode" data-mode="menu">← Mais</button>${achievements()}`;
+  if (M.p.moreMode === "favorites") { const values = guideBlocks(M.data).filter((row) => (M.data.progress?.favorites || []).includes(row.id)); return `<button class="text-action back-row" data-act="more-mode" data-mode="menu">← Mais</button><section class="screen-heading"><span class="eyebrow">FAVORITOS</span><h1>Favoritos</h1></section><section class="list-section">${values.map((row) => `<button class="guide-index-row" data-act="guide-open" data-block="${esc(row.id)}"><span>★</span><span><b>${esc(row.title)}</b><small>${esc(row.chapterTitle || "Guia")}</small></span><span>›</span></button>`).join("") || "<p class='muted'>Favorite um trecho do guia para encontrá-lo aqui.</p>"}</section>`; }
+  if (M.p.moreMode === "connection") return `<button class="text-action back-row" data-act="more-mode" data-mode="menu">← Mais</button><section class="screen-heading"><span class="eyebrow">CONEXÃO</span><h1>Este aparelho</h1></section><section class="connection-panel"><b>${M.connected ? "PC sincronizado" : "Aguardando o PC"}</b><p>${M.data?.companion?.server_url ? "Conectado à rede local." : "Mantenha o DigiTracker aberto no PC e conectado à mesma rede."}</p><dl><div><dt>Pendências</dt><dd>${M.p.pending.length}</dd></div><div><dt>Armazenamento offline</dt><dd>${M.storage?.available ? "Ativo" : "Indisponível"}</dd></div></dl><button class="outline" data-act="forget">Esquecer este aparelho</button></section>`;
+  return `<section class="screen-heading"><span class="eyebrow">MAIS</span><h1>Mais opções</h1></section><section class="list-section"><button class="simple-row" data-act="more-mode" data-mode="achievements"><span>♜</span><span><b>Conquistas</b><small>Acompanhe os marcos recebidos do PC</small></span><span>›</span></button><button class="simple-row" data-act="more-mode" data-mode="favorites"><span>★</span><span><b>Favoritos</b><small>Trechos guardados no guia</small></span><span>›</span></button><button class="simple-row" data-act="more-mode" data-mode="connection"><span>⌁</span><span><b>Conexão e aparelho</b><small>Sincronização com o DigiTracker</small></span><span>›</span></button></section>`;
+}
+function search() {
+  const q = normalized(M.p.query);
+  const guideRows = guideBlocks(M.data).filter((row) => !row.hidden && queryMatches(q, row.title, row.text, row.card_number));
+  const atlasRows = (M.data.systems || []).flatMap((system) => (system.nodes || []).map((node) => ({system,node}))).filter(({system,node}) => queryMatches(q, node.label, node.id, node.card_number, system.title));
+  const itemRows = (M.data.items || []).filter((row) => queryMatches(q, row.name, row.id));
+  const group = (title, body) => `<section><h2>${title}</h2>${body || "<p class='muted'>Nenhum resultado.</p>"}</section>`;
+  return `<div class="overlay-screen" data-overlay="search"><div class="overlay-head"><button class="mobile-icon-button" data-act="search-close" aria-label="Voltar">←</button><label><span class="sr-only">Buscar</span><input id="global-search" type="search" value="${esc(M.p.query)}" placeholder="Buscar guia, Atlas ou item" autofocus></label></div><div class="search-results">${q ? group("Guia", guideRows.map((row) => `<button class="simple-row" data-act="search-guide" data-block="${esc(row.id)}"><span>▤</span><span><b>${esc(row.title)}</b><small>${esc(row.chapterTitle || "")}</small></span><span>›</span></button>`).join("")) + group("Atlas", atlasRows.map(({system,node}) => `<button class="simple-row" data-act="search-atlas" data-system="${esc(system.id)}" data-node="${esc(node.id)}"><span>◇</span><span><b>${esc(node.label)}</b><small>#${num(node)} · ${esc(system.title)}</small></span><span>›</span></button>`).join("")) + group("Itens", itemRows.map((row) => `<button class="simple-row" data-act="search-item" data-item="${esc(row.id)}"><span>▣</span><span><b>${esc(row.name)}</b><small>${esc(row.id)}</small></span><span>›</span></button>`).join("")) : "<section class='mobile-empty'><h2>Buscar no jogo</h2><p>Use nome ou #ID. A busca ignora acentos e maiúsculas.</p></section>"}</div></div>`;
+}
+function library() {
+  return `<div class="overlay-screen" data-overlay="library"><div class="overlay-head"><button class="mobile-icon-button" data-act="library-close" aria-label="Fechar">×</button><h1>Biblioteca</h1></div><div class="library-list">${games().map((game) => `<button class="library-game ${game.slug === slug() ? "selected" : ""}" data-act="select-game" data-game="${esc(game.slug)}">${cover(game)}<span><b>${esc(game.title || game.slug)}</b><small>${esc(game.platform || "Jogo")}</small></span><span>${game.slug === slug() ? "✓" : "›"}</span></button>`).join("") || "<p class='muted'>Nenhum jogo recebido do PC.</p>"}</div></div>`;
+}
+function referenceRows(rows){return (rows||[]).map(row=>Array.isArray(row)?row.map(value=>String(value??"")).join(" · "):row&&typeof row==="object"?Object.values(row).filter(value=>typeof value!=="object").map(value=>String(value??"")).join(" · "):String(row??"")).filter(Boolean);}
+function sourceModal() {
+  const state=M.p.source;if(!state)return "";const ref=state.ref||state, references=state.references||[];
+  const body=state.loading?"<p>Carregando o trecho publicado…</p>":state.error?`<p class="warning">${esc(state.error)}</p>`:references.map(row=>{const block=row.block;if(block)return `<article class="source-reference"><small>${esc(row.chapter_title||"Guia")}</small><h3>${esc(block.title||"Trecho")}</h3>${block.hidden?"<p>Spoiler oculto.</p>":`${block.text?`<p>${esc(block.text)}</p>`:""}${(block.items||[]).map(item=>`<p>• ${esc(item.text||item)}</p>`).join("")}${referenceRows(block.rows).map(text=>`<p class="source-row">${esc(text)}</p>`).join("")}`}</article>`;const node=row.node;return node?`<article class="source-reference"><small>${esc(row.system_title||"Atlas")}</small><h3>${esc(node.label||"Entidade")}</h3><p>${esc(node.subtitle||"Referência estruturada no Atlas.")}</p></article>`:"";}).join("")||"<p>Nenhum trecho editorial publicado corresponde exatamente a esta referência.</p>";
+  return `<div class="modal-backdrop"><section class="mobile-modal source-modal" role="dialog" aria-modal="true"><button class="mobile-icon-button modal-close" data-act="source-close" aria-label="Fechar">×</button><span class="eyebrow">FONTE</span><h2>Trecho correspondente</h2><p>${esc(sourceName([ref])||"Trecho documentado")}</p>${body}</section></div>`;
+}
+async function openSource(ref){
+  M.p.source={ref,loading:true,references:[]};render();
+  try{
+    if(M.demo){const matches=[];for(const chapter of M.data.chapters||[])for(const block of chapter.blocks||[])if((block.source_refs||[]).some(candidate=>Object.entries(ref).every(([key,value])=>value==null||value===""||String(candidate?.[key]??"")===String(value))))matches.push({kind:"guide",chapter_title:chapter.title,block});M.p.source={ref,references:matches};}
+    else{const params=new URLSearchParams({slug:slug()});for(const key of ["page","section","block","row_id","table_id","element_id"])if(ref?.[key]!=null&&ref[key]!=="")params.set(key,String(ref[key]));if(ref?.id)params.set("id",String(ref.id));const response=await api(`/api/reference?${params}`);M.p.source={ref,references:response.references||[]};}
+  }catch(error){M.p.source={ref,references:[],error:error.message};}
+  render();
+}
+function conflictModal() {
+  const row = M.p.conflict; if (!row) return "";
+  return `<div class="modal-backdrop"><section class="mobile-modal" role="dialog" aria-modal="true"><span class="eyebrow">CONFLITO</span><h2>Esta alteração mudou no PC</h2><p>PC: <b>${esc(String(row.server?.value ?? "não informado"))}</b><br>Telefone: <b>${esc(String(row.values?.value ?? "não informado"))}</b></p><p>As demais alterações continuam independentes.</p><div class="modal-actions"><button class="outline" data-act="conflict-pc">Usar valor do PC</button><button class="primary" data-act="conflict-phone">Aplicar minha alteração</button></div></section></div>`;
+}
+function searchBackButton(){return M.p.searchReturn?`<button class="text-action search-return" data-act="search-back">← Resultados da busca</button>`:"";}
+function body() { let page;if(M.p.view==="guide")page=guide();else if(M.p.view==="atlas")page=atlas();else if(M.p.view==="items")page=items();else if(M.p.view==="more")page=more();else page=home();return searchBackButton()+page; }
+function tabState(){tabs.hidden=false;tabs.querySelectorAll("button").forEach(button=>{const active=button.dataset.tab===M.p.view;button.classList.toggle("active",active);button.setAttribute("aria-current",active?"page":"false");});}
+function render(options={}) {
+  if(!M.data?.ok)return;const top=options.top??window.scrollY, focus=focusSnapshot();tabState();
+  content.innerHTML=`<div class="mobile-screen">${body()}</div>${M.p.search?search():""}${M.p.library?library():""}${sourceModal()}${conflictModal()}${forgetModal()}`;setConnected(M.connected);
+  requestAnimationFrame(()=>window.scrollTo({top,behavior:"instant"}));restoreFocus(focus);
+}
+function renderScreen() {
+  if(!M.data?.ok)return render();const screen=content.querySelector(".mobile-screen");if(!screen)return render();const top=window.scrollY,focus=focusSnapshot(screen);screen.innerHTML=body();setConnected(M.connected);requestAnimationFrame(()=>window.scrollTo({top,behavior:"instant"}));restoreFocus(focus);
+}
+function replaceOverlay(name,html){const current=content.querySelector(`[data-overlay="${name}"]`);if(!current)return;const top=current.scrollTop,template=document.createElement("template");template.innerHTML=html.trim();current.replaceWith(template.content.firstElementChild);const next=content.querySelector(`[data-overlay="${name}"]`);if(next)next.scrollTop=top;}
+function renderChanged(changed){
+  const keys=new Set(changed),view=M.p.view;
+  const affectsScreen=keys.has("games")||view==="home"||(view==="guide"&&(keys.has("guide")||keys.has("assistant")))||(view==="atlas"&&(keys.has("atlas")||keys.has("media")))||(view==="items"&&keys.has("items"))||(view==="more"&&(keys.has("achievements")||keys.has("guide")));
+  if(affectsScreen)renderScreen();
+  if(M.p.search&&["guide","atlas","items"].some(key=>keys.has(key)))replaceOverlay("search",search());
+  if(M.p.library&&keys.has("games"))replaceOverlay("library",library());
+}
+function nav(view,options={}){rememberScroll();if(M.p.view!==view)M.p.history=[...M.p.history,M.p.view].slice(-20);M.p.view=view;if(!options.keepSearchReturn)M.p.searchReturn=null;persist();render({top:options.top??storedScroll()});}
+async function ask(form) {
+  if (!M.connected) return notify("A pergunta à IA exige conexão com o PC.", true);
+  const values = new FormData(form), question = String(values.get("question") || "").trim();
+  if (!question) return notify("Escreva uma pergunta antes de enviar.", true);
+  M.drafts.question = question;
+  try { await api("/api/action", {kind:"ask",slug:slug(),block_id:values.get("block"),question}); notify("Pergunta enviada ao PC."); render(); } catch (error) { notify(error.message,true); }
+}
+async function forget(mode = "ask") {
+  const rows=await M.storage?.pending(M.namespace)||[];
+  if(rows.length&&mode==="ask"){M.p.forget={count:rows.length};return render();}
+  if(mode==="cancel"){M.p.forget=null;return render();}
+  if(rows.length&&mode==="sync"){
+    if(!M.connected)return notify("Reconecte ao PC para sincronizar antes de esquecer este aparelho.",true);
+    await flush();const remaining=await M.storage?.pending(M.namespace)||[];
+    if(remaining.length){M.p.forget={count:remaining.length};notify("Ainda há pendências ou conflitos. Revise-os ou descarte antes de esquecer.",true);return render();}
+  }
+  if(mode==="discard")for(const row of rows)await M.storage.remove(row.id);
+  const remaining=await M.storage?.pending(M.namespace)||[];
+  if(remaining.length)return;
+  try{await api("/api/device/forget",{});M.connected=false;M.p.pending=[];M.p.forget=null;notify("Aparelho esquecido. Leia um novo QR Code para reconectar.");disconnected("Este aparelho foi removido do DigiTracker.");}catch(error){notify(error.message,true);}
+}
+function forgetModal(){
+  const row=M.p.forget;if(!row)return "";
+  return `<div class="modal-backdrop"><section class="mobile-modal" role="dialog" aria-modal="true"><span class="eyebrow">APARELHO</span><h2>Há ${Number(row.count)||0} alteração(ões) pendente(s)</h2><p>Escolha se quer sincronizar com o PC antes de remover a autorização deste aparelho ou descartar apenas estas pendências locais.</p><div class="modal-actions"><button class="outline" data-act="forget-cancel">Cancelar</button><button class="outline" data-act="forget-discard">Descartar e esquecer</button><button class="primary" data-act="forget-sync">Sincronizar antes</button></div></section></div>`;
+}
+async function click(event) {
+  const button = event.target.closest("[data-act],[data-tab]"); if (!button) return;
+  const a = button.dataset.act;
+  if (!a && button.dataset.tab) return nav(button.dataset.tab);
+  if (a === "retry") return refresh(true);
+  if (a === "tab") { if (button.dataset.more) M.p.moreMode = button.dataset.more; return nav(button.dataset.tab); }
+  if (a === "continue-guide") { M.p.guideMode = "read"; return nav("guide"); }
+  if (a === "guide-mode") { rememberScroll(); M.p.guideMode=button.dataset.mode; persist(); return render({top:storedScroll()}); }
+  if (a === "guide-open") { rememberScroll(); M.p.guideBlockId=button.dataset.block;M.p.guideMode="read";const row=guideBlocks(M.data).find(item=>item.id===button.dataset.block);rememberRecent("guide",button.dataset.block,row?.title||"Guia",row?.chapterTitle||"");persist();return render({top:storedScroll()}); }
+  if (a === "guide-step") { const rows = guideBlocks(M.data), index = rows.findIndex((row) => row.id === M.p.guideBlockId); M.p.guideBlockId = rows[index+Number(button.dataset.dir)]?.id || M.p.guideBlockId; persist(); render(); return window.scrollTo({top:0,behavior:"instant"}); }
+  if (["complete","favorite","reveal","checkpoint"].includes(a)) {
+    const action = a === "complete" ? "complete" : a === "favorite" ? "favorite" : a === "reveal" ? "reveal" : "checkpoint";
+    const value = action === "checkpoint" ? button.dataset.block : action === "reveal" ? true : button.dataset.value === "true";
+    return submit({kind:"progress",action,value,target:{block_id:button.dataset.block}});
+  }
+  if (a === "assistant") { M.p.assistant = !M.p.assistant; persist(); return render(); }
+  if (a === "atlas-mode") { M.p.atlasMode = button.dataset.mode; persist(); return render(); }
+  if (a === "atlas-system") { M.p.atlasSystemId=button.dataset.system;M.p.atlasNodeId="";M.p.atlasMode="entities";selections();persist();return render(); }
+  if (a === "atlas-node") { M.p.atlasSystemId=button.dataset.system;M.p.atlasNodeId=button.dataset.node;M.p.atlasEdgeId="";M.p.atlasMode="route";selections(); const sys=systemById(M.data,M.p.atlasSystemId), node=nodeById(sys,M.p.atlasNodeId);rememberRecent("atlas",node?.id,node?.label || "Atlas",sys?.title || ""); return nav("atlas"); }
+  if (a === "atlas-edge") { M.p.atlasEdgeId=button.dataset.edge;persist();return render(); }
+  if (a === "goal") { const current=M.data.system_state?.goals?.[button.dataset.system], value=current === button.dataset.node ? "" : button.dataset.node; return submit({kind:"goal",value,target:{system_id:button.dataset.system,node_id:value}}); }
+  if (a === "item-filter") { M.p.itemFilter=button.dataset.filter;persist();return renderScreen(); }
+  if (a === "item-open") { rememberScroll();M.p.itemId=button.dataset.item;const item=(M.data.items||[]).find(row=>row.id===M.p.itemId);rememberRecent("item",M.p.itemId,item?.name||"Item","Inventário");persist();return render({top:storedScroll()}); }
+  if (a === "item-back") { rememberScroll();M.p.itemId="";persist();return render({top:storedScroll()}); }
+  if (a === "item-use") { M.p.atlasSystemId=button.dataset.system;M.p.atlasNodeId=button.dataset.node;M.p.atlasEdgeId=button.dataset.edge;M.p.atlasMode="route";return nav("atlas"); }
+  if (a === "item-save") { const field=Array.from(content.querySelectorAll("[data-item-input]")).find((row)=>row.dataset.itemInput===button.dataset.item); const raw=String(M.drafts.items[button.dataset.item] ?? field?.value ?? "").trim(), value=raw === "" ? null : Number(raw); if (value !== null && (!Number.isInteger(value)||value<0)) return notify("Informe uma quantidade inteira, zero ou deixe em branco.",true); const item=(M.data.items||[]).find((row)=>row.id===button.dataset.item);rememberRecent("item",button.dataset.item,item?.name || "Item","Inventário"); return submit({kind:"item",value,target:{item_id:button.dataset.item}}); }
+  if (a === "more-mode") { M.p.moreMode=button.dataset.mode;persist();return render(); }
+  if (a === "forget") return forget("ask");
+  if (a === "forget-sync") return forget("sync");
+  if (a === "forget-discard") return forget("discard");
+  if (a === "forget-cancel") return forget("cancel");
+  if (a === "search-close") { M.p.search=false;M.p.searchReturn=null;persist();return render(); }
+  if (a === "search-back") { M.p.search=true;M.p.query=M.p.searchReturn?.query||M.p.query;const top=Number(M.p.searchReturn?.scrollTop||0);render();requestAnimationFrame(()=>{const overlay=content.querySelector('[data-overlay="search"]');if(overlay)overlay.scrollTop=top;document.getElementById("global-search")?.focus();});return; }
+  if (a === "library-close") { M.p.library=false;return render(); }
+  if (a === "select-game") { M.p={...defaults(),gameSlug:button.dataset.game}; M.loadedNamespace="";notify("Contexto de consulta alterado no telefone.");return refresh(true); }
+  if (["search-guide","search-atlas","search-item"].includes(a)) {
+    const overlay=content.querySelector('[data-overlay="search"]');M.p.searchReturn={query:M.p.query,scrollTop:overlay?.scrollTop||0};M.p.search=false;
+    if(a==="search-guide"){M.p.guideBlockId=button.dataset.block;M.p.guideMode="read";return nav("guide",{keepSearchReturn:true,top:0});}
+    if(a==="search-atlas"){M.p.atlasSystemId=button.dataset.system;M.p.atlasNodeId=button.dataset.node;M.p.atlasMode="route";selections();return nav("atlas",{keepSearchReturn:true,top:0});}
+    M.p.itemId=button.dataset.item;return nav("items",{keepSearchReturn:true,top:0});
+  }
+  if (a === "recent") { if(button.dataset.kind==="guide"){M.p.guideBlockId=button.dataset.id;M.p.guideMode="read";return nav("guide");}if(button.dataset.kind==="atlas"){const sys=(M.data.systems||[]).find((row)=>(row.nodes||[]).some((node)=>node.id===button.dataset.id));M.p.atlasSystemId=sys?.id||"";M.p.atlasNodeId=button.dataset.id;M.p.atlasMode="route";selections();return nav("atlas");}M.p.itemId=button.dataset.id;return nav("items"); }
+  if (a === "source") { try { return openSource(JSON.parse(button.dataset.source||"{}")); } catch (_) { return; } }
+  if (a === "source-close") { M.p.source=null;return render(); }
+  if (a === "conflict-pc") return resolveConflict("pc");
+  if (a === "conflict-phone") return resolveConflict("phone");
+}
+function change(event) { const input=event.target;if(input.matches("[data-act='requirement']")) return submit({kind:"requirement",value:input.checked,target:{system_id:input.dataset.system,edge_id:input.dataset.edge,requirement_id:input.dataset.requirement}}); }
+function input(event) {
+  const field=event.target;
+  if(field.matches("#global-search")){M.p.query=field.value;render();requestAnimationFrame(()=>document.getElementById("global-search")?.focus());}
+  if(field.matches("#atlas-local-search")){M.p.atlasQuery=field.value;persist();render();requestAnimationFrame(()=>document.getElementById("atlas-local-search")?.focus());}
+  if(field.matches("#item-local-search")){M.p.itemQuery=field.value;persist();render();requestAnimationFrame(()=>document.getElementById("item-local-search")?.focus());}
+  if(field.matches("[data-item-input]"))M.drafts.items[field.dataset.itemInput]=field.value;
+  if(field.matches("textarea[name='question']"))M.drafts.question=field.value;
+}
+content.addEventListener("click",click);content.addEventListener("change",change);content.addEventListener("input",input);content.addEventListener("submit",(event)=>{if(event.target.matches("[data-form='question']")){event.preventDefault();ask(event.target);}});
+tabs.addEventListener("click",click);
+document.getElementById("mobile-menu")?.addEventListener("click",()=>{M.p.library=true;render();});
+document.getElementById("mobile-search-toggle")?.addEventListener("click",()=>{M.p.searchReturn=null;M.p.search=true;render();requestAnimationFrame(()=>document.getElementById("global-search")?.focus());});
+document.getElementById("mobile-search-close")?.addEventListener("click",()=>{M.p.search=false;render();});
+document.getElementById("mobile-search-input")?.addEventListener("input",(event)=>{M.p.query=event.target.value;M.p.search=true;render();});
+function demoSnapshot() {
+  return {
+    ok: true, api_version: 2, definition_revision: "demo-v1",
+    companion: {installation_id: "demo", account_scope: "demo", server_url: ""},
+    game: {slug: "demo", title: "Digimon World Re:Digitize", platform: "PSP"},
+    games: [{slug: "demo", title: "Digimon World Re:Digitize", platform: "PSP"}],
+    chapters: [{id: "intro", title: "Início", blocks: [
+      {id: "b1", title: "Início da Aventura", text: "Depois de acordar, siga o tutorial e prepare seu parceiro.", source_refs: [{page: 1}]},
+      {id: "b2", title: "Instalações de File City", text: "Consulte a clínica, o armazém e o ginásio antes de continuar.", source_refs: [{page: 2}]},
+    ]}],
+    progress: {completed: [], favorites: [], checkpoint: "b1", revealed_spoilers: [], value_versions: {}},
+    systems: [{id: "evolution", title: "Evoluções", nodes: [
+      {id: "koromon", label: "Koromon", card_number: 1, stage: "Baby I", source_refs: [{page: 1}]},
+      {id: "agumon", label: "Agumon", card_number: 24, stage: "Rookie", source_refs: [{page: 1}]},
+      {id: "greymon", label: "Greymon", card_number: 63, stage: "Champion", source_refs: [{page: 1}]},
+    ], edges: [
+      {id: "koromon-agumon", from: "koromon", to: "agumon", requirements: [{id: "age", text: "Idade: 3 dias ou mais", condition: {op: ">="}, source_refs: [{page: 1}]}], source_refs: [{page: 1}]},
+      {id: "agumon-greymon", from: "agumon", to: "greymon", requirements: [{id: "item", text: "Use o item Digivice", mode: "item", source_refs: [{page: 1}]}], source_refs: [{page: 1}]},
+    ]}],
+    system_state: {active_system: "evolution", goals: {evolution: "agumon"}, completed_requirements: [], completed_requirement_targets: [], requirements_scoped: false, node_media: {}, value_versions: {}},
+    items: [{id: "digivice", name: "Digivice", quantity: null, value_version: 0, description: "Item usado em uma evolução documentada."}],
+    achievements: [{name: "Primeiros passos", desc: "Conclua a introdução.", earned: false}],
+    media: [], answer: {},
+  };
+}
+async function boot() {
+  M.storage=await createStorage(); const params=new URLSearchParams(location.search), pair=new URLSearchParams(location.hash.slice(1)).get("pair");
+  history.replaceState(null,"",location.pathname+(params.get("demo")==="1"?"?demo=1":""));
+  if(params.get("demo")==="1"){M.demo=true;M.data=demoSnapshot();M.namespace=namespaceFor(M.data,"demo");M.p.gameSlug="demo";selections();setConnected(true);notify("Modo demo: as marcações não são enviadas ao PC.");return render();}
+  if(pair){try{await api("/pair",{code:pair,name:/iPad|Tablet/i.test(navigator.userAgent)?"Tablet":"Celular",remember:true});notify("Confirme este aparelho no PC.");const wait=async()=>{try{const value=await api("/pair/status",{});if(value.pending)return setTimeout(wait,1500);refresh(true);}catch(error){notify(error.message,true);disconnected(error.message);}};wait();}catch(error){notify(error.message,true);disconnected(error.message);}}else await refresh(true);
+}
+function keyboardState(){const viewport=window.visualViewport;if(!viewport)return document.body.classList.remove("keyboard-open");document.body.classList.toggle("keyboard-open",window.innerHeight-viewport.height>120);}
+window.visualViewport?.addEventListener("resize",keyboardState);window.visualViewport?.addEventListener("scroll",keyboardState);document.addEventListener("focusin",event=>{if(event.target.matches("input,textarea,select"))setTimeout(()=>event.target.scrollIntoView({block:"center",behavior:"smooth"}),120);});keyboardState();
+window.addEventListener("online",()=>M.data?poll(true):refresh(true));window.addEventListener("focus",()=>M.data?poll(true):refresh(true));document.addEventListener("visibilitychange",()=>{if(!document.hidden)(M.data?poll(true):refresh(true));});setInterval(()=>{if(M.connected&&!document.hidden)poll(true);},3000);boot();

@@ -23,6 +23,13 @@ const path = require('node:path');
       await renderDashboard({ force: true });
     });
     const settle = () => page.waitForFunction(() => !!S.guideAtlas.viewKey && document.querySelector('.atlas-v2')?.style.getPropertyValue('--atlas-shell-height'));
+    await settle();
+    await page.evaluate(async () => { S.guideAtlas.nodeId = 'node_greymon'; S.guideAtlas.edgeId = ''; S.guideAtlas.incomingEdgeId = ''; S.guideAtlas.outgoingEdgeId = ''; S.guideAtlas.viewKey = ''; await renderDashboard({ force: true }); });
+    await settle();
+    assert.equal(await page.locator('.atlas-cd').count(), 1, 'C+D shell was not rendered');
+    assert(await page.locator('.atlas-entity-index').count() === 1, 'Entity index is missing');
+    assert(await page.locator('.atlas-node-cd').count() <= 3, 'Default routes leaked more than three cards');
+    assert(await page.locator('.atlas-index-row').count() >= 5, 'Index did not expose entities');
     const geometry = () => page.evaluate(() => {
       const main = document.querySelector('.atlas-main').getBoundingClientRect();
       const shell = document.querySelector('.atlas-v2').getBoundingClientRect();
@@ -40,7 +47,10 @@ const path = require('node:path');
     });
     for (const [width, height] of [[1600, 900], [1280, 720]]) {
       await page.setViewportSize({ width, height });
-      await page.evaluate(async () => { S.guideAtlas.viewKey = ''; await renderDashboard({ force: true }); });
+      await page.evaluate(async () => {
+        S.guideAtlas.edgeId = ''; S.guideAtlas.incomingEdgeId = ''; S.guideAtlas.outgoingEdgeId = '';
+        S.guideAtlas.viewKey = ''; await renderDashboard({ force: true });
+      });
       await settle();
       const result = await geometry();
       assert(result.bottomFits && result.widthFits, `Workspace overflow at ${width}: ${JSON.stringify(result)}`);
@@ -56,11 +66,19 @@ const path = require('node:path');
       assert(preview.bottomFits && preview.widthFits && preview.cards.every(card => card.fits && card.width >= 145),
         `Review preview overflow at ${width}: ${JSON.stringify(preview)}`);
       assert(await page.locator('.atlas-review').evaluate(element => element.clientHeight <= 70), 'Review header consumed the map');
-      await page.evaluate(async () => {
-        DEMO[0].smart_guide.current.systems[0].status = 'approved';
-        S.guideAtlas.viewKey = ''; await renderDashboard({ force: true });
-      });
-      await settle();
+    await page.evaluate(async () => {
+      DEMO[0].smart_guide.current.systems[0].status = 'approved';
+      S.guideAtlas.viewKey = ''; await renderDashboard({ force: true });
+    });
+    await settle();
+    const selectedBeforeAlternative = await page.evaluate(() => S.guideAtlas.nodeId);
+    // The chip is below the graph viewport at the narrowest route layout;
+    // dispatch the same DOM click used by keyboard/touch activation without
+    // making the smoke test depend on Playwright's scrollability heuristics.
+    await page.locator('[data-atlas-route="edge_2"]').dispatchEvent('click');
+    await settle();
+    assert.equal(await page.evaluate(() => S.guideAtlas.nodeId), selectedBeforeAlternative, 'Changing origin moved the central card');
+    assert.equal(await page.evaluate(() => S.guideAtlas.edgeId), 'edge_2', 'Alternative route was not selected independently');
     }
     await page.setViewportSize({ width: 1600, height: 900 });
     await page.locator('#atlas-search').fill('#003');

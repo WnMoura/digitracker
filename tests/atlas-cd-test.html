@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Atlas C+D — arquivo de teste</title>
+  <link rel="stylesheet" href="../ui/fonts.css">
+  <link rel="stylesheet" href="../ui/style.css?v=11">
+  <link rel="stylesheet" href="../ui/atlas.css?v=2">
+  <style>
+    :root { color-scheme: dark; font-family: Archivo, Arial, sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { min-width: 320px; min-height: 100%; margin: 0; overflow: auto; background: #020b18; color: #e9f2ff; }
+    body { min-height: 100vh; }
+    #app { min-height: 100vh; background: radial-gradient(ellipse at 55% -15%, #12315666, transparent 55%), #020b18; }
+    .atlas-test-topbar { min-height: 56px; display: flex; align-items: center; gap: 16px; padding: 9px 22px; border-bottom: 1px solid #1d3550; background: #041226ee; }
+    .atlas-test-brand { display: flex; align-items: center; gap: 10px; min-width: 0; color: #f4f8ff; font-size: 16px; font-weight: 650; }
+    .atlas-test-brand b { color: #28b8ff; font-size: 22px; }
+    .atlas-test-brand small { color: #7f9bb8; font-size: 11px; font-weight: 400; }
+    .atlas-test-status { min-width: 0; overflow: hidden; margin-left: auto; color: #8ea8c3; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .atlas-test-topbar button, .atlas-test-dialog button { min-height: 32px; padding: 6px 11px; border: 1px solid #2f5270; border-radius: 7px; color: #cfe7fa; background: #08223a; font: 600 11px Archivo, sans-serif; cursor: pointer; }
+    .atlas-test-topbar button:hover, .atlas-test-dialog button:hover { border-color: #35d4ed; }
+    .atlas-test-topbar button.primary, .atlas-test-dialog button.primary { border-color: #1686ff; color: white; background: #0878f9; }
+    #atlas-test-main { min-height: calc(100vh - 56px); display: flex; flex-direction: column; gap: 12px; padding: 18px 24px 24px; }
+    .atlas-test-game-head { display: flex; align-items: center; gap: 12px; min-height: 42px; color: #dceafa; }
+    .atlas-test-game-head .cover { width: 38px; height: 38px; display: grid; place-items: center; border: 1px solid #2c5878; border-radius: 8px; color: #55d8ef; background: #08243d; font-size: 20px; }
+    .atlas-test-game-head strong { display: block; font-size: 16px; }
+    .atlas-test-game-head small { color: #7f9db9; font-size: 11px; }
+    #atlas-shell { width: 100%; height: calc(100vh - 150px); min-height: 520px; flex: 1 1 auto; }
+    .atlas-test-dialog-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 20px; background: #0009; }
+    .atlas-test-dialog { width: min(720px, 100%); max-height: min(760px, calc(100vh - 40px)); overflow: auto; padding: 22px; border: 1px solid #345a79; border-radius: 14px; background: #071a2f; box-shadow: 0 24px 80px #000b; }
+    .atlas-test-dialog header { display: flex; align-items: start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .atlas-test-dialog h2 { margin: 0; font-size: 20px; }
+    .atlas-test-dialog p { color: #9bb2ca; font-size: 12px; line-height: 1.5; }
+    .atlas-test-dialog .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 14px 0; }
+    .atlas-test-dialog .stats b { padding: 10px; border: 1px solid #294a66; border-radius: 8px; color: #6edbff; background: #0a233b; font-size: 12px; }
+    .atlas-test-dialog .issue { margin-top: 10px; padding: 12px; border-left: 3px solid #e7bb56; border-radius: 5px; color: #d8e6f5; background: #202719; font-size: 12px; line-height: 1.45; }
+    .atlas-test-dialog .issue b { color: #f0c66e; }
+    .atlas-test-dialog footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+    @media (max-width: 820px) {
+      .atlas-test-topbar { align-items: start; flex-wrap: wrap; gap: 8px; padding: 10px 13px; }
+      .atlas-test-status { order: 3; width: 100%; margin-left: 0; }
+      #atlas-test-main { min-height: calc(100vh - 92px); padding: 12px; }
+      #atlas-shell { height: auto; min-height: 0; }
+      .atlas-test-dialog .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header class="atlas-test-topbar">
+      <div class="atlas-test-brand"><b>◇</b><span>Atlas C+D <small>arquivo principal de teste</small></span></div>
+      <span class="atlas-test-status" id="atlas-test-status">Fixture sintético · nenhuma fonte externa é acessada</span>
+      <button id="atlas-test-review">Revisão da fonte</button>
+      <button id="atlas-test-reset">Redefinir</button>
+    </header>
+    <main id="atlas-test-main" class="atlas-main main">
+      <div class="atlas-test-game-head"><span class="cover">◇</span><div><strong>Digimon World — cenário C+D</strong><small>PSP · dados sintéticos para testar rotas, itens, alternativas e ciclos</small></div></div>
+      <section id="atlas-shell" class="atlas-shell atlas-v2 atlas-cd routes-view" aria-label="Atlas C+D"></section>
+    </main>
+  </div>
+
+  <script src="../ui/atlas-view-model.js?v=1"></script>
+  <script src="../ui/atlas-layout.js?v=1"></script>
+  <script>
+    (function () {
+      "use strict";
+
+      const art = (label, color, accent) => {
+        const safe = String(label || "").slice(0, 12);
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 220"><defs><linearGradient id="g" x1="0" x2="1"><stop stop-color="${color}"/><stop offset="1" stop-color="${accent}"/></linearGradient></defs><rect width="360" height="220" rx="18" fill="#071b31"/><circle cx="274" cy="58" r="86" fill="url(#g)" opacity=".72"/><path d="M42 181c35-67 84-97 142-71 29 13 56 37 89 73H42Z" fill="${accent}" opacity=".68"/><circle cx="129" cy="94" r="32" fill="${color}"/><path d="M116 108 137 67l21 41-21 15z" fill="#effaff" opacity=".75"/><text x="18" y="204" fill="#e6f8ff" font-family="Arial" font-size="18" font-weight="700">${safe}</text></svg>`;
+        return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+      };
+      const ref = (section, block, page = 1) => ({ section, block, page });
+      const baseNodes = [
+        ["n001", 1, "Agumon", "Rookie", "Origem principal", "#f39a39", "#b73c4a"],
+        ["n002", 2, "Gabumon", "Rookie", "Origem alternativa", "#73d5f4", "#5142a3"],
+        ["n003", 3, "Greymon", "Champion", "Entidade selecionada", "#ffb044", "#bd3c33"],
+        ["n004", 4, "MetalGreymon", "Ultimate", "Destino principal", "#9ec8ff", "#3e548e"],
+        ["n005", 5, "SkullGreymon", "Ultimate", "Transformação por item", "#8f9abb", "#372945"],
+        ["n006", 6, "Airdramon", "Champion", "Origem alternativa", "#84e2dc", "#30759b"],
+        ["n007", 7, "MegaSeadramon", "Ultimate", "Destino alternativo", "#8bd7ff", "#2c4eaf"],
+        ["n008", 8, "Piyomon", "Rookie", "Origem alternativa", "#ffd37b", "#e15c55"],
+        ["n009", 9, "Birdramon", "Champion", "Destino alternativo", "#ffca65", "#af433d"],
+        ["n010", 10, "Veemon", "Rookie", "Origem alternativa", "#71c7ff", "#3672ca"],
+        ["n011", 11, "Guilmon", "Rookie", "Origem alternativa", "#ff7f73", "#a52e42"],
+        ["n012", 12, "Renamon", "Rookie", "Origem alternativa", "#f0b5ff", "#7253b2"],
+        ["n013", 13, "Omnimon", "Mega", "Combinação simultânea", "#d8e9ff", "#526f9e"],
+      ];
+      const originalNodes = baseNodes.map(([id, card, label, stage, subtitle, color, accent], index) => ({
+        id, card_number: card, label, stage, subtitle, group: "Digimon", tags: [stage.toLowerCase()],
+        media: index === 4 || index === 9 || index === 10 || index === 11 ? null : { url: art(label, color, accent), title: `${label} — ilustração sintética` },
+        source_refs: [ref(1 + Math.floor(index / 5), index + 1, 1 + (index % 3))],
+        spoiler: label === "Omnimon",
+      }));
+      const originalEdges = [
+        { id: "e001", from: "n001", to: "n003", label: "Rota principal", path_kind: "normal", relation_semantics: "single", requirements: [{ id: "r001", text: "Alcançar o nível 15", field: "level", operator: "gte", value: 15, source_refs: [ref(2, 1)] }] },
+        { id: "e002", from: "n002", to: "n003", label: "Origem alternativa", path_kind: "alternative", relation_semantics: "alternatives", requirements: [{ id: "r002", text: "Treinar com o item Garra Azul", mode: "item", field: "item", operator: "has", value: "Garra Azul", source_refs: [ref(2, 2)] }] },
+        { id: "e003", from: "n006", to: "n003", label: "Origem alternativa", path_kind: "alternative", relation_semantics: "alternatives", requirements: [], source_refs: [ref(2, 3)] },
+        { id: "e004", from: "n008", to: "n003", label: "Origem alternativa", path_kind: "alternative", relation_semantics: "alternatives", requirements: [], source_refs: [ref(2, 4)] },
+        { id: "e005", from: "n010", to: "n003", label: "Origem alternativa", path_kind: "alternative", relation_semantics: "alternatives", requirements: [], source_refs: [ref(2, 5)] },
+        { id: "e006", from: "n011", to: "n003", label: "Origem alternativa", path_kind: "alternative", relation_semantics: "alternatives", requirements: [], source_refs: [ref(2, 6)] },
+        { id: "e007", from: "n012", to: "n003", label: "Origem alternativa", path_kind: "alternative", relation_semantics: "alternatives", requirements: [], source_refs: [ref(2, 7)] },
+        { id: "e008", from: "n003", to: "n004", label: "Evolução documentada", path_kind: "normal", relation_semantics: "single", requirements: [{ id: "r003", text: "Força 80 ou superior", field: "strength", operator: "gte", value: 80, source_refs: [ref(3, 1)] }, { id: "r004", text: "Cota da fonte: 3", field: "quota", operator: "unknown", condition: { op: "unknown" }, source_refs: [ref(3, 1)] }], source_refs: [ref(3, 1)] },
+        { id: "e009", from: "n003", to: "n005", label: "Usar item do jogo", path_kind: "optional", relation_semantics: "item", requirements: [{ id: "r005", text: "Usar Skull Tag em Greymon", mode: "item", field: "item", operator: "has", value: "Skull Tag", source_refs: [ref(3, 2)] }], source_refs: [ref(3, 2)] },
+        { id: "e010", from: "n003", to: "n007", label: "Rota alternativa", path_kind: "alternative", relation_semantics: "alternatives", requirements: [{ id: "r006", text: "Obter 2 DigiMemories", field: "quota", operator: "gte", value: 2, source_refs: [ref(3, 3)] }], source_refs: [ref(3, 3)] },
+        { id: "e011", from: "n008", to: "n009", label: "Rota paralela", path_kind: "normal", relation_semantics: "single", requirements: [], source_refs: [ref(4, 1)] },
+        { id: "e012", from: "n004", to: "n013", label: "Combinação simultânea", path_kind: "optional", relation_semantics: "fusion", requirements: [{ id: "r007", text: "Combinar MetalGreymon e WereGarurumon", group: "unknown", operator: "unknown", condition: { op: "unknown" }, source_refs: [ref(4, 2)] }], source_refs: [ref(4, 2)] },
+        { id: "e013", from: "n013", to: "n001", label: "Retorno documentado", path_kind: "optional", relation_semantics: "unknown", requirements: [], source_refs: [ref(4, 3)] },
+      ];
+      const originalSystem = {
+        id: "fixture-cd", title: "Evoluções — fixture C+D", description: "Dados sintéticos locais para validação visual e de interação.", status: "approved",
+        source_id: "fixture-source", source_refs: [ref(1, 1)], nodes: originalNodes, edges: originalEdges,
+        _draftDiagnostics: { pending_items: [{ kind: "combined_entity_card", card_numbers: [104], label: "Airdramon, Growlmon, Kabuterimon, Seadramon", message: "O card #104 reúne quatro entidades; a relação individual deve ser reutilizada.", action: "Revisar a linha p001-e0229-r0015 antes de aprovar.", source_ref: { table_id: "p001-e0229", row_id: "p001-e0229-r0015", page: 1 }, components: ["Airdramon", "Growlmon", "Kabuterimon", "Seadramon"], reusable_paths: [{ from: "Airdramon", to: "MegaSeadramon", from_card: 104, to_card: 74 }, { from: "Growlmon", to: "MegaSeadramon", from_card: 105, to_card: 74 }, { from: "Kabuterimon", to: "MegaSeadramon", from_card: 106, to_card: 74 }, { from: "Seadramon", to: "MegaSeadramon", from_card: 107, to_card: 74 }], redundant_paths: [{ from: "Airdramon, Growlmon, Kabuterimon, Seadramon", to: "MegaSeadramon" }], impact: { image: "preservar no card composto; decisão explícita", objective: "seleção explícita necessária", completed_requirements: 0 } }] },
+      };
+      const originalState = { completed_requirements: ["r001"], goals: { "fixture-cd": "n003" }, node_media: {}, preferences: {} };
+      let system = clone(originalSystem);
+      let state = clone(originalState);
+      const ui = { nodeId: "n003", incomingEdgeId: "e001", outgoingEdgeId: "e008", edgeId: "e001", mode: "routes", indexOpen: window.innerWidth >= 1160, inspectorOpen: true, indexSearch: "", search: "", group: "all", tag: "all", availability: "all", spoilers: false, zoom: 1, filling: false };
+      let fillTimer = null;
+
+      function clone(value) { return JSON.parse(JSON.stringify(value)); }
+      function esc(value) { return String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char])); }
+      function number(node) { return Number(node?.card_number || 0); }
+      function mediaFor(node) { return node?.media?.url ? node.media : null; }
+      function refsLabel(refs) { const first = (refs || [])[0]; return first ? `p. ${first.page || 1} · §${first.section || 1}.${first.block || 1}` : "Fonte local"; }
+      function statusLabel(model, edge) { const status = model.edgeStatus(edge, model.completed); return status.unknown ? "?" : status.total ? `${status.done}/${status.total}` : "→"; }
+      function syncResponsive() {
+        if (window.innerWidth < 1160 && !ui.userIndex) ui.indexOpen = false;
+        if (window.innerWidth >= 1160 && ui.autoCollapsed) { ui.indexOpen = true; ui.autoCollapsed = false; }
+        if (window.innerWidth < 1160) ui.autoCollapsed = true;
+      }
+      function render() {
+        syncResponsive();
+        const mode = window.innerWidth <= 820 ? "list" : ui.mode === "map" || ui.mode === "overview" ? "overview" : ui.mode === "list" ? "list" : "routes";
+        const model = window.AtlasViewModel.buildAtlasViewModel({ system, systemState: state, selection: { nodeId: ui.nodeId, incomingEdgeId: ui.incomingEdgeId || ui.edgeId, outgoingEdgeId: ui.outgoingEdgeId, mode }, filters: { group: ui.group, tag: ui.tag, availability: ui.availability, spoilers: ui.spoilers, search: ui.search } });
+        ui.nodeId = model.selectedId || "";
+        const displayNodes = mode === "routes" ? model.routeCards.map(card => card.node) : model.visibleNodes;
+        const displayEdges = mode === "routes" ? model.routeEdges : model.overviewEdges;
+        const layout = window.AtlasLayout.layoutAtlasRoute({ cards: model.routeCards, connections: displayEdges, nodes: displayNodes, selectedId: model.selectedId, mode });
+        const positionFor = node => layout.positions.get(node.id) || { x: 0, y: 0 };
+        const nodeHTML = displayNodes.map(node => { const media = mediaFor(node); const pos = positionFor(node); const selected = node.id === model.selectedId; const role = model.routeCards.find(card => card.node.id === node.id)?.role || "overview"; return `<button class="atlas-node atlas-node-cd ${selected ? "selected" : ""} role-${role} ${media ? "" : "missing-media"}" data-atlas-node="${esc(node.id)}" style="left:${pos.x}px;top:${pos.y}px" aria-label="Card ${number(node)}: ${esc(node.label)}"><span class="atlas-node-id">#${String(number(node)).padStart(3, "0")}</span><span class="atlas-node-art">${media ? `<img src="${media.url}" alt="" draggable="false">` : "<i aria-hidden=\"true\">◇</i>"}</span><span class="atlas-node-copy"><b>${esc(node.label)}</b><small>${esc(node.stage)}</small><em>▤ ${esc(refsLabel(node.source_refs))}</em></span>${!media ? "<span class=\"atlas-missing-media\">Sem imagem</span>" : ""}</button>`; }).join("");
+        const edgeHTML = displayEdges.map(edge => { const from = layout.positions.get(edge.from), to = layout.positions.get(edge.to); if (!from || !to) return ""; const path = layout.edgePaths.get(edge.id); const rect = layout.edgeLabelRects.get(edge.id) || { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 }; const active = mode === "routes"; return `<g class="atlas-edge-group ${active ? "route" : "muted"}"><path class="atlas-edge ${active ? "route" : "muted"}" data-atlas-edge="${esc(edge.id)}" d="${esc(path || "")}" marker-end="url(#atlas-arrow-${active ? "route" : "muted"})"><title>${esc(model.byId.get(edge.from)?.label)} → ${esc(model.byId.get(edge.to)?.label)}</title></path><text x="${rect.x}" y="${rect.y}" class="atlas-edge-label" text-anchor="middle">${statusLabel(model, edge)}</text></g>`; }).join("");
+        const alternative = item => `<button class="atlas-alt-chip" data-atlas-route="${esc(item.edge.id)}" title="Abrir rota ${esc(item.node.label)}">${mediaFor(item.node) ? `<img src="${mediaFor(item.node).url}" alt="">` : "◇"}<span>${esc(item.node.label)}</span><small>#${String(number(item.node)).padStart(3, "0")}</small></button>`;
+        const alternatives = mode === "routes" ? `<div class="atlas-alternatives" aria-label="Rotas alternativas">${model.alternativeOrigins.length ? `<section><h4>Outras origens <span>· ${model.alternativeOrigins.length}</span></h4><div>${model.alternativeOrigins.slice(0, 4).map(alternative).join("")}${model.alternativeOrigins.length > 4 ? `<button class="atlas-alt-more" data-atlas-index-open>+${model.alternativeOrigins.length - 4} outras</button>` : ""}</div></section>` : ""}${model.alternativeDestinations.length ? `<section><h4>Outros destinos <span>· ${model.alternativeDestinations.length}</span></h4><div>${model.alternativeDestinations.slice(0, 4).map(alternative).join("")}</div></section>` : ""}</div>` : "";
+        const indexQuery = ui.indexSearch.toLocaleLowerCase("pt-BR");
+        const indexNodes = model.visibleNodes.filter(node => !indexQuery || `${node.label} #${number(node)} ${number(node)}`.toLocaleLowerCase("pt-BR").includes(indexQuery));
+        const index = `<aside class="atlas-entity-index ${ui.indexOpen ? "" : "collapsed"}" aria-label="Entidades"><div class="atlas-index-heading"><b>ENTIDADES</b><button data-atlas-index-toggle aria-expanded="${ui.indexOpen}">${ui.indexOpen ? "‹" : "›"}</button></div>${ui.indexOpen ? `<label class="atlas-index-search"><span>⌕</span><input id="atlas-index-search" value="${esc(ui.indexSearch)}" placeholder="Buscar entidade ou #ID" aria-label="Buscar entidade ou ID"></label><small class="atlas-index-count">${indexNodes.length} de ${model.allNodes.length} entidades</small><div class="atlas-index-list">${indexNodes.map(node => `<button class="atlas-index-row ${node.id === model.selectedId ? "selected" : ""}" data-atlas-node="${esc(node.id)}"><span class="atlas-index-thumb">${mediaFor(node) ? `<img src="${mediaFor(node).url}" alt="">` : "◇"}</span><span><b>${esc(node.label)}</b><small>#${String(number(node)).padStart(3, "0")} · ${esc(node.stage)}</small></span></button>`).join("")}</div>` : ""}</aside>`;
+        const path = model.selectedRoute || model.selectedIncomingRoute || model.selectedOutgoingRoute;
+        const requirements = path?.requirements || [];
+        const pathOptions = model.incoming.map(edge => `<option value="${esc(edge.id)}" ${edge.id === model.selectedIncomingRoute?.id ? "selected" : ""}>${esc(model.byId.get(edge.from)?.label)} → ${esc(model.selected?.label)}${edge.label ? ` · ${esc(edge.label)}` : ""}</option>`).join("");
+        const inspector = model.selected ? `<aside class="atlas-inspector atlas-inspector-cd" aria-label="Detalhes da rota"><div class="atlas-inspector-title"><div><h3>${esc(model.selected.label)}</h3><p>${path ? "Rota selecionada" : "Entidade selecionada"}</p></div><span>#${String(number(model.selected)).padStart(3, "0")}</span></div><div class="atlas-inspector-art">${mediaFor(model.selected) ? `<img src="${mediaFor(model.selected).url}" alt="${esc(model.selected.label)}">` : "<span>◇</span>"}</div>${pathOptions ? `<label class="atlas-path-label">Origem desta rota<select id="atlas-test-path">${pathOptions}</select></label>` : ""}<div class="atlas-requirements"><h4>Requisitos desta rota <span>${path ? (model.edgeStatus(path, model.completed).unknown ? "?" : `${model.edgeStatus(path, model.completed).done}/${model.edgeStatus(path, model.completed).total}`) : ""}</span></h4>${path?.label ? `<p class="atlas-route-kind">${esc(path.label)}</p>` : ""}${requirements.length ? requirements.map(req => `<label class="${req.operator === "unknown" || req.condition?.op === "unknown" ? "unknown" : ""}"><input type="checkbox" data-atlas-requirement="${esc(req.id)}" ${req.operator === "unknown" || req.condition?.op === "unknown" ? "disabled" : ""} ${model.completed.has(req.id) ? "checked" : ""}><span>${req.mode === "item" ? "<em class=\"atlas-requirement-mode\">Item do jogo</em>" : ""}${esc(req.text)}</span></label>`).join("") : "<p>Sem requisitos documentados para esta rota.</p>"}${model.edgeStatus(path, model.completed).unknown ? "<p class=\"atlas-rule-warning\">Disponibilidade desconhecida nesta fonte.</p>" : ""}</div><button class="atlas-source" id="atlas-test-source">Consultar trecho · ${esc(refsLabel(path?.source_refs || model.selected.source_refs))} ↗</button><div class="atlas-inspector-actions"><button class="primary" id="atlas-test-goal">${state.goals[system.id] === model.selected.id ? "✓ Objetivo fixado" : "♧ Fixar objetivo"}</button><button id="atlas-test-image">▧ Trocar imagem</button></div><details class="atlas-source-info" open><summary>ⓘ Fonte e manutenção</summary><p>Fixture local; nenhum HTML externo é executado.</p><button id="atlas-test-reprocess">Reprocessar fonte salva</button></details></aside>` : "<aside class=\"atlas-inspector empty\">Nenhuma entidade corresponde.</aside>";
+        const shell = document.getElementById("atlas-shell");
+        shell.className = `atlas-shell atlas-v2 atlas-cd ${mode === "list" ? "list-view" : mode === "overview" ? "overview-view" : "routes-view"} ${ui.inspectorOpen ? "" : "inspector-closed"}`;
+        shell.style.setProperty("--atlas-shell-height", `${Math.max(520, window.innerHeight - 150)}px`);
+        shell.style.setProperty("--atlas-card-width", `${layout.cardWidth}px`);
+        shell.style.setProperty("--atlas-card-height", `${layout.cardHeight}px`);
+        shell.style.setProperty("--atlas-zoom", ui.zoom);
+        shell.style.setProperty("--atlas-x", "0px");
+        shell.style.setProperty("--atlas-y", "0px");
+        shell.innerHTML = `<div class="atlas-workspace"><header class="atlas-toolbar"><h2>Atlas</h2><select id="atlas-test-system" aria-label="Sistema"><option>Evoluções — fixture C+D</option></select><label class="atlas-search"><span>⌕</span><input id="atlas-test-search" value="${esc(ui.search)}" placeholder="Buscar entidade ou #ID" aria-label="Buscar nome ou #ID"></label><button id="atlas-test-sources" title="Fontes e revisões">▤</button><button data-atlas-inspector-toggle>${ui.inspectorOpen ? "Ocultar" : "Detalhes"}</button><button class="primary" id="atlas-test-new">Novo ＋</button></header><div class="atlas-contextbar"><span>Rotas de <b>${esc(model.selected?.label || "—")}</b></span>${model.alternativeOrigins.length || model.alternativeDestinations.length ? `<span class="atlas-alternative-summary">${model.alternativeOrigins.length} origem(ns) · ${model.alternativeDestinations.length} destino(s)</span>` : ""}<details class="atlas-filter-menu"><summary>☷ Filtros</summary><div><label>Disponibilidade<select><option>Todas</option></select></label><label class="atlas-spoilers"><input type="checkbox" id="atlas-test-spoilers" ${ui.spoilers ? "checked" : ""}> Mostrar spoilers</label></div></details></div><div class="atlas-cd-body ${ui.indexOpen ? "" : "index-collapsed"}"><div class="atlas-cd-index-wrap">${index}</div><div class="atlas-cd-graph"><div class="atlas-viewport" id="atlas-test-viewport"><div class="atlas-world" style="width:${layout.width}px;height:${layout.height}px"><svg width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="atlas-arrow-route" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#25deeb" stroke-width="1.5"/></marker><marker id="atlas-arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#63748c" stroke-width="1.5"/></marker></defs>${edgeHTML}</svg>${nodeHTML}</div>${!model.matches.length ? "<p class=\"atlas-no-results\">Nenhuma entidade corresponde aos filtros.</p>" : ""}</div>${alternatives}<footer class="atlas-map-footer"><div class="atlas-zoom"><button data-atlas-test-zoom="out">−</button><output>${Math.round(ui.zoom * 100)}%</output><button data-atlas-test-zoom="in">＋</button></div><div class="atlas-mode-tabs"><button data-atlas-mode="focus" class="${mode === "routes" ? "active" : ""}">Rotas</button><button data-atlas-mode="map" class="${mode === "overview" ? "active" : ""}">Visão geral</button><button data-atlas-mode="list" class="${mode === "list" ? "active" : ""}">Lista</button></div><button data-atlas-test-fit>⛶ Ajustar</button></footer></div></div><div class="atlas-image-status"><button id="atlas-test-fill">▧ ${ui.filling ? "Preenchendo…" : "Preencher imagens"}</button><span id="atlas-test-image-count">${system.nodes.filter(node => mediaFor(node)).length}/${system.nodes.length} com imagem</span></div></div>${ui.inspectorOpen ? inspector : ""}`;
+        bind(model, mode);
+        document.getElementById("atlas-test-status").textContent = `${mode === "routes" ? "Rotas" : mode === "overview" ? "Visão geral" : "Lista"} · ${model.allNodes.length} entidades · ${system.nodes.filter(node => mediaFor(node)).length}/${system.nodes.length} imagens`;
+      }
+      function bind(model, mode) {
+        document.querySelectorAll("[data-atlas-node]").forEach(button => button.onclick = () => { ui.nodeId = button.dataset.atlasNode; ui.incomingEdgeId = ""; ui.outgoingEdgeId = ""; ui.edgeId = ""; render(); });
+        document.querySelectorAll("[data-atlas-route]").forEach(button => button.onclick = () => { const edge = system.edges.find(item => item.id === button.dataset.atlasRoute); if (!edge) return; if (edge.to === ui.nodeId) { ui.incomingEdgeId = edge.id; ui.outgoingEdgeId = ""; ui.edgeId = edge.id; } else if (edge.from === ui.nodeId) { ui.outgoingEdgeId = edge.id; ui.incomingEdgeId = ""; ui.edgeId = ""; } else { ui.nodeId = edge.to; ui.incomingEdgeId = edge.id; ui.edgeId = edge.id; ui.outgoingEdgeId = ""; } render(); });
+        document.querySelectorAll("[data-atlas-edge]").forEach(path => path.onclick = () => { const edge = system.edges.find(item => item.id === path.dataset.atlasEdge); if (edge) { ui.nodeId = edge.to; ui.incomingEdgeId = edge.id; ui.edgeId = edge.id; ui.outgoingEdgeId = ""; render(); } });
+        document.querySelectorAll("[data-atlas-index-toggle]").forEach(button => button.onclick = () => { ui.indexOpen = !ui.indexOpen; ui.userIndex = true; render(); });
+        document.querySelectorAll("[data-atlas-index-open]").forEach(button => button.onclick = () => { ui.indexOpen = true; ui.userIndex = true; render(); });
+        document.querySelector("[data-atlas-inspector-toggle]")?.addEventListener("click", () => { ui.inspectorOpen = !ui.inspectorOpen; render(); });
+        document.getElementById("atlas-test-search")?.addEventListener("input", event => { ui.search = event.target.value; render(); document.getElementById("atlas-test-search")?.focus(); });
+        document.getElementById("atlas-index-search")?.addEventListener("input", event => { ui.indexSearch = event.target.value; render(); document.getElementById("atlas-index-search")?.focus(); });
+        document.getElementById("atlas-test-spoilers")?.addEventListener("change", event => { ui.spoilers = event.target.checked; render(); });
+        document.querySelectorAll("[data-atlas-mode]").forEach(button => button.onclick = () => { ui.mode = button.dataset.atlasMode; render(); });
+        document.querySelectorAll("[data-atlas-test-zoom]").forEach(button => button.onclick = () => { ui.zoom = Math.max(.65, Math.min(1.6, ui.zoom + (button.dataset.atlasTestZoom === "in" ? .1 : -.1))); render(); });
+        document.querySelector("[data-atlas-test-fit]")?.addEventListener("click", () => { ui.zoom = 1; render(); });
+        document.getElementById("atlas-test-path")?.addEventListener("change", event => { ui.incomingEdgeId = event.target.value; ui.edgeId = event.target.value; render(); });
+        document.querySelectorAll("[data-atlas-requirement]").forEach(input => input.onchange = () => { const id = input.dataset.atlasRequirement; const done = new Set(state.completed_requirements || []); input.checked ? done.add(id) : done.delete(id); state.completed_requirements = [...done]; render(); });
+        document.getElementById("atlas-test-fill")?.addEventListener("click", startImageFill);
+      }
+      function startImageFill() {
+        if (ui.filling) return;
+        ui.filling = true; render();
+        const missing = system.nodes.filter(node => !mediaFor(node)); let index = 0;
+        clearInterval(fillTimer);
+        fillTimer = setInterval(() => { const node = missing[index++]; if (node) node.media = { url: art(node.label, "#36bde7", "#345ba7"), title: `${node.label} — preenchida pela fixture` }; render(); if (index >= missing.length) { clearInterval(fillTimer); fillTimer = null; ui.filling = false; render(); } }, 180);
+      }
+      function openReview() {
+        const item = system._draftDiagnostics.pending_items[0];
+        const modal = document.createElement("div"); modal.className = "atlas-test-dialog-backdrop"; modal.id = "atlas-test-dialog";
+        modal.innerHTML = `<div class="atlas-test-dialog" role="dialog" aria-modal="true"><header><div><h2>Revisão da fonte estruturada</h2><p>Este arquivo é a fonte principal do smoke visual. Os dados são sintéticos e não substituem a revisão do GameFAQs.</p></div><button data-close>×</button></header><div class="stats"><b>248 tabelas</b><b>323 linhas de evolução</b><b>13 entidades</b><b>13 caminhos</b></div><div class="issue"><b>Regressão #104</b><br>${esc(item.message)}<br><br><strong>Reutilizar:</strong> ${item.reusable_paths.map(path => `${esc(path.from)} → ${esc(path.to)}`).join(" · ")}<br><strong>Remover:</strong> ${item.redundant_paths.map(path => esc(path.from)).join(" · ")}<br><strong>Referência:</strong> tabela ${esc(item.source_ref.table_id)} · linha ${esc(item.source_ref.row_id)}</div><p>Teste também: selecione outra origem, marque um requisito, alterne Visão geral/Lista, pesquise por <code>#003</code> e use Preencher imagens.</p><footer><button data-close>Fechar</button><button class="primary" data-close>Continuar teste</button></footer></div>`;
+        document.body.appendChild(modal); modal.querySelectorAll("[data-close]").forEach(button => button.onclick = () => modal.remove());
+      }
+      document.getElementById("atlas-test-review").onclick = openReview;
+      document.getElementById("atlas-test-reset").onclick = () => { clearInterval(fillTimer); system = clone(originalSystem); state = clone(originalState); Object.assign(ui, { nodeId: "n003", incomingEdgeId: "e001", outgoingEdgeId: "e008", edgeId: "e001", mode: "routes", indexOpen: window.innerWidth >= 1160, inspectorOpen: true, indexSearch: "", search: "", spoilers: false, filling: false, userIndex: false, autoCollapsed: false }); render(); };
+      window.addEventListener("resize", render);
+      window.AtlasFixture = { get state() { return ui; }, get system() { return system; }, get completed() { return [...(state.completed_requirements || [])]; }, get progress() { return { images: system.nodes.filter(node => mediaFor(node)).length, total: system.nodes.length }; }, reset: () => document.getElementById("atlas-test-reset").click() };
+      render();
+    })();
+  </script>
+</body>
+</html>

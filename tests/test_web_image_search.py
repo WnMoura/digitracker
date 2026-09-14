@@ -30,6 +30,28 @@ def test_url_publica_preserva_consulta_e_safesearch():
     assert "Jogo+PS2" in url and "safe=active" in url and "tbm=isch" in url
 
 
+def test_site_especifico_gera_link_direto_e_le_imagem_da_pagina():
+    assert web_image_search.direct_site_url("Agumon", "wikimon.net") == "https://wikimon.net/Agumon"
+    assert web_image_search.direct_site_url("Agumon", "digimon.fandom.com") == "https://digimon.fandom.com/wiki/Agumon"
+    html = '<meta property="og:image" content="/images/Agumon.png"><table class="infobox"><img src="/images/Agumon-2.png" alt="Agumon"></table>'
+    results = web_image_search.parse_direct_site_page(html, "https://wikimon.net/Agumon", "Agumon", "wikimon.net")
+    assert [item["url"] for item in results] == [
+        "https://wikimon.net/images/Agumon.png", "https://wikimon.net/images/Agumon-2.png"
+    ]
+
+
+def test_busca_site_especifico_nao_consulta_google(monkeypatch):
+    class Response:
+        status_code = 200
+        text = '<meta property="og:image" content="https://wikimon.net/images/Agumon.png">'
+
+    monkeypatch.setattr(web_image_search.requests, "get", lambda *args, **kwargs: Response())
+    result = web_image_search.direct_site_search("Agumon", ["wikimon.net"])
+    assert result["ok"] is True
+    assert result["open_url"] == "https://wikimon.net/Agumon"
+    assert result["provider"] == "site"
+
+
 def test_parseia_resultado_google_basico_com_origem():
     html = '''
     <a href="/imgres?imgurl=https%3A%2F%2Fcdn.example%2Fcover.jpg&amp;imgrefurl=https%3A%2F%2Fexample.com%2Fgame">

@@ -55,14 +55,75 @@ def _has_unlinked_named_entity(tail: str) -> bool:
     return any(word[:1].isupper() for word in words)
 
 
+def _has_explicit_alternative_delimiter(value: str) -> bool:
+    """Return true only for punctuation/prose that explicitly means OR.
+
+    Hyperlinks are editorial navigation, not semantic evidence.  A cell with
+    two links joined by ``+``/``and`` may describe a fusion and must therefore
+    remain pending.  Commas/semicolons/pipes and the words ``or``/``ou`` are
+    the conservative alternatives used by the structured GameFAQs parser.
+    Delimiters inside parentheses or quoted names are ignored.
+    """
+    text = str(value or "")
+    comma_flags = _comma_alternative_flags(text)
+    comma_index = 0
+    depth = 0
+    quote = ""
+    for char in text:
+        if char in {'"', "“", "”"}:
+            quote = "" if quote else char
+            continue
+        if quote:
+            continue
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth = max(0, depth - 1)
+        elif depth == 0 and char in ",;|":
+            if char == ",":
+                explicit = comma_flags[comma_index] if comma_index < len(comma_flags) else False
+                comma_index += 1
+                if not explicit:
+                    continue
+            return True
+    return bool(re.search(r"\b(?:or|ou)\b", text, re.I))
+
+
+def _comma_alternative_flags(value: str) -> list[bool]:
+    """Classify top-level commas without treating ``Name, the ...`` as a list."""
+    text = str(value or "")
+    flags = []
+    depth = 0
+    quote = ""
+    for index, char in enumerate(text):
+        if char in {'"', "“", "”"}:
+            quote = "" if quote else char
+            continue
+        if quote:
+            continue
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            cursor = index + 1
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+            next_char = text[cursor] if cursor < len(text) else ""
+            flags.append(next_char.isupper() or next_char.isdigit())
+    return flags
+
+
 def split_entities(value: object, *, cell: dict | None = None,
-                   known_labels: list[str] | None = None) -> tuple[list[str], str]:
+                   known_labels: list[str] | None = None,
+                   endpoint_semantics: str = "") -> tuple[list[str], str]:
     """Read alternatives without turning a fusion into independent routes.
 
     Exact editorial names win over punctuation. List delimiters are considered
     only outside parentheses/quotes. Original text stays in the source JSON.
     """
     original = str(value or "").strip()
+    semantics = str(endpoint_semantics or "").strip().casefold()
     label = clean_label(original)
     if not label or re.fullmatch(r"[-‐‑‒–—―]+", label):
         return [], "A célula não informa uma entidade."
@@ -73,11 +134,17 @@ def split_entities(value: object, *, cell: dict | None = None,
     if any(identity(item) == identity(label) for item in links):
         return [label], ""
     if links:
-        # Several explicit links are an authoritative alternative list.  This
-        # is how GameFAQs marks cells such as ``A and B`` without making a
-        # combined card.  Preserve their order and de-duplicate by identity.
+        # Links identify editorial entities, but do not by themselves tell us
+        # whether the row means alternatives or a simultaneous combination.
+        # Only a visible OR/list delimiter is sufficient to split them.  This
+        # prevents ``Knight + Dragon`` with two hyperlinks from becoming two
+        # independent routes.
         if len(links) > 1:
-            return links, ""
+            if semantics == "fusion":
+                return [], "A célula combina entidades; a fonte marcou uma combinação simultânea."
+            if semantics == "alternatives" or _has_explicit_alternative_delimiter(original):
+                return links, ""
+            return [], "A célula combina entidades; confirme se são alternativas, uma forma ou participantes simultâneos."
         # A single link may be followed by an editorial aside.  Use the link
         # as the endpoint only when the remaining text has no second proper
         # name or list delimiter.  The original cell remains in the source
@@ -88,6 +155,8 @@ def split_entities(value: object, *, cell: dict | None = None,
             return [linked], ""
     chunks, current, depth, quote = [], [], 0, ""
     tokens = re.split(r"(\bor\b|\bou\b|\band\b|\be\b|[,;\n+&/()\[\]\"“”])", original, flags=re.I)
+    comma_flags = _comma_alternative_flags(original)
+    comma_index = 0
     ambiguous = False
     for token in tokens:
         if token in {'"', '“', '”'}:
@@ -100,6 +169,12 @@ def split_entities(value: object, *, cell: dict | None = None,
             depth = max(0, depth - 1)
             current.append(token)
         elif not quote and not depth and token.casefold() in {",", ";", "\n", "or", "ou"}:
+            if token == ",":
+                explicit = comma_flags[comma_index] if comma_index < len(comma_flags) else False
+                comma_index += 1
+                if not explicit:
+                    current.append(token)
+                    continue
             chunks.append("".join(current))
             current = []
         else:
@@ -107,7 +182,7 @@ def split_entities(value: object, *, cell: dict | None = None,
                 ambiguous = True
             current.append(token)
     chunks.append("".join(current))
-    if ambiguous:
+    if ambiguous and semantics != "alternatives":
         return [], "A célula combina entidades; confirme se são alternativas, uma forma ou participantes simultâneos."
     labels = []
     for chunk in chunks:

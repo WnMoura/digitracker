@@ -13,7 +13,7 @@ import re
 import threading
 import time
 import unicodedata
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -31,6 +31,79 @@ _CACHE_LOCK = threading.Lock()
 
 class WebImageSearchError(RuntimeError):
     pass
+
+
+def direct_site_url(label: str, host: str) -> str:
+    """Build the entity page URL for a selected wiki/site, without a search engine."""
+    host = str(host or "").lower().removeprefix("www.").strip()
+    slug = re.sub(r"\s+", "_", str(label or "").strip()).strip("_")
+    encoded = quote(slug, safe="._-()")
+    if host.endswith(".fandom.com"):
+        return f"https://{host}/wiki/{encoded}"
+    return f"https://{host}/{encoded}"
+
+
+def parse_direct_site_page(document: str, page_url: str, label: str, host: str) -> list[dict]:
+    """Extract the page's representative artwork and infobox images."""
+    soup = BeautifulSoup(document or "", "html.parser")
+    candidates = []
+    seen = set()
+
+    def add(raw_url: str, title: str = "") -> None:
+        url = _http_url(urljoin(page_url, raw_url or ""))
+        if not url or url in seen:
+            return
+        parsed = urlparse(url)
+        if parsed.hostname and not (parsed.hostname == host or parsed.hostname.endswith("." + host)):
+            # A selected site may serve its artwork from a CDN, but the page
+            # itself remains the evidence used by atlas_images' site filter.
+            pass
+        seen.add(url)
+        candidates.append({
+            "url": url, "thumb": url, "width": 0, "height": 0,
+            "source": page_url, "landing_url": page_url,
+            "title": " ".join(filter(None, [str(label or "").strip(), title.strip()])),
+            "provider": f"site:{host}",
+        })
+
+    for meta in soup.select('meta[property="og:image"], meta[name="twitter:image"]'):
+        add(meta.get("content") or "", meta.get("property") or meta.get("name") or "")
+    for image in soup.select("table.infobox img, .infobox img, .portable-infobox img, main img, article img"):
+        raw = image.get("data-src") or image.get("data-original") or image.get("src") or ""
+        title = image.get("alt") or image.get("title") or ""
+        add(raw, title)
+        if len(candidates) >= 12:
+            break
+    return candidates
+
+
+def direct_site_search(label: str, sites: list[str] | tuple[str, ...] | str,
+                       timeout: int = 20) -> dict:
+    """Read selected entity pages directly; never falls back to Google."""
+    if isinstance(sites, str):
+        hosts = [part.strip().lower().removeprefix("www.")
+                 for part in re.split(r"[,;\n]+", sites) if part.strip()]
+    else:
+        hosts = [str(part or "").strip().lower().removeprefix("www.") for part in sites or []]
+    hosts = list(dict.fromkeys(hosts))[:8]
+    page_urls = [direct_site_url(label, host) for host in hosts if host]
+    results = []
+    errors = []
+    for host, page_url in zip(hosts, page_urls):
+        try:
+            response = requests.get(page_url, timeout=timeout, headers={"User-Agent": UA, "Accept-Language": "pt-BR,pt;q=.9,en;q=.7"})
+            if response.status_code != 200:
+                errors.append(f"{host}: HTTP {response.status_code}")
+                continue
+            results.extend(parse_direct_site_page(response.text, page_url, label, host))
+        except requests.RequestException as exc:
+            errors.append(f"{host}: {exc}")
+    return {
+        "ok": bool(results), "direct": True, "provider": "site",
+        "results": _dedupe(results), "site_urls": page_urls,
+        "open_url": page_urls[0] if page_urls else "",
+        "error": "; ".join(errors) if errors and not results else "",
+    }
 
 
 def google_public_search_url(query: str, safe: str = "moderate") -> str:

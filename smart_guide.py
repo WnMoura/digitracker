@@ -83,6 +83,30 @@ def _json_hash(value: object) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def requirement_target(system_id: str, edge_id: str, requirement_id: str) -> str:
+    """Return the stable storage key for one route requirement.
+
+    Requirement ids are not globally unique: a guide can reuse the same
+    condition id on several paths.  Keeping the system and edge in the key
+    prevents marking Airdramon from also marking Growlmon when both rows use
+    the same source id.  The public legacy ``completed_requirements`` list is
+    retained for old clients, but new readers use this scoped key.
+    """
+    return f"requirement:{_clean_text(system_id, 100)}:{_clean_text(edge_id, 100)}:{_clean_text(requirement_id, 100)}"
+
+
+def requirement_completed(state: dict, system_id: str, edge_id: str,
+                          requirement_id: str) -> bool:
+    """Read one requirement without distributing legacy marks between paths."""
+    scoped = set(state.get("completed_requirement_targets") or [])
+    if state.get("requirements_scoped") or scoped:
+        return requirement_target(system_id, edge_id, requirement_id) in scoped
+    # Documents created before protocol v2 only have bare ids.  This fallback
+    # is deliberately limited to those documents; once a scoped write occurs
+    # we no longer guess which route a legacy id belonged to.
+    return _clean_text(requirement_id, 100) in set(state.get("completed_requirements") or [])
+
+
 def _replace_atomic(temp: Path, path: Path) -> None:
     """Substitui um arquivo com tolerância a bloqueios transitórios do Windows.
 
@@ -274,6 +298,8 @@ def _validate_systems(document: dict) -> list[dict]:
         if len(raw_edges) > MAX_SYSTEM_EDGES:
             raise SmartGuideError(f"{title} excede o limite de {MAX_SYSTEM_EDGES} relações.")
         nodes, raw_to_stable, seen_raw = [], {}, set()
+        used_card_numbers = set()
+        next_card_number = 1
         for ni, raw_node in enumerate(raw_nodes):
             if not isinstance(raw_node, dict):
                 continue
@@ -302,12 +328,22 @@ def _validate_systems(document: dict) -> list[dict]:
                 }
             else:
                 attributes = raw_attributes if isinstance(raw_attributes, dict) else {}
+            try:
+                requested_card_number = int(raw_node.get("card_number") or 0)
+            except (TypeError, ValueError):
+                requested_card_number = 0
+            if requested_card_number <= 0 or requested_card_number in used_card_numbers:
+                while next_card_number in used_card_numbers:
+                    next_card_number += 1
+                requested_card_number = next_card_number
+            used_card_numbers.add(requested_card_number)
+            next_card_number = max(next_card_number, requested_card_number + 1)
             nodes.append({
                 "id": node_id, "label": label,
                 # Derived from the normalized order so every Atlas card has a
                 # compact numeric reference for review diagnostics. The
                 # stable string id remains the identity across revisions.
-                "card_number": len(nodes) + 1,
+                "card_number": requested_card_number,
                 "entity_id": _clean_text(raw_node.get("entity_id"), 160) or node_id,
                 "entity_type": (_clean_text(raw_node.get("entity_type"), 40).lower()
                                  if _clean_text(raw_node.get("entity_type"), 40).lower() in atlas_model.ENTITY_TYPES
@@ -348,6 +384,9 @@ def _validate_systems(document: dict) -> list[dict]:
             edge_path_kind = _clean_text(raw_edge.get("path_kind"), 40)
             if edge_path_kind not in {"normal", "alternative", "optional"}:
                 edge_path_kind = "normal"
+            relation_semantics = _clean_text(raw_edge.get("relation_semantics"), 40).lower()
+            if relation_semantics not in {"single", "alternatives", "fusion", "item", "unknown"}:
+                relation_semantics = "single"
             requirement_texts = []
             for item in raw_edge.get("requirements") or []:
                 value = ((item.get("text") or item.get("label"))
@@ -409,6 +448,7 @@ def _validate_systems(document: dict) -> list[dict]:
                 "id": edge_id, "from": from_id, "to": to_id,
                 "label": edge_label,
                 "path_kind": edge_path_kind,
+                "relation_semantics": relation_semantics,
                 "rule_id": _clean_text(raw_edge.get("rule_id"), 160) or edge_id,
                 "kind": (_clean_text(raw_edge.get("kind"), 40).lower()
                           if _clean_text(raw_edge.get("kind"), 40).lower() in atlas_model.RULE_KINDS
@@ -654,15 +694,35 @@ def reconcile_system_ids(candidate: dict, previous: dict) -> dict:
     old_nodes = {atlas_entities.identity(node.get("label")): node for node in previous.get("nodes") or []}
     used, node_ids = set(), {}
     reserved = {node["id"] for node in previous.get("nodes") or []}
+    used_card_numbers = set()
+    for old_node in previous.get("nodes") or []:
+        try:
+            value = int(old_node.get("card_number") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            used_card_numbers.add(value)
+    next_card_number = max(used_card_numbers or {0}) + 1
     for node in result.get("nodes") or []:
         raw_id, key = node.get("id", ""), atlas_entities.identity(node.get("label"))
         old = old_nodes.get(key)
         if old and old["id"] not in used:
             node["id"] = old["id"]
+            try:
+                old_number = int(old.get("card_number") or 0)
+            except (TypeError, ValueError):
+                old_number = 0
+            if old_number > 0:
+                node["card_number"] = old_number
         else:
             node["id"] = _stable_id("node", previous["id"], key, "reprocess")
             while node["id"] in used or node["id"] in reserved:
                 node["id"] = _stable_id("node", node["id"], len(used))
+            while next_card_number in used_card_numbers:
+                next_card_number += 1
+            node["card_number"] = next_card_number
+            used_card_numbers.add(next_card_number)
+            next_card_number += 1
         used.add(node["id"])
         node_ids[raw_id] = node["id"]
 
@@ -670,7 +730,8 @@ def reconcile_system_ids(candidate: dict, previous: dict) -> dict:
         return atlas_model.requirement_identity(req)
 
     def edge_signature(edge):
-        return (edge.get("from"), edge.get("to"), tuple(sorted(req_signature(req) for req in edge.get("requirements") or [])))
+        return (edge.get("from"), edge.get("to"), edge.get("relation_semantics") or "single",
+                tuple(sorted(req_signature(req) for req in edge.get("requirements") or [])))
 
     old_edges = {edge_signature(edge): edge for edge in previous.get("edges") or []}
     for edge in result.get("edges") or []:
@@ -691,7 +752,8 @@ def reconcile_system_ids(candidate: dict, previous: dict) -> dict:
     return result
 
 
-def _structured_composite_card_issues(system: dict, source: dict) -> list[dict]:
+def _structured_composite_card_issues(system: dict, source: dict,
+                                      previous_state: dict | None = None) -> list[dict]:
     """Aponta cards compostos que uma reimportação estruturada não pode publicar.
 
     O materializador atual separa alternativas diretamente nas células da
@@ -704,13 +766,64 @@ def _structured_composite_card_issues(system: dict, source: dict) -> list[dict]:
     }:
         return []
     issues = []
+    all_nodes = [node for node in system.get("nodes") or [] if isinstance(node, dict)]
     for node in system.get("nodes") or []:
         if not isinstance(node, dict):
             continue
         label = str(node.get("label") or "").strip()
-        if not re.search(r"\s*,\s*|\s+[+&/]\s+", label):
+        # A comma inside a legitimate editorial name (``Knight, the Brave``)
+        # is not a combined card.  A second capitalised token or an explicit
+        # fusion delimiter is the conservative diagnostic signal.
+        if not (re.search(r",\s*(?=[A-ZÀ-Þ0-9])", label)
+                or re.search(r"\s+[+&/]\s+", label)):
             continue
         refs = list(node.get("source_refs") or [])
+        source_ref = dict(refs[0]) if refs else {
+            "source_id": source.get("id", ""), "section": 0, "block": 0, "page": 0,
+        }
+        other_labels = [str(item.get("label") or "") for item in all_nodes if item is not node]
+        components, split_reason = atlas_entities.split_entities(label, known_labels=other_labels)
+        component_keys = {atlas_entities.identity(value) for value in components}
+        component_nodes = [item for item in all_nodes
+                           if item is not node
+                           and atlas_entities.identity(item.get("label")) in component_keys]
+        component_ids = {item.get("id") for item in component_nodes}
+        target_ids = {edge.get("to") for edge in system.get("edges") or []
+                      if isinstance(edge, dict) and edge.get("from") == node.get("id")}
+        reusable_paths = []
+        redundant_paths = []
+        for edge in system.get("edges") or []:
+            if not isinstance(edge, dict):
+                continue
+            if edge.get("from") == node.get("id") and edge.get("to") in target_ids:
+                target = next((item for item in all_nodes if item.get("id") == edge.get("to")), {})
+                redundant_paths.append({"edge_id": edge.get("id", ""),
+                                        "from": label, "to": target.get("label", "")})
+            elif edge.get("from") in component_ids and edge.get("to") in target_ids:
+                origin = next((item for item in component_nodes if item.get("id") == edge.get("from")), {})
+                target = next((item for item in all_nodes if item.get("id") == edge.get("to")), {})
+                reusable_paths.append({"edge_id": edge.get("id", ""),
+                                       "from": origin.get("label", ""),
+                                       "to": target.get("label", ""),
+                                       "from_card": int(origin.get("card_number") or 0),
+                                       "to_card": int(target.get("card_number") or 0)})
+        state = previous_state or {}
+        system_id = system.get("id", "")
+        node_key = f"{system_id}:{node.get('id', '')}" if state else ""
+        node_media = state.get("node_media") or {}
+        objective = (state.get("goals") or {}).get(system_id)
+        component_impact = {
+            "image": "preservar manualmente" if node_key and node_key in node_media else "nenhuma imagem associada",
+            "objective": "seleção explícita necessária" if objective == node.get("id") else "não fixado neste card",
+            "completed_requirements": sum(
+                1 for edge in system.get("edges") or []
+                if isinstance(edge, dict) and edge.get("from") == node.get("id")
+                for requirement in edge.get("requirements") or []
+                if isinstance(requirement, dict) and requirement_completed(
+                    state, system_id, edge.get("id", ""), requirement.get("id", "")
+                )
+            ),
+        }
         issues.append({
             "id": f"atlas-issue-composite-{len(issues) + 1:04d}",
             "severity": "blocking", "kind": "combined_entity_card",
@@ -718,9 +831,15 @@ def _structured_composite_card_issues(system: dict, source: dict) -> list[dict]:
             "row_id": "", "row_number": 0, "row_preview": label,
             "message": f"O card #{int(node.get('card_number') or 0):03d} reúne mais de uma entidade: {label}.",
             "action": "Reprocesse a fonte estruturada; cada entidade precisa de um card próprio e nenhuma relação deve ser inventada.",
-            "source_ref": dict(refs[0]) if refs else {"source_id": source.get("id", ""), "section": 0, "block": 0, "page": 0},
+            "source_ref": source_ref,
+            "source_refs": refs[:20],
             "card_numbers": [int(node.get("card_number") or 0)] if int(node.get("card_number") or 0) > 0 else [],
             "label": label,
+            "components": components,
+            "split_reason": split_reason,
+            "reusable_paths": reusable_paths,
+            "redundant_paths": redundant_paths,
+            "impact": component_impact,
         })
     return issues
 
@@ -728,7 +847,12 @@ def _structured_composite_card_issues(system: dict, source: dict) -> list[dict]:
 def default_system_state() -> dict:
     return {
         "schema_version": SCHEMA_VERSION, "active_system": "", "goals": {},
-        "completed_requirements": [], "node_media": {}, "preferences": {},
+        # ``completed_requirements`` remains as a compatibility projection
+        # for pre-v2 clients.  New writes also persist the route-scoped keys
+        # below and set ``requirements_scoped`` so readers never distribute a
+        # legacy id across multiple paths.
+        "completed_requirements": [], "completed_requirement_targets": [],
+        "requirements_scoped": False, "node_media": {}, "preferences": {},
         "value_versions": {}, "receipts": {},
         "updated_at": 0,
     }
@@ -1082,6 +1206,91 @@ class SmartGuideStore:
             value.pop("markdown", None)
         return value
 
+    def read_system_source_raw(self, slug: str, source_id: str,
+                               limit: int = 50 * 1024 * 1024) -> bytes | None:
+        """Lê a captura binária preservada de uma fonte exclusiva.
+
+        A captura é sempre resolvida dentro da pasta do jogo.  Reprocessar um
+        sistema antigo nunca tenta buscar novamente a URL nem depende de um
+        arquivo temporário do importador; quando o binário não existe, o
+        chamador recebe ``None`` e pode pedir uma nova importação ao usuário.
+        """
+        source = self.system_source(slug, source_id)
+        raw_name = str(source.get("raw_file") or "").strip()
+        if not raw_name:
+            return None
+        path = self._path(slug, raw_name)
+        try:
+            if not path.is_file() or path.stat().st_size > limit:
+                return None
+            return path.read_bytes()
+        except OSError as exc:
+            raise SmartGuideError(f"Não foi possível ler a captura preservada: {exc}") from exc
+
+    @_serialized
+    def update_system_source_content(self, slug: str, source_id: str, *,
+                                     sections: list | None = None,
+                                     structured: dict | None = None,
+                                     text: str | None = None,
+                                     markdown: str | None = None,
+                                     source_format: str | None = None,
+                                     metadata: dict | None = None,
+                                     **changes) -> dict:
+        """Atualiza a projeção editorial sem substituir a captura original.
+
+        Reprocessamentos de PDF podem acrescentar tabelas e referências ao
+        mesmo ``source_id``. O hash e ``raw_file`` continuam representando a
+        captura original, de modo que checkpoints antigos ficam incompatíveis
+        pela versão do extrator, mas o arquivo bruto continua reprocessável.
+        """
+        source_id = _clean_text(source_id, 100)
+        path = self._path(slug, f"system_sources/{source_id}.json")
+        value = _read_json(path, {})
+        if not value:
+            raise SmartGuideError("Fonte exclusiva do Atlas não encontrada.")
+        if sections is not None:
+            clean_sections = deepcopy(sections or [])
+            if not clean_sections:
+                raise SmartGuideError("A fonte do Atlas não contém conteúdo utilizável.")
+            value["sections"] = clean_sections
+            value["section_count"] = len(clean_sections)
+            value["character_count"] = sum(
+                len(str(block.get("text") or ""))
+                for section in clean_sections
+                for block in (section.get("blocks") or [])
+                if isinstance(block, dict)
+            )
+        if structured is not None:
+            value["structured"] = deepcopy(structured)
+        if text is not None:
+            value["text"] = str(text or "")[:5_000_000]
+        if markdown is not None:
+            value["markdown"] = str(markdown or "")[:10_000_000]
+        if source_format is not None:
+            clean_format = _clean_text(source_format, 100)
+            if clean_format:
+                value["source_format"] = clean_format
+            else:
+                value.pop("source_format", None)
+        if metadata is not None:
+            merged = deepcopy(value.get("metadata") or {})
+            if isinstance(metadata, dict):
+                merged.update(deepcopy(metadata))
+            value["metadata"] = merged
+        # Status/replace_system_id/selection are deliberately delegated to the
+        # existing narrow updater, so content replacement cannot accidentally
+        # publish or cancel a running analysis.
+        allowed = {key: changes[key] for key in (
+            "status", "stage", "message", "error", "error_kind", "error_code",
+            "error_details", "system_id", "replace_system_id", "job_id", "provider",
+            "model", "selection", "source_review", "analysis_done", "analysis_total",
+            "checkpoint_count", "edition_warning",
+        ) if key in changes}
+        _atomic_json(path, value)
+        if allowed:
+            return self.update_system_source(slug, source_id, **allowed)
+        return self.system_source(slug, source_id)
+
     @_serialized
     def update_system_source(self, slug: str, source_id: str, **changes) -> dict:
         source_id = _clean_text(source_id, 100)
@@ -1168,16 +1377,47 @@ class SmartGuideStore:
             raise SmartGuideError("A fonte precisa documentar ao menos dois nós e uma relação.")
         validate_system_references({"systems": normalized}, source.get("sections") or [])
         diagnostics_value = deepcopy(diagnostics or {})
-        composite_issues = _structured_composite_card_issues(normalized[0], source)
-        if composite_issues:
+        previous_state = self.system_state(slug) if previous else {}
+        if previous:
+            previous_state = deepcopy(previous_state)
+            previous_state["system_id"] = previous.get("id", "")
+        composite_issues = _structured_composite_card_issues(normalized[0], source, previous_state)
+        objective_issues = []
+        if previous:
+            candidate_ids = {node.get("id") for node in normalized[0].get("nodes") or []}
+            previous_goal = (previous_state.get("goals") or {}).get(previous.get("id", ""))
+            if previous_goal and previous_goal not in candidate_ids:
+                old_goal_node = next((node for node in previous.get("nodes") or []
+                                      if node.get("id") == previous_goal), {})
+                old_number = int(old_goal_node.get("card_number") or 0)
+                objective_issues.append({
+                    "id": "atlas-issue-objective-replacement",
+                    "severity": "blocking", "kind": "objective_replacement",
+                    "table_id": "", "table_title": "Objetivo do sistema publicado",
+                    "page": 0, "row_id": "", "row_number": 0,
+                    "row_preview": old_goal_node.get("label", previous_goal),
+                    "message": (f"O objetivo do card #{old_number:03d} não existe na nova revisão."),
+                    "action": "Selecione explicitamente um card substituto em Revisar e editar; o objetivo não será redistribuído automaticamente.",
+                    "source_ref": dict((old_goal_node.get("source_refs") or [{}])[0]),
+                    "card_numbers": [old_number] if old_number > 0 else [],
+                    "label": old_goal_node.get("label", previous_goal),
+                    "replacement_node_ids": sorted(candidate_ids),
+                })
+        all_review_issues = composite_issues + objective_issues
+        if all_review_issues:
             existing_items = list(diagnostics_value.get("pending_items") or [])
             existing_ids = {str(item.get("id") or "") for item in existing_items if isinstance(item, dict)}
-            existing_items.extend(item for item in composite_issues
+            existing_items.extend(item for item in all_review_issues
                                   if item.get("id") not in existing_ids)
             diagnostics_value["pending_items"] = existing_items
             diagnostics_value["pending_composite_cards"] = [
                 {"card_number": item["card_numbers"][0], "label": item["label"]}
                 for item in composite_issues if item.get("card_numbers")
+            ]
+            diagnostics_value["pending_objective_replacements"] = [
+                {"id": item["id"], "label": item["label"],
+                 "replacement_node_ids": item["replacement_node_ids"]}
+                for item in objective_issues
             ]
         blocking_items = [item for item in diagnostics_value.get("pending_items") or []
                           if isinstance(item, dict) and item.get("severity", "blocking") == "blocking"]
@@ -1198,21 +1438,58 @@ class SmartGuideStore:
         draft = self.atlas_draft(slug, source_id)
         if source.get("status") != "suggested" or not draft:
             raise SmartGuideError("Não há prévia pronta para aprovação.")
+        candidate_value = deepcopy(candidate or draft["system"])
+        requested_replacement = _clean_text(candidate_value.get("_goal_replacement", ""), 100)
         if draft.get("approval_blocked"):
-            raise SmartGuideError(
-                "Há tabelas ou linhas pendentes de interpretação. Resolva as pendências "
-                "ou exclua explicitamente essas tabelas na revisão da fonte antes de publicar."
-            )
-        system = deepcopy(candidate or draft["system"])
+            candidate_node_ids = {node.get("id") for node in candidate_value.get("nodes") or []}
+            pending = [item for item in (draft.get("diagnostics") or {}).get("pending_items") or []
+                       if isinstance(item, dict) and item.get("severity", "blocking") == "blocking"]
+            legacy_blocked = bool((draft.get("diagnostics") or {}).get("pending_table_ids")
+                                  or (draft.get("diagnostics") or {}).get("unmapped_table_ids"))
+            unresolved = [item for item in pending
+                          if not (item.get("kind") == "objective_replacement"
+                                  and requested_replacement in candidate_node_ids)]
+            if not unresolved and not legacy_blocked and pending:
+                # The explicit replacement supplied by the editor resolves the
+                # objective-only review block; all other pending items still
+                # require the normal source-review decision.
+                pass
+            else:
+                if any(item.get("kind") == "objective_replacement" for item in unresolved):
+                    raise SmartGuideError(
+                        "O objetivo publicado aponta para um card removido. "
+                        "Selecione explicitamente um card substituto antes de aprovar."
+                    )
+                raise SmartGuideError(
+                    "Há tabelas, linhas ou cartões pendentes de interpretação. "
+                    "Resolva as pendências ou exclua-as explicitamente na revisão da fonte antes de publicar."
+                )
+        system = candidate_value
+        system.pop("_goal_replacement", None)
         system.update(source_id=source_id, status="approved")
         if source.get("replace_system_id"):
             system["id"] = source["replace_system_id"]
         validate_system_references({"systems": [system]}, source.get("sections") or [])
+        replacement_state = None
+        if source.get("replace_system_id"):
+            current_state = self.system_state(slug)
+            old_goal = (current_state.get("goals") or {}).get(source.get("replace_system_id"))
+            new_node_ids = {node.get("id") for node in system.get("nodes") or []}
+            if old_goal and old_goal not in new_node_ids:
+                if requested_replacement not in new_node_ids:
+                    raise SmartGuideError(
+                        "O objetivo publicado aponta para um card removido. "
+                        "Selecione explicitamente um card substituto antes de aprovar."
+                    )
+                replacement_state = current_state
+                replacement_state["goals"][source.get("replace_system_id")] = requested_replacement
         result = self.save_system(slug, system)
         nodes = {node['id'] for node in result['system'].get('nodes') or []}
         for node_id, media_id in (draft.get('node_media') or {}).items():
             if node_id in nodes:
                 self.set_system_media(slug, result['system']['id'], node_id, media_id)
+        if replacement_state is not None:
+            self._save_system_state(slug, replacement_state)
         self.update_system_source(slug, source_id, status="published", system_id=result["system"]["id"])
         self.link_system_source(slug, source_id, result["system"]["id"])
         return result
@@ -1292,6 +1569,11 @@ class SmartGuideStore:
             _clean_text(item, 100) for item in (base.get("completed_requirements") or [])
             if _clean_text(item, 100)
         })
+        base["completed_requirement_targets"] = sorted({
+            _clean_text(item, 260) for item in (base.get("completed_requirement_targets") or [])
+            if _clean_text(item, 260).startswith("requirement:")
+        })
+        base["requirements_scoped"] = bool(base.get("requirements_scoped") or base["completed_requirement_targets"])
         base["node_media"] = {
             _clean_text(key, 100): _clean_text(media_id, 100)
             for key, media_id in dict(base.get("node_media") or {}).items()
@@ -1435,6 +1717,10 @@ class SmartGuideStore:
             item for item in state.get("completed_requirements") or []
             if item not in removed_requirements
         ]
+        state["completed_requirement_targets"] = [
+            item for item in state.get("completed_requirement_targets") or []
+            if not item.startswith(f"requirement:{system_id}:")
+        ]
         state["node_media"] = {
             key: value for key, value in (state.get("node_media") or {}).items()
             if not key.startswith(f"{system_id}:")
@@ -1507,18 +1793,75 @@ class SmartGuideStore:
             raise SmartGuideError("Requisito visual não encontrado.")
         state = self.system_state(slug)
         items = set(state.get("completed_requirements") or [])
+        scoped = set(state.get("completed_requirement_targets") or [])
+        target = requirement_target(system_id, edge_id, requirement_id)
         if completed:
             items.add(requirement_id)
+            scoped.add(target)
         else:
-            items.discard(requirement_id)
+            scoped.discard(target)
+            # Keep the compatibility projection only while another scoped
+            # route still carries the same legacy id.
+            if not any(item.rsplit(":", 1)[-1] == requirement_id for item in scoped):
+                items.discard(requirement_id)
         state["completed_requirements"] = sorted(items)
+        state["completed_requirement_targets"] = sorted(scoped)
+        state["requirements_scoped"] = True
         # Desktop writes use this legacy wrapper too.  Incrementing the same
         # target version used by companion v2 keeps PC→phone changes visible
         # as conflicts instead of allowing a stale mobile checkbox to win.
-        target = f"requirement:{system_id}:{edge_id}:{requirement_id}"
         versions = state.setdefault("value_versions", {})
         versions[target] = max(0, _safe_int(versions.get(target))) + 1
         return self._save_system_state(slug, state)
+
+    @_serialized
+    def set_system_goal_versioned(self, slug: str, system_id: str, node_id: str, *,
+                                  request_id: str, expected_definition_revision: str = "",
+                                  expected_value_version: int | None = None) -> dict:
+        request_id = _clean_text(request_id, 120)
+        if not request_id:
+            raise SmartGuideError("request_id é obrigatório no protocolo v2.")
+        current = self.current(slug)
+        definition_revision = _clean_text(current.get("revision_id"), 160)
+        if expected_definition_revision and expected_definition_revision != definition_revision:
+            raise SmartGuideConflict("A definição do Atlas mudou. Atualize o celular.", target=system_id)
+        system = next((item for item in current.get("systems") or [] if item.get("id") == system_id), None)
+        if not system:
+            raise SmartGuideError("Sistema visual não encontrado.")
+        node_id = _clean_text(node_id, 100)
+        if node_id and node_id not in {item.get("id") for item in system.get("nodes") or []}:
+            raise SmartGuideError("Nó do sistema não encontrado.")
+        state = self.system_state(slug)
+        target = f"goal:{system_id}"
+        fingerprint = _json_hash({"target": target, "value": node_id})
+        receipts = state.setdefault("receipts", {})
+        previous = receipts.get(request_id)
+        if previous:
+            if previous.get("fingerprint") != fingerprint:
+                raise SmartGuideConflict("request_id já foi usado com outro comando.", target=target)
+            return {"state": state, "target": target, "value": previous.get("value", ""),
+                    "value_version": previous.get("value_version", 0), "request_id": request_id,
+                    "definition_revision": definition_revision, "idempotent": True}
+        versions = state.setdefault("value_versions", {})
+        value_version = int(versions.get(target) or 0)
+        if expected_value_version is not None and int(expected_value_version) != value_version:
+            raise SmartGuideConflict("Este objetivo mudou no PC ou em outro celular.", target=target,
+                                     value=(state.get("goals") or {}).get(system_id, ""),
+                                     value_version=value_version)
+        state["active_system"] = system_id if node_id else ""
+        if node_id:
+            state.setdefault("goals", {})[system_id] = node_id
+        else:
+            state.setdefault("goals", {}).pop(system_id, None)
+        value_version += 1
+        versions[target] = value_version
+        receipts[request_id] = {"fingerprint": fingerprint, "target": target,
+                                "value": node_id, "value_version": value_version}
+        state["receipts"] = dict(list(receipts.items())[-256:])
+        state = self._save_system_state(slug, state)
+        return {"state": state, "target": target, "value": node_id,
+                "value_version": value_version, "request_id": request_id,
+                "definition_revision": definition_revision, "idempotent": False}
 
     @_serialized
     def update_requirement_versioned(self, slug: str, system_id: str, edge_id: str,
@@ -1540,7 +1883,7 @@ class SmartGuideStore:
         requirement = next((item for item in (edge or {}).get("requirements") or [] if item.get("id") == requirement_id), None)
         if not requirement:
             raise SmartGuideError("Requisito visual não encontrado.")
-        state = self.system_state(slug); target = f"requirement:{system_id}:{edge_id}:{requirement_id}"
+        state = self.system_state(slug); target = requirement_target(system_id, edge_id, requirement_id)
         previous = (state.get("receipts") or {}).get(request_id)
         payload_fingerprint = _json_hash({"target": target, "value": completed})
         if previous:
@@ -1552,13 +1895,21 @@ class SmartGuideStore:
         versions = state.setdefault("value_versions", {})
         value_version = int(versions.get(target) or 0)
         if expected_value_version is not None and int(expected_value_version) != value_version:
-            actual = requirement_id in set(state.get("completed_requirements") or [])
+            actual = requirement_completed(state, system_id, edge_id, requirement_id)
             raise SmartGuideConflict("Esta marcação mudou no PC ou em outro celular.", target=target,
                                      value=actual, value_version=value_version)
         items = set(state.get("completed_requirements") or [])
+        scoped = set(state.get("completed_requirement_targets") or [])
         if completed: items.add(requirement_id)
-        else: items.discard(requirement_id)
+        if completed:
+            scoped.add(target)
+        else:
+            scoped.discard(target)
+            if not any(item.rsplit(":", 1)[-1] == requirement_id for item in scoped):
+                items.discard(requirement_id)
         state["completed_requirements"] = sorted(items)
+        state["completed_requirement_targets"] = sorted(scoped)
+        state["requirements_scoped"] = True
         value_version += 1; versions[target] = value_version
         receipts = state.setdefault("receipts", {})
         receipts[request_id] = {"fingerprint": payload_fingerprint, "target": target,
@@ -1575,38 +1926,55 @@ class SmartGuideStore:
                                   value: bool, *, request_id: str,
                                   expected_definition_revision: str = "",
                                   expected_value_version: int | None = None) -> dict:
-        if action not in {"complete", "reveal", "checkpoint"} or not isinstance(value, bool):
+        if action not in {"complete", "favorite", "reveal", "checkpoint"}:
             raise SmartGuideError("Comando de progresso inválido.")
+        if action == "checkpoint":
+            if isinstance(value, str):
+                desired_value = _clean_text(value, 100)
+                if desired_value and desired_value != _clean_text(block_id, 100):
+                    raise SmartGuideError("Ponto de retomada inválido.")
+            elif isinstance(value, bool):
+                # Compatibility with clients created before checkpoint became
+                # an absolute guide-scoped value.
+                desired_value = block_id if value else ""
+            else:
+                raise SmartGuideError("Ponto de retomada inválido.")
+        else:
+            if not isinstance(value, bool):
+                raise SmartGuideError("Comando de progresso inválido.")
+            desired_value = value
         request_id = _clean_text(request_id, 120)
         current = self.current(slug); definition_revision = _clean_text(current.get("revision_id"), 160)
         if expected_definition_revision and expected_definition_revision != definition_revision:
             raise SmartGuideConflict("O guia mudou. Atualize o celular.", target=block_id)
         valid = {block.get("id") for chapter in current.get("chapters") or [] for block in chapter.get("blocks") or []}
         if block_id not in valid: raise SmartGuideError("Etapa não encontrada.")
-        state = self.progress(slug); target = f"progress:{action}:{block_id}"
+        state = self.progress(slug)
+        target = "progress:checkpoint" if action == "checkpoint" else f"progress:{action}:{block_id}"
         # Progress uses a sidecar version file in the guide directory because
         # the legacy progress JSON did not carry per-target revisions.
         versions = dict(state.get("value_versions") or {})
         receipts = dict(state.get("receipts") or {})
-        previous = receipts.get(request_id); fingerprint = _json_hash({"target": target, "value": value})
+        previous = receipts.get(request_id); fingerprint = _json_hash({"target": target, "value": desired_value})
         if previous:
             if previous.get("fingerprint") != fingerprint: raise SmartGuideConflict("request_id já foi usado com outro comando.", target=target)
             return {"progress": state, "target": target, "value": previous.get("value"), "value_version": previous.get("value_version", 0), "request_id": request_id, "definition_revision": definition_revision, "idempotent": True}
         version = int(versions.get(target) or 0)
         if expected_value_version is not None and int(expected_value_version) != version:
-            key = {"complete": "completed", "reveal": "revealed_spoilers"}.get(action)
-            actual = block_id in set(state.get(key) or []) if key else state.get("checkpoint") == block_id
+            key = {"complete": "completed", "favorite": "favorites", "reveal": "revealed_spoilers"}.get(action)
+            actual = block_id in set(state.get(key) or []) if key else str(state.get("checkpoint") or "")
             raise SmartGuideConflict("Esta marcação mudou no PC ou em outro celular.", target=target, value=actual, value_version=version)
-        if action == "checkpoint": state["checkpoint"] = block_id
+        if action == "checkpoint": state["checkpoint"] = desired_value
         else:
-            key = "completed" if action == "complete" else "revealed_spoilers"; values = set(state.get(key) or [])
+            key = {"complete": "completed", "favorite": "favorites", "reveal": "revealed_spoilers"}[action]
+            values = set(state.get(key) or [])
             if value: values.add(block_id)
             else: values.discard(block_id)
             state[key] = sorted(values)
-        version += 1; versions[target] = version; receipts[request_id] = {"fingerprint": fingerprint, "value": value, "value_version": version}
+        version += 1; versions[target] = version; receipts[request_id] = {"fingerprint": fingerprint, "value": desired_value, "value_version": version}
         state["value_versions"] = versions; state["receipts"] = dict(list(receipts.items())[-256:]); state["updated_at"] = _now()
         _atomic_json(self._path(slug, "progress.json"), state)
-        return {"progress": state, "target": target, "value": value, "value_version": version,
+        return {"progress": state, "target": target, "value": desired_value, "value_version": version,
                 "request_id": request_id, "definition_revision": definition_revision, "idempotent": False}
 
     def media_system(self, slug: str, system_id: str, source_id: str = '') -> dict:
@@ -1649,23 +2017,24 @@ class SmartGuideStore:
         node = next((item for item in system.get("nodes") or [] if item.get("id") == node_id), None)
         if not node:
             return {}
-        completed = set(state.get("completed_requirements") or [])
         incoming = [edge for edge in system.get("edges") or [] if edge.get("to") == node_id]
         # Incoming edges are alternative paths, not one giant AND condition.
         chosen = state.get("preferences", {}).get(system_id, {}).get("edge_id")
         edge = next((item for item in incoming if item.get("id") == chosen), None)
+        def is_done(edge_item: dict, requirement: dict) -> bool:
+            return requirement_completed(state, system_id, edge_item.get("id", ""), requirement.get("id", ""))
         if edge is None and incoming:
             edge = min(incoming, key=lambda item: sum(
-                req.get("id") not in completed for req in item.get("requirements") or []))
+                not is_done(item, req) for req in item.get("requirements") or []))
         requirements = (edge or {}).get("requirements") or []
-        pending = next((req for req in requirements if req.get("id") not in completed), None)
+        pending = next((req for req in requirements if not is_done(edge or {}, req)), None)
         return {
             "system_id": system_id, "system_title": system.get("title", ""),
             "node_id": node_id, "title": node.get("label", ""),
             "edge_id": (edge or {}).get("id", ""), "alternative_paths": len(incoming),
             "subtitle": node.get("subtitle", ""), "next_requirement": pending or {},
             "requirements_total": len(requirements),
-            "requirements_completed": sum(1 for req in requirements if req.get("id") in completed),
+            "requirements_completed": sum(1 for req in requirements if is_done(edge or {}, req)),
         }
 
     @_serialized
@@ -1701,8 +2070,8 @@ class SmartGuideStore:
             progress["session_minutes"] = max(5, min(480, int(value or 30)))
         else:
             raise SmartGuideError("Atualização de progresso inválida.")
-        if action in {"complete", "reveal", "checkpoint"} and block_id:
-            target = f"progress:{action}:{block_id}"
+        if action in {"complete", "favorite", "reveal", "checkpoint"} and block_id:
+            target = "progress:checkpoint" if action == "checkpoint" else f"progress:{action}:{block_id}"
             versions = progress.setdefault("value_versions", {})
             versions[target] = max(0, _safe_int(versions.get(target))) + 1
         progress["updated_at"] = _now()
