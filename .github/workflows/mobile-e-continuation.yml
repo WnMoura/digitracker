@@ -21,6 +21,14 @@ jobs:
         run: |
           python tools/mobile_e_phase3_patch.py
           python tools/mobile_e_phase3_finalize.py
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('companion.py')
+          text = p.read_text(encoding='utf-8')
+          if 'import copy\n' not in text:
+              text = text.replace('import base64\n', 'import base64\nimport copy\n', 1)
+              p.write_text(text, encoding='utf-8', newline='\n')
+          PY
       - name: Syntax checks
         run: |
           python -m py_compile companion.py experience_api.py
