@@ -1,10 +1,27 @@
+let requestSequence = 0;
+
 export function normalized(value) {
   return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase("pt-BR");
 }
 
-export function requestId() {
-  if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
-  return "mobile-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+export function requestId(source = globalThis.crypto) {
+  if (source?.randomUUID) return source.randomUUID();
+  if (source?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    source.getRandomValues(bytes);
+    // UUID v4 layout. getRandomValues remains available on ordinary HTTP LAN
+    // pages where randomUUID may be unavailable because the context is not
+    // considered secure.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  // request_id is an idempotency key, not a credential. This last-resort
+  // monotonic value keeps very old browsers usable without falling back to
+  // Math.random; supported mobile browsers should always take a crypto branch.
+  requestSequence += 1;
+  return `mobile-${Date.now().toString(36)}-${requestSequence.toString(36)}`;
 }
 
 export function namespaceFor(data, slug) {
@@ -44,10 +61,24 @@ export function targetKey(values) {
 }
 
 export function versionFor(data, values) {
-  if (values.kind === "progress") return Number(data?.progress?.value_versions?.[targetKey(values)] || 0);
-  if (values.kind === "requirement" || values.kind === "goal") return Number(data?.system_state?.value_versions?.[targetKey(values)] || 0);
-  if (values.kind === "item") return Number((data?.items || []).find((item) => item.id === values.target.item_id)?.value_version || 0);
-  return 0;
+  // The first version observed for an operation is part of that operation's
+  // intent. Keep it attached to the queued value so reconnect/flush cannot
+  // silently replace a stale write with the newest PC version and overwrite a
+  // concurrent change. Retrying the same request_id after a lost ACK remains
+  // safe because the backend checks the idempotency receipt first.
+  if (values && Object.prototype.hasOwnProperty.call(values, "_expectedValueVersion")) {
+    const captured = Number(values._expectedValueVersion);
+    if (Number.isInteger(captured) && captured >= 0) return captured;
+  }
+
+  let current = 0;
+  if (values.kind === "progress") current = Number(data?.progress?.value_versions?.[targetKey(values)] || 0);
+  else if (values.kind === "requirement" || values.kind === "goal") current = Number(data?.system_state?.value_versions?.[targetKey(values)] || 0);
+  else if (values.kind === "item") current = Number((data?.items || []).find((item) => item.id === values.target.item_id)?.value_version || 0);
+
+  current = Number.isInteger(current) && current >= 0 ? current : 0;
+  if (values && typeof values === "object") values._expectedValueVersion = current;
+  return current;
 }
 
 export function patchConfirmedValue(data, result) {
