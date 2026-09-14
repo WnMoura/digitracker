@@ -32,6 +32,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Targeted tests
-        run: python -m pytest tests/test_smart_guide.py tests/test_experience.py tests/test_item_catalog.py -q
+        run: python -m pytest tests/test_smart_guide.py tests/test_experience.py -q
       - name: Full suite
         run: python -m pytest tests/ -q
