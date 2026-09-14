@@ -1,0 +1,77 @@
+name: Publish DigiTracker v0.11.9
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+        with:
+          ref: b9838f4d72042de147c25571cd061756588b2709
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-build.txt -r requirements-dev.txt
+
+      - name: Validate version
+        shell: pwsh
+        run: |
+          $appVersion = python -c "from version import APP_VERSION; print(APP_VERSION)"
+          if ($appVersion -ne "0.11.9") { throw "APP_VERSION=$appVersion; expected 0.11.9" }
+
+      - name: Tests
+        run: python -m pytest tests/ -q
+
+      - name: Build with PyInstaller
+        run: pyinstaller digitracker.spec --noconfirm
+
+      - name: Generate SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist/DigiTracker.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  DigiTracker.exe" | Out-File dist/DigiTracker.exe.sha256 -Encoding ascii
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: DigiTracker-v0.11.9-windows
+          path: |
+            dist/DigiTracker.exe
+            dist/DigiTracker.exe.sha256
+          if-no-files-found: error
+
+      - name: Move v0.11.9 tag to release commit
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --tags --force
+          git tag -d v0.11.9 2>$null
+          git tag -a v0.11.9 b9838f4d72042de147c25571cd061756588b2709 -m "DigiTracker v0.11.9"
+          git push --force origin refs/tags/v0.11.9
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          if (gh release view v0.11.9 2>$null) {
+            gh release upload v0.11.9 dist/DigiTracker.exe dist/DigiTracker.exe.sha256 --clobber
+            gh release edit v0.11.9 --title "DigiTracker v0.11.9" --notes-file docs/RELEASE_v0.11.9.md
+          } else {
+            gh release create v0.11.9 dist/DigiTracker.exe dist/DigiTracker.exe.sha256 --title "DigiTracker v0.11.9" --notes-file docs/RELEASE_v0.11.9.md
+          }
