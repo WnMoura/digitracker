@@ -49,10 +49,19 @@ const {chromium} = require("playwright");
         value: false,
         value_version: 3,
       });
+      const operations = [
+        {id: "one", target: "progress:checkpoint", status: "pending", values: {_expectedValueVersion: 0}, body: {expected_value_version: 0}},
+        {id: "two", target: "progress:checkpoint", status: "pending", values: {_expectedValueVersion: 0}, body: {expected_value_version: 0}},
+        {id: "three", target: "item:x", status: "pending", values: {_expectedValueVersion: 4}, body: {expected_value_version: 4}},
+      ];
+      const rebased = state.rebaseNextDependent(operations, 0, "progress:checkpoint", 1);
+      const checkpointTarget = state.targetKey({kind: "progress", action: "checkpoint", target: {block_id: "block-a"}});
       return {
         fallbackId,
         firstVersion,
         replayVersion,
+        checkpointTarget,
+        rebased,
         legacyRequirementKept: patchedRequirement.system_state.completed_requirements.includes("shared-condition"),
         remainingScopedTargets: patchedRequirement.system_state.completed_requirement_targets,
       };
@@ -62,6 +71,10 @@ const {chromium} = require("playwright");
     assert.equal(stateChecks.firstVersion, 2, "Initial target version was not captured");
     assert.equal(stateChecks.replayVersion, 2,
       "Queued operations must keep their original expected version so reconnect exposes a conflict instead of overwriting PC state");
+    assert.equal(stateChecks.checkpointTarget, "progress:checkpoint", "Checkpoint concurrency must be guide-scoped");
+    assert.equal(stateChecks.rebased.index, 1, "Only the next dependent operation should be rebased");
+    assert.equal(stateChecks.rebased.operation.body.expected_value_version, 1,
+      "The next same-target offline intent must advance from the version confirmed by its predecessor");
     assert.equal(stateChecks.legacyRequirementKept, true,
       "Legacy requirement projection must remain marked while another scoped route with the same requirement id is still complete");
     assert.deepEqual(stateChecks.remainingScopedTargets, ["requirement:system-a:edge-b:shared-condition"]);

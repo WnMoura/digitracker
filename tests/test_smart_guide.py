@@ -266,3 +266,34 @@ def test_estado_visual_sobrevive_a_nova_revisao_e_restauracao(tmp_path):
     assert requirement["id"] in state["completed_requirements"]
     assert state["node_media"][f"{system['id']}:{node['id']}"] == "media_demo"
     assert store.system_objective(store.current("jogo"), state)["next_requirement"] == {}
+
+
+def test_checkpoint_version_is_scoped_to_the_guide(tmp_path):
+    store = smart_guide.SmartGuideStore(tmp_path)
+    store.ensure_source("jogo", "Jogo", SECTIONS)
+    blocks = [block["id"] for chapter in store.current("jogo")["chapters"] for block in chapter["blocks"]]
+    first, second = blocks[:2]
+
+    saved = store.update_progress_versioned(
+        "jogo", "checkpoint", first, first,
+        request_id="phone-a-1", expected_value_version=0,
+    )
+    assert saved["target"] == "progress:checkpoint"
+    assert saved["value"] == first
+    assert saved["value_version"] == 1
+
+    with pytest.raises(smart_guide.SmartGuideConflict) as conflict:
+        store.update_progress_versioned(
+            "jogo", "checkpoint", second, second,
+            request_id="phone-a-2", expected_value_version=0,
+        )
+    assert conflict.value.target == "progress:checkpoint"
+    assert conflict.value.value == first
+    assert conflict.value.value_version == 1
+
+    moved = store.update_progress_versioned(
+        "jogo", "checkpoint", second, second,
+        request_id="phone-a-3", expected_value_version=1,
+    )
+    assert moved["value"] == second
+    assert store.progress("jogo")["checkpoint"] == second

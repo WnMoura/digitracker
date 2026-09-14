@@ -53,11 +53,34 @@ export function mediaUrl(data, mediaId, fallback = "") {
 }
 
 export function targetKey(values) {
-  if (values.kind === "progress") return "progress:" + values.action + ":" + values.target.block_id;
+  if (values.kind === "progress") {
+    // There is only one resume point per guide/game. Completion, favorite and
+    // reveal remain block-scoped, but checkpoint writes share one version.
+    if (values.action === "checkpoint") return "progress:checkpoint";
+    return "progress:" + values.action + ":" + values.target.block_id;
+  }
   if (values.kind === "requirement") return "requirement:" + values.target.system_id + ":" + values.target.edge_id + ":" + values.target.requirement_id;
   if (values.kind === "goal") return "goal:" + values.target.system_id;
   if (values.kind === "item") return "item:" + values.target.item_id;
   return values.kind || "unknown";
+}
+
+export function rebaseNextDependent(operations, completedIndex, target, valueVersion) {
+  const version = Number(valueVersion);
+  if (!Array.isArray(operations) || !Number.isInteger(version) || version < 0) return null;
+  for (let index = completedIndex + 1; index < operations.length; index += 1) {
+    const operation = operations[index];
+    if (!operation || operation.target !== target || operation.status === "conflict") continue;
+    return {
+      index,
+      operation: {
+        ...operation,
+        values: {...operation.values, _expectedValueVersion: version},
+        body: {...operation.body, expected_value_version: version},
+      },
+    };
+  }
+  return null;
 }
 
 export function versionFor(data, values) {
@@ -89,7 +112,7 @@ export function patchConfirmedValue(data, result) {
     const parts = target.split(":");
     const action = parts[1], blockId = parts[2];
     const map = {complete: "completed", favorite: "favorites", reveal: "revealed_spoilers"};
-    if (action === "checkpoint") next.progress.checkpoint = result.value ? blockId : "";
+    if (action === "checkpoint") next.progress.checkpoint = String(result.value || "");
     else if (map[action]) {
       const values = new Set(next.progress[map[action]] || []);
       result.value ? values.add(blockId) : values.delete(blockId);

@@ -1,6 +1,6 @@
 "use strict";
 
-import {guideBlocks, mediaUrl, namespaceFor, nodeById, normalized, patchConfirmedValue, requestId, systemById, targetKey, versionFor} from "./state.js";
+import {guideBlocks, mediaUrl, namespaceFor, nodeById, normalized, patchConfirmedValue, rebaseNextDependent, requestId, systemById, targetKey, versionFor} from "./state.js";
 import {createStorage} from "./storage.js";
 
 const content = document.getElementById("content");
@@ -135,12 +135,32 @@ async function flush() {
   if (!M.connected || !M.storage?.available || M.flushing) return M.flushing;
   M.flushing = (async () => {
     const blocked = new Set();
-    for (const op of await M.storage.pending(M.namespace)) {
+    const operations = await M.storage.pending(M.namespace);
+    for (let index = 0; index < operations.length; index += 1) {
+      const op = operations[index];
       if (op.status === "conflict") { blocked.add(op.target); continue; }
       if (blocked.has(op.target)) continue;
       try {
-        const result = await api("/api/action", {...op.body, expected_value_version: versionFor(M.data, op.values)});
-        M.data = patchConfirmedValue(M.data, result); await M.storage.remove(op.id); dropPending(op.target); notify("Alteração pendente salva no PC.");
+        // Replay the exact request first. A lost ACK is recovered through the
+        // persistent receipt for this request_id; a newer PC value must not be
+        // substituted before the server decides whether this intent conflicts.
+        const result = await api("/api/action", op.body);
+        M.data = patchConfirmedValue(M.data, result);
+        await M.storage.remove(op.id);
+        dropPending(op.target);
+
+        // Successive changes on the same semantic target are dependent. Only
+        // the next intent advances to this confirmed version. If it succeeds,
+        // it advances the following one in turn.
+        const dependent = rebaseNextDependent(operations, index, op.target, result.value_version);
+        if (dependent) {
+          operations[dependent.index] = dependent.operation;
+          await M.storage.update(dependent.operation.id, {
+            values: dependent.operation.values,
+            body: dependent.operation.body,
+          });
+        }
+        notify("Alteração pendente salva no PC.");
       } catch (error) {
         if (error.value?.conflict) { await M.storage.update(op.id, {status: "conflict", server: error.value}); M.p.conflict ||= {id: op.id, target: op.target, values: op.values, body: op.body, server: error.value}; blocked.add(op.target); }
         else break;
@@ -292,7 +312,11 @@ async function click(event) {
   if (a === "guide-mode") { M.p.guideMode = button.dataset.mode; persist(); return render(); }
   if (a === "guide-open") { M.p.guideBlockId = button.dataset.block; M.p.guideMode = "read"; const row = guideBlocks(M.data).find((item) => item.id === button.dataset.block); rememberRecent("guide",button.dataset.block,row?.title || "Guia",row?.chapterTitle || ""); return nav("guide"); }
   if (a === "guide-step") { const rows = guideBlocks(M.data), index = rows.findIndex((row) => row.id === M.p.guideBlockId); M.p.guideBlockId = rows[index+Number(button.dataset.dir)]?.id || M.p.guideBlockId; persist(); render(); return window.scrollTo({top:0,behavior:"instant"}); }
-  if (["complete","favorite","reveal","checkpoint"].includes(a)) return submit({kind:"progress",action:a === "complete" ? "complete" : a === "favorite" ? "favorite" : a === "reveal" ? "reveal" : "checkpoint",value:a === "reveal" || a === "checkpoint" ? true : button.dataset.value === "true",target:{block_id:button.dataset.block}});
+  if (["complete","favorite","reveal","checkpoint"].includes(a)) {
+    const action = a === "complete" ? "complete" : a === "favorite" ? "favorite" : a === "reveal" ? "reveal" : "checkpoint";
+    const value = action === "checkpoint" ? button.dataset.block : action === "reveal" ? true : button.dataset.value === "true";
+    return submit({kind:"progress",action,value,target:{block_id:button.dataset.block}});
+  }
   if (a === "assistant") { M.p.assistant = !M.p.assistant; persist(); return render(); }
   if (a === "atlas-mode") { M.p.atlasMode = button.dataset.mode; persist(); return render(); }
   if (a === "atlas-system") { M.p.atlasSystemId=button.dataset.system;M.p.atlasNodeId="";M.p.atlasMode="entities";selections();persist();return render(); }

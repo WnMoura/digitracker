@@ -13,7 +13,7 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import Flask, g, jsonify, request, send_file, send_from_directory
 from waitress import create_server
 
 try:  # Optional at runtime; the LAN server remains usable when discovery is unavailable.
@@ -46,29 +46,47 @@ class DeviceRegistry:
     a copied local database cannot be used to create a browser session.
     """
 
+    SCHEMA_VERSION = 1
+
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._migrate()
+
+    def _migrate(self):
         with self._connection() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS companion_devices (
-                    device_id TEXT PRIMARY KEY,
-                    account_id TEXT NOT NULL,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    name TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    seen_at REAL NOT NULL,
-                    expires_at REAL NOT NULL,
-                    revoked_at REAL
-                )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_companion_device_token ON companion_devices(token_hash)")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS companion_meta (
                     name TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 )
             """)
+            row = conn.execute("SELECT value FROM companion_meta WHERE name = 'schema_version'").fetchone()
+            try:
+                version = int(row[0]) if row else 0
+            except (TypeError, ValueError):
+                version = 0
+            if version > self.SCHEMA_VERSION:
+                raise RuntimeError("Cadastro de aparelhos foi criado por uma versão mais nova do DigiTracker.")
+            if version < 1:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS companion_devices (
+                        device_id TEXT PRIMARY KEY,
+                        account_id TEXT NOT NULL,
+                        token_hash TEXT NOT NULL UNIQUE,
+                        name TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        seen_at REAL NOT NULL,
+                        expires_at REAL NOT NULL,
+                        revoked_at REAL
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_companion_device_token ON companion_devices(token_hash)")
+                conn.execute(
+                    "INSERT INTO companion_meta(name, value) VALUES ('schema_version', ?) "
+                    "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                    (str(self.SCHEMA_VERSION),),
+                )
 
     def _connection(self):
         return sqlite3.connect(self.path, timeout=5)
@@ -169,6 +187,14 @@ class CompanionServer:
     def _account(self):
         return str(self.account_provider() or "local")[:200]
 
+    def _scoped_request_id(self, session, slug, request_id):
+        raw_id = str(request_id or "").strip()
+        if not raw_id:
+            return ""
+        device = str((session or {}).get("device_id") or (session or {}).get("id") or "temporary")
+        scope = "|".join((self.installation_id, self._account(), device, str(slug or ""), raw_id))
+        return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
     def _allowed_hosts(self):
         values = {f"{self.host}:{self.port}"}
         if self.mdns_info:
@@ -243,6 +269,7 @@ class CompanionServer:
                     if not session or session["expires"] < now or session.get("account_id") != self._account():
                         return jsonify(ok=False, error="Conexão encerrada. Faça o pareamento novamente."), 401
                     session["seen_at"] = now
+                    g.companion_session = dict(session)
 
         @app.after_request
         def headers(response):
@@ -562,8 +589,16 @@ class CompanionServer:
             body = request.get_json()
             if not isinstance(body, dict):
                 return jsonify(ok=False, error="Comando inválido."), 400
+            body = dict(body)
+            client_request_id = str(body.get("request_id") or "").strip()
+            if client_request_id:
+                body["request_id"] = self._scoped_request_id(
+                    getattr(g, "companion_session", {}), body.get("slug") or "", client_request_id)
             try:
                 result = self.command(body)
+                if client_request_id and isinstance(result, dict) and result.get("request_id") == body.get("request_id"):
+                    result = dict(result)
+                    result["request_id"] = client_request_id
                 return jsonify(result), (409 if result.get("conflict") else 200)
             except (ValueError, KeyError, TypeError) as exc:
                 return jsonify(ok=False, error=str(exc)), 400
@@ -643,7 +678,9 @@ class CompanionServer:
             if include_qr and self.pair_code:
                 import qrcode
                 stream = io.BytesIO()
-                qrcode.make(result["url"] + "/#pair=" + self.pair_code).save(stream, format="PNG")
+                pair_base = result.get("canonical_url") or result["url"]
+                result["pairing_url"] = pair_base + "/#pair=" + self.pair_code
+                qrcode.make(result["pairing_url"]).save(stream, format="PNG")
                 result["qr"] = "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()
         return result
 

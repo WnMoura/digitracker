@@ -212,3 +212,19 @@ def test_library_invalid(value):
 def test_library_deduplication():
     value = {"format": "digitracker-library", "version": 1, "provider": "retroachievements", "games": [{"id": 1}, {"id": 1}, {"id": 2}]}
     assert validate_library(value) == [1, 2]
+
+
+def test_companion_request_identity_is_scoped_to_device_account_and_game(server):
+    a = {"id": "session-a", "device_id": "phone-a"}
+    b = {"id": "session-b", "device_id": "phone-b"}
+    first = server._scoped_request_id(a, "game-a", "same-client-id")
+    assert first == server._scoped_request_id(a, "game-a", "same-client-id")
+    assert first != server._scoped_request_id(b, "game-a", "same-client-id")
+    assert first != server._scoped_request_id(a, "game-b", "same-client-id")
+
+
+def test_companion_registry_records_schema_version(tmp_path):
+    registry = companion.DeviceRegistry(tmp_path / "companion.sqlite3")
+    with registry._connection() as conn:
+        row = conn.execute("SELECT value FROM companion_meta WHERE name = 'schema_version'").fetchone()
+    assert row and int(row[0]) == companion.DeviceRegistry.SCHEMA_VERSION

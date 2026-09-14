@@ -1926,39 +1926,55 @@ class SmartGuideStore:
                                   value: bool, *, request_id: str,
                                   expected_definition_revision: str = "",
                                   expected_value_version: int | None = None) -> dict:
-        if action not in {"complete", "favorite", "reveal", "checkpoint"} or not isinstance(value, bool):
+        if action not in {"complete", "favorite", "reveal", "checkpoint"}:
             raise SmartGuideError("Comando de progresso inválido.")
+        if action == "checkpoint":
+            if isinstance(value, str):
+                desired_value = _clean_text(value, 100)
+                if desired_value and desired_value != _clean_text(block_id, 100):
+                    raise SmartGuideError("Ponto de retomada inválido.")
+            elif isinstance(value, bool):
+                # Compatibility with clients created before checkpoint became
+                # an absolute guide-scoped value.
+                desired_value = block_id if value else ""
+            else:
+                raise SmartGuideError("Ponto de retomada inválido.")
+        else:
+            if not isinstance(value, bool):
+                raise SmartGuideError("Comando de progresso inválido.")
+            desired_value = value
         request_id = _clean_text(request_id, 120)
         current = self.current(slug); definition_revision = _clean_text(current.get("revision_id"), 160)
         if expected_definition_revision and expected_definition_revision != definition_revision:
             raise SmartGuideConflict("O guia mudou. Atualize o celular.", target=block_id)
         valid = {block.get("id") for chapter in current.get("chapters") or [] for block in chapter.get("blocks") or []}
         if block_id not in valid: raise SmartGuideError("Etapa não encontrada.")
-        state = self.progress(slug); target = f"progress:{action}:{block_id}"
+        state = self.progress(slug)
+        target = "progress:checkpoint" if action == "checkpoint" else f"progress:{action}:{block_id}"
         # Progress uses a sidecar version file in the guide directory because
         # the legacy progress JSON did not carry per-target revisions.
         versions = dict(state.get("value_versions") or {})
         receipts = dict(state.get("receipts") or {})
-        previous = receipts.get(request_id); fingerprint = _json_hash({"target": target, "value": value})
+        previous = receipts.get(request_id); fingerprint = _json_hash({"target": target, "value": desired_value})
         if previous:
             if previous.get("fingerprint") != fingerprint: raise SmartGuideConflict("request_id já foi usado com outro comando.", target=target)
             return {"progress": state, "target": target, "value": previous.get("value"), "value_version": previous.get("value_version", 0), "request_id": request_id, "definition_revision": definition_revision, "idempotent": True}
         version = int(versions.get(target) or 0)
         if expected_value_version is not None and int(expected_value_version) != version:
             key = {"complete": "completed", "favorite": "favorites", "reveal": "revealed_spoilers"}.get(action)
-            actual = block_id in set(state.get(key) or []) if key else state.get("checkpoint") == block_id
+            actual = block_id in set(state.get(key) or []) if key else str(state.get("checkpoint") or "")
             raise SmartGuideConflict("Esta marcação mudou no PC ou em outro celular.", target=target, value=actual, value_version=version)
-        if action == "checkpoint": state["checkpoint"] = block_id
+        if action == "checkpoint": state["checkpoint"] = desired_value
         else:
             key = {"complete": "completed", "favorite": "favorites", "reveal": "revealed_spoilers"}[action]
             values = set(state.get(key) or [])
             if value: values.add(block_id)
             else: values.discard(block_id)
             state[key] = sorted(values)
-        version += 1; versions[target] = version; receipts[request_id] = {"fingerprint": fingerprint, "value": value, "value_version": version}
+        version += 1; versions[target] = version; receipts[request_id] = {"fingerprint": fingerprint, "value": desired_value, "value_version": version}
         state["value_versions"] = versions; state["receipts"] = dict(list(receipts.items())[-256:]); state["updated_at"] = _now()
         _atomic_json(self._path(slug, "progress.json"), state)
-        return {"progress": state, "target": target, "value": value, "value_version": version,
+        return {"progress": state, "target": target, "value": desired_value, "value_version": version,
                 "request_id": request_id, "definition_revision": definition_revision, "idempotent": False}
 
     def media_system(self, slug: str, system_id: str, source_id: str = '') -> dict:
@@ -2055,7 +2071,7 @@ class SmartGuideStore:
         else:
             raise SmartGuideError("Atualização de progresso inválida.")
         if action in {"complete", "favorite", "reveal", "checkpoint"} and block_id:
-            target = f"progress:{action}:{block_id}"
+            target = "progress:checkpoint" if action == "checkpoint" else f"progress:{action}:{block_id}"
             versions = progress.setdefault("value_versions", {})
             versions[target] = max(0, _safe_int(versions.get(target))) + 1
         progress["updated_at"] = _now()
