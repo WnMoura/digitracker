@@ -264,3 +264,22 @@ def test_remembered_device_restore_reports_explicit_reason(tmp_path):
     assert registry.restore_status(token, "other", now=101)[1] == "account_changed"
     registry.revoke(item["id"], "account")
     assert registry.restore_status(token, "account", now=102)[1] == "revoked"
+
+
+def test_companion_reference_returns_editorial_fragment_only(tmp_path):
+    snapshot = {
+        "ok": True, "game": {"slug": "a"}, "games": [{"slug": "a"}],
+        "chapters": [{"id": "c1", "title": "Chapter", "blocks": [{
+            "id": "b1", "type": "text", "title": "Exact line", "text": "Published editorial text",
+            "source_refs": [{"page": 7, "section": 2, "block": 4}],
+        }]}],
+        "systems": [], "media": [], "progress": {}, "system_state": {}, "items": [], "achievements": [], "answer": {},
+    }
+    service = companion.CompanionServer(tmp_path / "ui", tmp_path / "assets", lambda slug: dict(snapshot), lambda body: {"ok": True})
+    service.host, service.port = "127.0.0.1", 8766
+    client = client_for(service); pair(service, client)
+    result = request(client, "/api/reference?slug=a&page=7&section=2&block=4").json
+    assert result["total"] == 1
+    block = result["references"][0]["block"]
+    assert block["title"] == "Exact line" and block["text"] == "Published editorial text"
+    assert "html" not in block and "raw" not in block

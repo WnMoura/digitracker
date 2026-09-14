@@ -2,12 +2,16 @@
 const assert = require("node:assert/strict");
 const path = require("node:path");
 const {mkdir} = require("node:fs/promises");
-const {chromium} = require("playwright");
+const {chromium, webkit} = require("playwright");
 
 (async () => {
   const output = path.resolve(__dirname, "../build-check/companion-ui-smoke");
   await mkdir(output, {recursive: true});
-  const browser = await chromium.launch({headless: true, channel: "msedge"});
+  const engine = process.env.PW_ENGINE === "webkit" ? "webkit" : "chromium";
+  const browserType = engine === "webkit" ? webkit : chromium;
+  const launchOptions = {headless: true};
+  if (engine === "chromium" && process.env.PW_CHANNEL) launchOptions.channel = process.env.PW_CHANNEL;
+  const browser = await browserType.launch(launchOptions);
   try {
     const page = await browser.newPage({viewport: {width: 390, height: 844}, isMobile: true, hasTouch: true});
     const errors = [];
@@ -101,10 +105,14 @@ const {chromium} = require("playwright");
 
     await page.locator("#tabs [data-tab='items']").click();
     await page.locator("#item-local-search").fill("digivice");
-    assert.equal(await page.locator(".item-card").count(), 1, "Items local search did not resolve name");
+    assert.equal(await page.locator("[data-act='item-open']").count(), 1, "Items local search did not resolve name");
     await page.locator("#item-local-search").fill("");
+    await page.locator("[data-act='item-open']").first().click();
+    await page.waitForSelector(".item-detail");
     await page.locator("[data-item-input]").fill("2");
     await page.locator("[data-act='item-save']").click();
+    await page.locator("[data-act='item-back']").click();
+    await page.waitForSelector("[data-act='item-open']");
     await page.locator("#tabs [data-tab='more']").click();
     await page.locator("[data-act='more-mode'][data-mode='connection']").click();
     assert.match(await page.locator(".connection-panel").innerText(), /Armazenamento offline/);
@@ -112,18 +120,40 @@ const {chromium} = require("playwright");
     await page.locator("#mobile-search-toggle").click();
     await page.locator("#global-search").fill("agumon");
     assert(await page.locator(".search-results .simple-row").count() >= 1, "Search did not return Atlas result");
+    await page.locator("[data-act='search-atlas']").first().click();
+    await page.waitForSelector("[data-act='search-back']");
+    await page.locator("[data-act='search-back']").click();
+    assert.equal(await page.locator("#global-search").inputValue(), "agumon", "Search query was not restored after detail");
     await page.locator("#global-search").fill("");
     assert.match(await page.locator(".search-results").innerText(), /Buscar no jogo/);
     await page.locator("[data-act='search-close']").click();
+
+    await page.locator("#tabs [data-tab='items']").click();
+    await page.locator("[data-act='item-open']").first().click();
+    await page.waitForSelector(".item-detail");
+    assert.match(await page.locator(".item-detail").innerText(), /Como obter/);
+    await page.locator("[data-act='item-back']").click();
+    assert(await page.locator("[data-act='item-open']").count() >= 1, "Item list did not return from detail");
+
+    await page.locator("#tabs [data-tab='guide']").click();
+    await page.locator("[data-act='guide-mode'][data-mode='read']").click();
+    await page.locator("[data-act='source']").first().click();
+    await page.waitForSelector(".source-reference");
+    assert.match(await page.locator(".source-modal").innerText(), /Início da Aventura|Trecho correspondente/);
+    await page.locator("[data-act='source-close']").click();
+
+    await page.evaluate(() => document.body.classList.add("keyboard-open"));
+    assert.equal(await page.locator("#tabs").evaluate((node) => getComputedStyle(node).display), "none", "Bottom nav must hide while the software keyboard is open");
+    await page.evaluate(() => document.body.classList.remove("keyboard-open"));
 
     for (const width of [360, 390, 430]) {
       await page.setViewportSize({width, height: 844});
       assert(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1),
         `Horizontal page overflow at ${width}px`);
-      await page.screenshot({path: path.join(output, `proposal-e-${width}.png`)});
+      await page.screenshot({path: path.join(output, `${engine}-proposal-e-${width}.png`)});
     }
     assert.deepEqual(errors, []);
-    console.log("Companion UI smoke passed: 360, 390 and 430px; Guide, Atlas, items, More, search and offline version guards.");
+    console.log(`Companion UI smoke passed on ${engine}: 360, 390 and 430px; Guide, Atlas, items, More, search and offline version guards.`);
   } finally {
     await browser.close();
   }

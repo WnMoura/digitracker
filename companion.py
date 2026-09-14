@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import ipaddress
@@ -605,24 +606,61 @@ class CompanionServer:
             if error:
                 return error
             ref_id = str(request.args.get("id", request.args.get("block_id", ""))).strip()
-            page = str(request.args.get("page", "")).strip()
+            selectors = {
+                key: str(request.args.get(key, "")).strip()
+                for key in ("page", "section", "block", "row_id", "table_id", "element_id")
+                if str(request.args.get(key, "")).strip()
+            }
+
+            def ref_matches(candidate):
+                if not isinstance(candidate, dict):
+                    return False
+                return all(str(candidate.get(key, "")) == wanted for key, wanted in selectors.items())
+
+            def editorial_block(block):
+                rows = list(block.get("rows") or [])
+                row_id = selectors.get("row_id")
+                if row_id:
+                    selected = [row for row in rows if isinstance(row, dict) and str(row.get("id", row.get("row_id", ""))) == row_id]
+                    rows = selected or rows[:20]
+                else:
+                    rows = rows[:20]
+                return {
+                    key: copy.deepcopy(block.get(key))
+                    for key in ("id", "type", "title", "text", "hidden", "source_refs")
+                    if block.get(key) is not None
+                } | {"items": copy.deepcopy((block.get("items") or [])[:20]), "rows": copy.deepcopy(rows)}
+
             matches = []
             for chapter in value.get("chapters") or []:
                 for block in chapter.get("blocks") or []:
-                    if ref_id and ref_id not in {str(block.get("id", "")), str(block.get("element_id", ""))}:
-                        continue
+                    direct = ref_id and ref_id in {str(block.get("id", "")), str(block.get("element_id", ""))}
                     refs = block.get("source_refs") or []
-                    if page and not any(str(ref.get("page", "")) == page for ref in refs if isinstance(ref, dict)):
+                    if ref_id and not direct and not selectors:
                         continue
-                    matches.append({"chapter_id": chapter.get("id", ""),
+                    if selectors and not any(ref_matches(ref) for ref in refs):
+                        continue
+                    if not ref_id and not selectors:
+                        continue
+                    matches.append({"kind": "guide", "chapter_id": chapter.get("id", ""),
                                    "chapter_title": chapter.get("title", ""),
-                                   "block": block})
-            if ref_id and not matches:
+                                   "block": editorial_block(block)})
+            # If the source coordinate is Atlas-only, return a safe structured
+            # summary instead of reaching into source files or exposing raw HTML.
+            if not matches:
                 for system in value.get("systems") or []:
                     for node in system.get("nodes") or []:
-                        if ref_id in {str(node.get("id", "")), str(node.get("entity_id", ""))}:
-                            matches.append({"system_id": system.get("id", ""), "system_title": system.get("title", ""), "node": node})
-            return jsonify(ok=True, references=matches[:100], total=len(matches),
+                        refs = node.get("source_refs") or []
+                        if (ref_id and ref_id in {str(node.get("id", "")), str(node.get("entity_id", ""))}) or (selectors and any(ref_matches(ref) for ref in refs)):
+                            matches.append({"kind": "atlas", "system_id": system.get("id", ""),
+                                            "system_title": system.get("title", ""),
+                                            "node": {key: copy.deepcopy(node.get(key)) for key in ("id", "label", "subtitle", "card_number", "source_refs")}})
+                    for edge in system.get("edges") or []:
+                        if selectors and any(ref_matches(ref) for ref in edge.get("source_refs") or []):
+                            matches.append({"kind": "atlas", "system_id": system.get("id", ""),
+                                            "system_title": system.get("title", ""),
+                                            "edge": {key: copy.deepcopy(edge.get(key)) for key in ("id", "label", "from", "to", "requirements", "source_refs")}})
+            return jsonify(ok=True, references=matches[:20], total=len(matches),
                            content_revision=value.get("content_revision", ""))
 
         @app.post("/api/action")

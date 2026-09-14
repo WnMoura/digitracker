@@ -180,3 +180,29 @@ small, em { color: var(--muted); font-size: 12px; font-style: normal; }
   .reading-actions .outline { grid-column: 1; }
 }
 @media (prefers-reduced-motion: reduce) { *,*::before,*::after { scroll-behavior: auto !important; transition: none !important; } }
+
+
+/* Mobile E phase 3 */
+.item-list-row { width:100%; min-height:60px; padding:10px 16px; display:grid; grid-template-columns:28px minmax(0,1fr) auto; align-items:center; gap:10px; border:0; border-bottom:1px solid var(--line); border-radius:0; text-align:left; background:transparent; }
+.item-list-row:last-child { border-bottom:0; }
+.item-list-row > span:first-child { color:var(--cyan); text-align:center; }
+.item-list-row b,.item-list-row small { display:block; overflow-wrap:anywhere; }
+.item-detail { display:grid; gap:16px; }
+.item-detail > h1 { overflow-wrap:anywhere; }
+.item-quantity { padding:16px; display:grid; grid-template-columns:minmax(0,1fr) 76px; gap:10px; border:1px solid var(--line); border-radius:14px; background:var(--surface); }
+.item-quantity small { display:block; margin-top:4px; }
+.item-quantity .primary { grid-column:1 / -1; }
+.detail-section { display:grid; gap:8px; }
+.detail-section > .muted { padding:12px 0; }
+.alternatives { border:1px solid var(--line); border-radius:12px; background:var(--surface); }
+.alternatives summary { min-height:44px; padding:11px 12px; cursor:pointer; font-weight:700; font-size:13px; }
+.alternatives > div { padding:0 10px 10px; display:flex; flex-wrap:wrap; gap:7px; }
+.source-modal { max-height:min(86dvh,720px); overflow:auto; }
+.source-reference { margin-top:12px; padding:12px; border:1px solid var(--line); border-radius:12px; background:#07182b; }
+.source-reference h3 { margin:4px 0 8px; }
+.source-reference p { white-space:pre-wrap; overflow-wrap:anywhere; }
+.source-row { margin-top:6px; padding-top:6px; border-top:1px solid var(--line); }
+.search-return { margin-bottom:-8px; }
+body.keyboard-open #tabs { display:none !important; }
+body.keyboard-open #content { padding-bottom:max(16px,env(safe-area-inset-bottom)); }
+@media (max-width:380px) { .item-quantity { grid-template-columns:1fr; } .item-quantity .primary { grid-column:1; } }
