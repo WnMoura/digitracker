@@ -15,6 +15,29 @@ const {chromium} = require("playwright");
     await page.goto(`${process.argv[2] || "http://127.0.0.1:8781"}/index.html?demo=1`, {waitUntil: "domcontentloaded"});
     await page.waitForSelector(".mobile-game-hero");
     await page.waitForTimeout(300);
+
+    const stateChecks = await page.evaluate(async () => {
+      const state = await import("./state.js");
+      let next = 0;
+      const fallbackId = state.requestId({
+        getRandomValues(bytes) {
+          for (let index = 0; index < bytes.length; index += 1) bytes[index] = next++;
+          return bytes;
+        },
+      });
+      const data = {progress: {value_versions: {"progress:complete:block-a": 2}}};
+      const values = {kind: "progress", action: "complete", target: {block_id: "block-a"}};
+      const firstVersion = state.versionFor(data, values);
+      data.progress.value_versions["progress:complete:block-a"] = 7;
+      const replayVersion = state.versionFor(data, values);
+      return {fallbackId, firstVersion, replayVersion};
+    });
+    assert.match(stateChecks.fallbackId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      "requestId fallback must use a UUID v4 generated with crypto.getRandomValues");
+    assert.equal(stateChecks.firstVersion, 2, "Initial target version was not captured");
+    assert.equal(stateChecks.replayVersion, 2,
+      "Queued operations must keep their original expected version so reconnect exposes a conflict instead of overwriting PC state");
+
     assert.match(await page.evaluate(() => document.querySelector("#tabs button.active")?.textContent || ""), /Início/);
     await page.locator("#tabs [data-tab='guide']").click();
     await page.waitForSelector(".reading-card");
@@ -59,7 +82,7 @@ const {chromium} = require("playwright");
       await page.screenshot({path: path.join(output, `proposal-e-${width}.png`)});
     }
     assert.deepEqual(errors, []);
-    console.log("Companion UI smoke passed: 360, 390 and 430px; Guide, Atlas, items, More and search.");
+    console.log("Companion UI smoke passed: 360, 390 and 430px; Guide, Atlas, items, More, search and offline version guards.");
   } finally {
     await browser.close();
   }
