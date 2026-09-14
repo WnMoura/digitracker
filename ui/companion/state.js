@@ -101,8 +101,16 @@ export function patchConfirmedValue(data, result) {
     const requirementId = target.split(":").at(-1);
     const values = new Set(next.system_state.completed_requirements || []);
     const scoped = new Set(next.system_state.completed_requirement_targets || []);
-    result.value ? values.add(requirementId) : values.delete(requirementId);
-    result.value ? scoped.add(target) : scoped.delete(target);
+    if (result.value) {
+      values.add(requirementId);
+      scoped.add(target);
+    } else {
+      scoped.delete(target);
+      // Keep the legacy projection while another scoped route still uses the
+      // same requirement id. This mirrors SmartGuideStore and avoids a brief
+      // client-side mismatch before the next server refresh.
+      if (![...scoped].some((item) => item.split(":").at(-1) === requirementId)) values.delete(requirementId);
+    }
     next.system_state.completed_requirements = [...values];
     next.system_state.completed_requirement_targets = [...scoped];
     next.system_state.requirements_scoped = true;
