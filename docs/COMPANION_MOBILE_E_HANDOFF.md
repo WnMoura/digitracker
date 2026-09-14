@@ -31,7 +31,34 @@ revisão manual em WebView2, Safari ou em um aparelho físico.
 - Demo local sem gravações reais, adequada para testar os controles quando o
   PC não estiver pareado.
 
-## Verificações executadas
+## Continuação da etapa 8 — integração
+
+Após o checkpoint `wip/mobile-companion-e-local`, a continuação foi aberta em
+`feat/mobile-step8-integration` sem alterar a `main`.
+
+A auditoria encontrou um caso de concorrência importante na fila offline: ao
+reconectar, o cliente recalculava `expected_value_version` com o valor mais
+novo recebido do PC. Isso poderia transformar uma intenção antiga em uma
+escrita atual e impedir o `409` que deveria pedir revisão ao usuário. O estado
+móvel agora captura a versão observada quando a operação nasce e reutiliza essa
+mesma versão em reenvios. O mesmo `request_id` continua sendo seguro no caso de
+ACK perdido porque o backend verifica o recibo idempotente antes do conflito.
+
+Também foram endurecidos dois detalhes do contrato móvel:
+
+- o fallback de `request_id` usa `crypto.getRandomValues` e UUID v4 quando
+  `crypto.randomUUID` não está disponível em uma página HTTP da LAN; não usa
+  `Math.random`;
+- a projeção legada `completed_requirements` permanece marcada enquanto outra
+  rota escopada com o mesmo `requirement_id` ainda estiver concluída, espelhando
+  o comportamento persistido pelo `SmartGuideStore`.
+
+`tests/companion_ui_smoke.cjs` recebeu regressões para esses três casos. Essas
+alterações ainda precisam passar novamente pelo smoke com Edge, pela suíte
+completa e pelo build Windows antes de serem consideradas validadas para
+publicação.
+
+## Verificações executadas no checkpoint da proposta E
 
 Na pasta do projeto:
 
@@ -39,7 +66,7 @@ Na pasta do projeto:
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Resultado desta entrega: **642 testes aprovados**.
+Resultado do checkpoint anterior: **642 testes aprovados**.
 
 ```powershell
 $env:NODE_PATH='C:\Users\wanso\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\node_modules'
@@ -54,10 +81,10 @@ $node='C:\Users\wanso\.cache\codex-runtimes\codex-primary-runtime\dependencies\n
 & $node tests/atlas_cd_fixture_smoke.cjs
 ```
 
-Os dois smoke tests passam em 360, 390, 430 e 820 px, cobrindo Guia, Atlas,
-alternativas, transformação por item, busca, marcações, imagens e conflitos
-do caso composto. Os testes usam dados sintéticos; não substituem a validação
-de rede, Gemini ou WebView2.
+Os dois smoke tests do checkpoint passaram em 360, 390, 430 e 820 px,
+cobrindo Guia, Atlas, alternativas, transformação por item, busca, marcações,
+imagens e conflitos do caso composto. Os testes usam dados sintéticos; não
+substituem a validação de rede, Gemini ou WebView2.
 
 ## Build
 
