@@ -28,6 +28,18 @@ jobs:
           if 'import copy\n' not in text:
               text = text.replace('import base64\n', 'import base64\nimport copy\n', 1)
               p.write_text(text, encoding='utf-8', newline='\n')
+
+          smoke = Path('tests/companion_ui_smoke.cjs')
+          text = smoke.read_text(encoding='utf-8')
+          needle = '''    await page.locator("[data-act='item-save']").click();
+    await page.locator("#tabs [data-tab='more']").click();'''
+          replacement = '''    await page.locator("[data-act='item-save']").click();
+    await page.locator("[data-act='item-back']").click();
+    await page.waitForSelector("[data-act='item-open']");
+    await page.locator("#tabs [data-tab='more']").click();'''
+          if needle not in text:
+              raise SystemExit('item smoke transition anchor not found')
+          smoke.write_text(text.replace(needle, replacement, 1), encoding='utf-8', newline='\n')
           PY
       - name: Syntax checks
         run: |
