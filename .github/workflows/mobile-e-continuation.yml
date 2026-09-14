@@ -1,0 +1,527 @@
+name: Mobile E continuation
+
+on:
+  push:
+    branches:
+      - feat/mobile-step8-integration
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: feat/mobile-step8-integration
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Apply protocol and queue continuation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new, count=1):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              actual = text.count(old)
+              if actual < count:
+                  raise SystemExit(f'{path}: expected at least {count} occurrence(s), found {actual}: {old[:120]!r}')
+              text = text.replace(old, new, count)
+              p.write_text(text, encoding='utf-8', newline='\n')
+
+          # ---- ui/companion/state.js ----
+          replace('ui/companion/state.js',
+          '''export function targetKey(values) {
+            if (values.kind === "progress") return "progress:" + values.action + ":" + values.target.block_id;
+            if (values.kind === "requirement") return "requirement:" + values.target.system_id + ":" + values.target.edge_id + ":" + values.target.requirement_id;
+            if (values.kind === "goal") return "goal:" + values.target.system_id;
+            if (values.kind === "item") return "item:" + values.target.item_id;
+            return values.kind || "unknown";
+          }
+          ''',
+          '''export function targetKey(values) {
+            if (values.kind === "progress") {
+              // Only one resume point exists per guide/game. Checkpoint writes
+              // therefore share one concurrency scope instead of one scope per
+              // block. Completion/favorite/reveal remain block-scoped.
+              if (values.action === "checkpoint") return "progress:checkpoint";
+              return "progress:" + values.action + ":" + values.target.block_id;
+            }
+            if (values.kind === "requirement") return "requirement:" + values.target.system_id + ":" + values.target.edge_id + ":" + values.target.requirement_id;
+            if (values.kind === "goal") return "goal:" + values.target.system_id;
+            if (values.kind === "item") return "item:" + values.target.item_id;
+            return values.kind || "unknown";
+          }
+
+          export function rebaseNextDependent(operations, completedIndex, target, valueVersion) {
+            const version = Number(valueVersion);
+            if (!Array.isArray(operations) || !Number.isInteger(version) || version < 0) return null;
+            for (let index = completedIndex + 1; index < operations.length; index += 1) {
+              const operation = operations[index];
+              if (!operation || operation.target !== target || operation.status === "conflict") continue;
+              return {
+                index,
+                operation: {
+                  ...operation,
+                  values: {...operation.values, _expectedValueVersion: version},
+                  body: {...operation.body, expected_value_version: version},
+                },
+              };
+            }
+            return null;
+          }
+          ''')
+
+          replace('ui/companion/state.js',
+          '''  if (result.kind === "progress") {
+              const parts = target.split(":");
+              const action = parts[1], blockId = parts[2];
+              const map = {complete: "completed", favorite: "favorites", reveal: "revealed_spoilers"};
+              if (action === "checkpoint") next.progress.checkpoint = result.value ? blockId : "";
+          ''',
+          '''  if (result.kind === "progress") {
+              const parts = target.split(":");
+              const action = parts[1], blockId = parts[2];
+              const map = {complete: "completed", favorite: "favorites", reveal: "revealed_spoilers"};
+              if (action === "checkpoint") next.progress.checkpoint = String(result.value || "");
+          ''')
+
+          # ---- ui/companion/app.js ----
+          replace('ui/companion/app.js',
+          '''import {guideBlocks, mediaUrl, namespaceFor, nodeById, normalized, patchConfirmedValue, requestId, systemById, targetKey, versionFor} from "./state.js";''',
+          '''import {guideBlocks, mediaUrl, namespaceFor, nodeById, normalized, patchConfirmedValue, rebaseNextDependent, requestId, systemById, targetKey, versionFor} from "./state.js";''')
+
+          replace('ui/companion/app.js',
+          '''async function flush() {
+            if (!M.connected || !M.storage?.available || M.flushing) return M.flushing;
+            M.flushing = (async () => {
+              const blocked = new Set();
+              for (const op of await M.storage.pending(M.namespace)) {
+                if (op.status === "conflict") { blocked.add(op.target); continue; }
+                if (blocked.has(op.target)) continue;
+                try {
+                  const result = await api("/api/action", {...op.body, expected_value_version: versionFor(M.data, op.values)});
+                  M.data = patchConfirmedValue(M.data, result); await M.storage.remove(op.id); dropPending(op.target); notify("Alteração pendente salva no PC.");
+                } catch (error) {
+                  if (error.value?.conflict) { await M.storage.update(op.id, {status: "conflict", server: error.value}); M.p.conflict ||= {id: op.id, target: op.target, values: op.values, body: op.body, server: error.value}; blocked.add(op.target); }
+                  else break;
+                }
+              }
+              persist(); render();
+            })();
+            try { await M.flushing; } finally { M.flushing = null; }
+          }
+          ''',
+          '''async function flush() {
+            if (!M.connected || !M.storage?.available || M.flushing) return M.flushing;
+            M.flushing = (async () => {
+              const blocked = new Set();
+              const operations = await M.storage.pending(M.namespace);
+              for (let index = 0; index < operations.length; index += 1) {
+                const op = operations[index];
+                if (op.status === "conflict") { blocked.add(op.target); continue; }
+                if (blocked.has(op.target)) continue;
+                try {
+                  // Replay the exact request first. If the response was lost,
+                  // the same request_id recovers the persistent receipt. Never
+                  // substitute the newest PC version before the server decides.
+                  const result = await api("/api/action", op.body);
+                  M.data = patchConfirmedValue(M.data, result);
+                  await M.storage.remove(op.id);
+                  dropPending(op.target);
+
+                  // Successive intents for the same semantic target are a
+                  // dependency chain. Only the next one is rebased onto the
+                  // version confirmed by this operation; when it succeeds it
+                  // will advance the following dependent in turn.
+                  const dependent = rebaseNextDependent(operations, index, op.target, result.value_version);
+                  if (dependent) {
+                    operations[dependent.index] = dependent.operation;
+                    await M.storage.update(dependent.operation.id, {
+                      values: dependent.operation.values,
+                      body: dependent.operation.body,
+                    });
+                  }
+                  notify("Alteração pendente salva no PC.");
+                } catch (error) {
+                  if (error.value?.conflict) { await M.storage.update(op.id, {status: "conflict", server: error.value}); M.p.conflict ||= {id: op.id, target: op.target, values: op.values, body: op.body, server: error.value}; blocked.add(op.target); }
+                  else break;
+                }
+              }
+              persist(); render();
+            })();
+            try { await M.flushing; } finally { M.flushing = null; }
+          }
+          ''')
+
+          replace('ui/companion/app.js',
+          '''  if (["complete","favorite","reveal","checkpoint"].includes(a)) return submit({kind:"progress",action:a === "complete" ? "complete" : a === "favorite" ? "favorite" : a === "reveal" ? "reveal" : "checkpoint",value:a === "reveal" || a === "checkpoint" ? true : button.dataset.value === "true",target:{block_id:button.dataset.block}});''',
+          '''  if (["complete","favorite","reveal","checkpoint"].includes(a)) {
+              const action = a === "complete" ? "complete" : a === "favorite" ? "favorite" : a === "reveal" ? "reveal" : "checkpoint";
+              const value = action === "checkpoint" ? button.dataset.block : action === "reveal" ? true : button.dataset.value === "true";
+              return submit({kind:"progress",action,value,target:{block_id:button.dataset.block}});
+            }''')
+
+          # ---- smart_guide.py ----
+          replace('smart_guide.py',
+          '''        if action not in {"complete", "favorite", "reveal", "checkpoint"} or not isinstance(value, bool):
+                    raise SmartGuideError("Comando de progresso inválido.")
+                request_id = _clean_text(request_id, 120)
+          ''',
+          '''        if action not in {"complete", "favorite", "reveal", "checkpoint"}:
+                    raise SmartGuideError("Comando de progresso inválido.")
+                if action == "checkpoint":
+                    if isinstance(value, str):
+                        desired_value = _clean_text(value, 100)
+                        if desired_value and desired_value != _clean_text(block_id, 100):
+                            raise SmartGuideError("Ponto de retomada inválido.")
+                    elif isinstance(value, bool):
+                        # Compatibility with protocol-v2 clients created before
+                        # checkpoint became an absolute guide-scoped value.
+                        desired_value = block_id if value else ""
+                    else:
+                        raise SmartGuideError("Ponto de retomada inválido.")
+                else:
+                    if not isinstance(value, bool):
+                        raise SmartGuideError("Comando de progresso inválido.")
+                    desired_value = value
+                request_id = _clean_text(request_id, 120)
+          ''')
+
+          replace('smart_guide.py',
+          '''        state = self.progress(slug); target = f"progress:{action}:{block_id}"
+                # Progress uses a sidecar version file in the guide directory because
+          ''',
+          '''        state = self.progress(slug)
+                target = "progress:checkpoint" if action == "checkpoint" else f"progress:{action}:{block_id}"
+                # Progress uses a sidecar version file in the guide directory because
+          ''')
+
+          replace('smart_guide.py',
+          '''        previous = receipts.get(request_id); fingerprint = _json_hash({"target": target, "value": value})
+          ''',
+          '''        previous = receipts.get(request_id); fingerprint = _json_hash({"target": target, "value": desired_value})
+          ''')
+
+          replace('smart_guide.py',
+          '''            key = {"complete": "completed", "favorite": "favorites", "reveal": "revealed_spoilers"}.get(action)
+                    actual = block_id in set(state.get(key) or []) if key else state.get("checkpoint") == block_id
+                    raise SmartGuideConflict("Esta marcação mudou no PC ou em outro celular.", target=target, value=actual, value_version=version)
+                if action == "checkpoint": state["checkpoint"] = block_id
+          ''',
+          '''            key = {"complete": "completed", "favorite": "favorites", "reveal": "revealed_spoilers"}.get(action)
+                    actual = block_id in set(state.get(key) or []) if key else str(state.get("checkpoint") or "")
+                    raise SmartGuideConflict("Esta marcação mudou no PC ou em outro celular.", target=target, value=actual, value_version=version)
+                if action == "checkpoint": state["checkpoint"] = desired_value
+          ''')
+
+          replace('smart_guide.py',
+          '''        version += 1; versions[target] = version; receipts[request_id] = {"fingerprint": fingerprint, "value": value, "value_version": version}
+                state["value_versions"] = versions; state["receipts"] = dict(list(receipts.items())[-256:]); state["updated_at"] = _now()
+                _atomic_json(self._path(slug, "progress.json"), state)
+                return {"progress": state, "target": target, "value": value, "value_version": version,
+          ''',
+          '''        version += 1; versions[target] = version; receipts[request_id] = {"fingerprint": fingerprint, "value": desired_value, "value_version": version}
+                state["value_versions"] = versions; state["receipts"] = dict(list(receipts.items())[-256:]); state["updated_at"] = _now()
+                _atomic_json(self._path(slug, "progress.json"), state)
+                return {"progress": state, "target": target, "value": desired_value, "value_version": version,
+          ''')
+
+          replace('smart_guide.py',
+          '''        if action in {"complete", "favorite", "reveal", "checkpoint"} and block_id:
+                    target = f"progress:{action}:{block_id}"
+                    versions = progress.setdefault("value_versions", {})
+          ''',
+          '''        if action in {"complete", "favorite", "reveal", "checkpoint"} and block_id:
+                    target = "progress:checkpoint" if action == "checkpoint" else f"progress:{action}:{block_id}"
+                    versions = progress.setdefault("value_versions", {})
+          ''')
+
+          # ---- companion.py: versioned device registry and request scope ----
+          replace('companion.py',
+          '''from flask import Flask, jsonify, request, send_file, send_from_directory''',
+          '''from flask import Flask, g, jsonify, request, send_file, send_from_directory''')
+
+          replace('companion.py',
+          '''    def __init__(self, path: Path):
+                self.path = Path(path)
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self._connection() as conn:
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS companion_devices (
+                            device_id TEXT PRIMARY KEY,
+                            account_id TEXT NOT NULL,
+                            token_hash TEXT NOT NULL UNIQUE,
+                            name TEXT NOT NULL,
+                            created_at REAL NOT NULL,
+                            seen_at REAL NOT NULL,
+                            expires_at REAL NOT NULL,
+                            revoked_at REAL
+                        )
+                    """)
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_companion_device_token ON companion_devices(token_hash)")
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS companion_meta (
+                            name TEXT PRIMARY KEY,
+                            value TEXT NOT NULL
+                        )
+                    """)
+
+                def _connection(self):
+          ''',
+          '''    SCHEMA_VERSION = 1
+
+                def __init__(self, path: Path):
+                    self.path = Path(path)
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    self._migrate()
+
+                def _migrate(self):
+                    with self._connection() as conn:
+                        conn.execute("""
+                            CREATE TABLE IF NOT EXISTS companion_meta (
+                                name TEXT PRIMARY KEY,
+                                value TEXT NOT NULL
+                            )
+                        """)
+                        row = conn.execute("SELECT value FROM companion_meta WHERE name = 'schema_version'").fetchone()
+                        try:
+                            version = int(row[0]) if row else 0
+                        except (TypeError, ValueError):
+                            version = 0
+                        if version > self.SCHEMA_VERSION:
+                            raise RuntimeError("Cadastro de aparelhos foi criado por uma versão mais nova do DigiTracker.")
+                        if version < 1:
+                            conn.execute("""
+                                CREATE TABLE IF NOT EXISTS companion_devices (
+                                    device_id TEXT PRIMARY KEY,
+                                    account_id TEXT NOT NULL,
+                                    token_hash TEXT NOT NULL UNIQUE,
+                                    name TEXT NOT NULL,
+                                    created_at REAL NOT NULL,
+                                    seen_at REAL NOT NULL,
+                                    expires_at REAL NOT NULL,
+                                    revoked_at REAL
+                                )
+                            """)
+                            conn.execute("CREATE INDEX IF NOT EXISTS idx_companion_device_token ON companion_devices(token_hash)")
+                            conn.execute("INSERT INTO companion_meta(name, value) VALUES ('schema_version', ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                                         (str(self.SCHEMA_VERSION),))
+
+                def _connection(self):
+          ''')
+
+          # add scoped request helper after _account
+          replace('companion.py',
+          '''    def _account(self):
+                return str(self.account_provider() or "local")[:200]
+
+            def _allowed_hosts(self):
+          ''',
+          '''    def _account(self):
+                return str(self.account_provider() or "local")[:200]
+
+            def _scoped_request_id(self, session, slug, request_id):
+                raw_id = str(request_id or "").strip()
+                if not raw_id:
+                    return ""
+                device = str((session or {}).get("device_id") or (session or {}).get("id") or "temporary")
+                scope = "|".join((self.installation_id, self._account(), device, str(slug or ""), raw_id))
+                return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
+            def _allowed_hosts(self):
+          ''')
+
+          replace('companion.py',
+          '''                    if not session or session["expires"] < now or session.get("account_id") != self._account():
+                            return jsonify(ok=False, error="Conexão encerrada. Faça o pareamento novamente."), 401
+                        session["seen_at"] = now
+          ''',
+          '''                    if not session or session["expires"] < now or session.get("account_id") != self._account():
+                            return jsonify(ok=False, error="Conexão encerrada. Faça o pareamento novamente."), 401
+                        session["seen_at"] = now
+                        g.companion_session = dict(session)
+          ''')
+
+          replace('companion.py',
+          '''        @app.post("/api/action")
+                def action():
+                    body = request.get_json()
+                    if not isinstance(body, dict):
+                        return jsonify(ok=False, error="Comando inválido."), 400
+                    try:
+                        result = self.command(body)
+                        return jsonify(result), (409 if result.get("conflict") else 200)
+          ''',
+          '''        @app.post("/api/action")
+                def action():
+                    body = request.get_json()
+                    if not isinstance(body, dict):
+                        return jsonify(ok=False, error="Comando inválido."), 400
+                    body = dict(body)
+                    client_request_id = str(body.get("request_id") or "").strip()
+                    if client_request_id:
+                        body["request_id"] = self._scoped_request_id(
+                            getattr(g, "companion_session", {}), body.get("slug") or "", client_request_id)
+                    try:
+                        result = self.command(body)
+                        if client_request_id and isinstance(result, dict) and result.get("request_id") == body.get("request_id"):
+                            result = dict(result)
+                            result["request_id"] = client_request_id
+                        return jsonify(result), (409 if result.get("conflict") else 200)
+          ''')
+
+          replace('companion.py',
+          '''            if include_qr and self.pair_code:
+                        import qrcode
+                        stream = io.BytesIO()
+                        qrcode.make(result["url"] + "/#pair=" + self.pair_code).save(stream, format="PNG")
+                        result["qr"] = "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()
+          ''',
+          '''            if include_qr and self.pair_code:
+                        import qrcode
+                        stream = io.BytesIO()
+                        # Prefer the stable mDNS origin when it was actually
+                        # registered. The IP URL remains visible as the manual
+                        # fallback and we never pretend cookies transfer between
+                        # those two origins.
+                        pair_base = result.get("canonical_url") or result["url"]
+                        result["pairing_url"] = pair_base + "/#pair=" + self.pair_code
+                        qrcode.make(result["pairing_url"]).save(stream, format="PNG")
+                        result["qr"] = "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()
+          ''')
+
+          # ---- tests/test_smart_guide.py ----
+          p = Path('tests/test_smart_guide.py')
+          text = p.read_text(encoding='utf-8')
+          text += '''\n\ndef test_checkpoint_version_is_scoped_to_the_guide(tmp_path):
+              store = smart_guide.SmartGuideStore(tmp_path)
+              store.ensure_source("jogo", "Jogo", SECTIONS)
+              blocks = [block["id"] for chapter in store.current("jogo")["chapters"] for block in chapter["blocks"]]
+              first, second = blocks[:2]
+
+              saved = store.update_progress_versioned(
+                  "jogo", "checkpoint", first, first,
+                  request_id="phone-a-1", expected_value_version=0,
+              )
+              assert saved["target"] == "progress:checkpoint"
+              assert saved["value"] == first
+              assert saved["value_version"] == 1
+
+              with pytest.raises(smart_guide.SmartGuideConflict) as conflict:
+                  store.update_progress_versioned(
+                      "jogo", "checkpoint", second, second,
+                      request_id="phone-a-2", expected_value_version=0,
+                  )
+              assert conflict.value.target == "progress:checkpoint"
+              assert conflict.value.value == first
+              assert conflict.value.value_version == 1
+
+              moved = store.update_progress_versioned(
+                  "jogo", "checkpoint", second, second,
+                  request_id="phone-a-3", expected_value_version=1,
+              )
+              assert moved["value"] == second
+              assert store.progress("jogo")["checkpoint"] == second
+          '''
+          p.write_text(text, encoding='utf-8', newline='\n')
+
+          # ---- tests/test_experience.py ----
+          p = Path('tests/test_experience.py')
+          text = p.read_text(encoding='utf-8')
+          text += '''\n\ndef test_companion_request_identity_is_scoped_to_device_account_and_game(server):
+              a = {"id": "session-a", "device_id": "phone-a"}
+              b = {"id": "session-b", "device_id": "phone-b"}
+              first = server._scoped_request_id(a, "game-a", "same-client-id")
+              assert first == server._scoped_request_id(a, "game-a", "same-client-id")
+              assert first != server._scoped_request_id(b, "game-a", "same-client-id")
+              assert first != server._scoped_request_id(a, "game-b", "same-client-id")
+
+
+def test_companion_registry_records_schema_version(tmp_path):
+              registry = companion.DeviceRegistry(tmp_path / "companion.sqlite3")
+              with registry._connection() as conn:
+                  row = conn.execute("SELECT value FROM companion_meta WHERE name = 'schema_version'").fetchone()
+              assert row and int(row[0]) == companion.DeviceRegistry.SCHEMA_VERSION
+          '''
+          p.write_text(text, encoding='utf-8', newline='\n')
+
+          # ---- tests/companion_ui_smoke.cjs ----
+          replace('tests/companion_ui_smoke.cjs',
+          '''      const state = await import("./state.js");''',
+          '''      const state = await import("./state.js");''')
+          replace('tests/companion_ui_smoke.cjs',
+          '''      return {fallbackId, firstVersion, replayVersion};
+              });
+          ''',
+          '''      const operations = [
+                {id: "one", target: "progress:checkpoint", status: "pending", values: {_expectedValueVersion: 0}, body: {expected_value_version: 0}},
+                {id: "two", target: "progress:checkpoint", status: "pending", values: {_expectedValueVersion: 0}, body: {expected_value_version: 0}},
+                {id: "three", target: "item:x", status: "pending", values: {_expectedValueVersion: 4}, body: {expected_value_version: 4}},
+              ];
+              const rebased = state.rebaseNextDependent(operations, 0, "progress:checkpoint", 1);
+              const checkpointTarget = state.targetKey({kind: "progress", action: "checkpoint", target: {block_id: "block-a"}});
+              return {fallbackId, firstVersion, replayVersion, rebased, checkpointTarget};
+            });
+          ''')
+          replace('tests/companion_ui_smoke.cjs',
+          '''    assert.equal(stateChecks.replayVersion, 2,
+              "Queued operations must keep their original expected version so reconnect exposes a conflict instead of overwriting PC state");
+          ''',
+          '''    assert.equal(stateChecks.replayVersion, 2,
+              "Queued operations must keep their original expected version so reconnect exposes a conflict instead of overwriting PC state");
+            assert.equal(stateChecks.checkpointTarget, "progress:checkpoint", "Checkpoint concurrency must be guide-scoped");
+            assert.equal(stateChecks.rebased.index, 1, "Only the next dependent operation should be rebased");
+            assert.equal(stateChecks.rebased.operation.body.expected_value_version, 1,
+              "The next same-target offline intent must advance from the version confirmed by its predecessor");
+          ''')
+
+          print('Mobile E protocol continuation applied.')
+          PY
+
+      - name: Syntax checks
+        run: |
+          python -m py_compile companion.py smart_guide.py experience_api.py
+          node --check ui/companion/app.js
+          node --check ui/companion/state.js
+          node --check ui/companion/storage.js
+          node --check tests/companion_ui_smoke.cjs
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Targeted tests
+        run: python -m pytest tests/test_smart_guide.py tests/test_experience.py tests/test_item_catalog.py -q
+
+      - name: Full test suite
+        run: python -m pytest tests/ -q
+
+      - name: Commit validated continuation
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add companion.py smart_guide.py ui/companion/app.js ui/companion/state.js tests/test_smart_guide.py tests/test_experience.py tests/companion_ui_smoke.cjs
+          if git diff --cached --quiet; then
+            echo "No product changes to commit."
+            exit 0
+          fi
+          git commit -m "fix: complete mobile command concurrency contracts"
+          git push origin HEAD:feat/mobile-step8-integration
