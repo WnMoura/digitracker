@@ -17,14 +17,16 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
-      - name: Apply connection and polling patch
-        run: python tools/mobile_e_phase2_patch.py
+      - name: Apply reader and navigation patch
+        run: |
+          python tools/mobile_e_phase3_patch.py
+          python tools/mobile_e_phase3_finalize.py
       - name: Syntax checks
         run: |
           python -m py_compile companion.py experience_api.py
           node --check ui/companion/app.js
-          node --check ui/experience.js
-      - name: Install dependencies
+          node --check tests/companion_ui_smoke.cjs
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-dev.txt
@@ -32,11 +34,24 @@ jobs:
         run: python -m pytest tests/test_experience.py -q
       - name: Full suite
         run: python -m pytest tests/ -q
+      - name: Install browser test runtime
+        run: |
+          npm install --no-save playwright@1.62.0
+          npx playwright install --with-deps chromium webkit
+      - name: Companion smoke Chromium and WebKit
+        shell: bash
+        run: |
+          python -m http.server 8781 --directory ui/companion > /tmp/companion-http.log 2>&1 &
+          server_pid=$!
+          trap 'kill $server_pid || true' EXIT
+          for i in {1..20}; do curl -fsS http://127.0.0.1:8781/index.html >/dev/null && break; sleep 0.25; done
+          PW_ENGINE=chromium node tests/companion_ui_smoke.cjs http://127.0.0.1:8781
+          PW_ENGINE=webkit node tests/companion_ui_smoke.cjs http://127.0.0.1:8781
       - name: Commit validated product changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add companion.py experience_api.py ui/companion/app.js ui/experience.js tests/test_experience.py
+          git add companion.py ui/companion/app.js ui/companion/style.css tests/test_experience.py tests/companion_ui_smoke.cjs
           if git diff --cached --quiet; then exit 0; fi
-          git commit -m "feat: add selective mobile polling and device recovery"
+          git commit -m "feat: complete mobile reader navigation contracts"
           git push origin HEAD:feat/mobile-step8-integration
