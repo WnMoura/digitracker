@@ -257,17 +257,30 @@ class ExperienceApi:
             next_objective = {}
         with self._companion_ai_lock:
             answer = copy.deepcopy(self._companion_ai.get(slug) or {})
+        chapters = document.get("chapters") or []
+        media = [{"id": item.get("id"), "url": item.get("url"), "title": item.get("title")}
+                 for item in bundle.get("media") or [] if item.get("status") != "rejected"]
+        achievements = copy.deepcopy(game.get("achievements") or [])
+        game_public = {key: game.get(key) for key in ("slug", "title", "platform", "art", "mastery", "completion")}
+        revisions = {
+            "guide": smart_guide._json_hash([definition_revision, chapters, progress_public, next_objective]),
+            "atlas": smart_guide._json_hash([definition_revision, systems, public_system_state]),
+            "items": smart_guide._json_hash([items_revision, items]),
+            "media": smart_guide._json_hash(media),
+            "achievements": smart_guide._json_hash(achievements),
+            "assistant": smart_guide._json_hash(answer),
+            "games": smart_guide._json_hash([games_public, self._active_slug]),
+        }
         return {"ok": True, "api_version": 2, "version": version,
                 "definition_revision": definition_revision, "content_revision": content_revision,
-                "progress_revision": progress_revision,
-                "game": {key: game.get(key) for key in ("slug", "title", "platform", "art", "mastery", "completion")},
-                "games": games_public,
-                "chapters": document.get("chapters") or [], "systems": systems,
-                "media": [{"id": item.get("id"), "url": item.get("url"), "title": item.get("title")} for item in bundle.get("media") or [] if item.get("status") != "rejected"],
+                "progress_revision": progress_revision, "revisions": revisions,
+                "active_pc_slug": self._active_slug,
+                "game": game_public, "games": games_public,
+                "chapters": chapters, "systems": systems, "media": media,
                 "progress": progress_public,
                 "system_state": public_system_state, "objective": next_objective,
                 "items": items, "items_revision": items_revision,
-                "missables": game.get("pending_missables") or [], "achievements": game.get("achievements") or [], "answer": answer}
+                "missables": game.get("pending_missables") or [], "achievements": achievements, "answer": answer}
 
     def _companion_command(self, body):
         kind, slug = body.get("kind"), str(body.get("slug") or "")

@@ -228,3 +228,39 @@ def test_companion_registry_records_schema_version(tmp_path):
     with registry._connection() as conn:
         row = conn.execute("SELECT value FROM companion_meta WHERE name = 'schema_version'").fetchone()
     assert row and int(row[0]) == companion.DeviceRegistry.SCHEMA_VERSION
+
+
+def test_companion_light_revisions_and_resource_endpoints(tmp_path):
+    snapshot = {
+        "ok": True,
+        "game": {"slug": "a", "title": "A"},
+        "games": [{"slug": "a", "title": "A"}, {"slug": "b", "title": "B"}],
+        "active_pc_slug": "b",
+        "revisions": {"guide": "g1", "atlas": "a1", "items": "i1", "media": "m1", "achievements": "h1", "assistant": "q1", "games": "l1"},
+        "chapters": [], "progress": {}, "objective": {}, "systems": [], "system_state": {},
+        "items": [], "items_revision": 0,
+        "media": [{"id": "cover", "url": "/assets/cover.png", "title": "Cover"}],
+        "achievements": [], "answer": {"answer": "ok"},
+    }
+    service = companion.CompanionServer(tmp_path / "ui", tmp_path / "assets", lambda slug: dict(snapshot), lambda body: {"ok": True})
+    service.host, service.port = "127.0.0.1", 8766
+    client = client_for(service)
+    pair(service, client)
+    revisions = request(client, "/api/revisions?slug=a").json
+    assert revisions["revisions"]["media"] == "m1" and revisions["active_pc_slug"] == "b"
+    games = request(client, "/api/games?slug=a").json
+    assert [row["slug"] for row in games["games"]] == ["a", "b"]
+    assert games["active_slug"] == "b" and games["selected_slug"] == "a"
+    assert request(client, "/api/media?slug=a").json["media"][0]["id"] == "cover"
+    assert request(client, "/api/assistant?slug=a").json["answer"]["answer"] == "ok"
+
+
+def test_remembered_device_restore_reports_explicit_reason(tmp_path):
+    registry = companion.DeviceRegistry(tmp_path / "companion.sqlite3")
+    assert registry.restore_status("", "account")[1] == "missing_device"
+    assert registry.restore_status("unknown", "account")[1] == "unknown_device"
+    token = "remember-me"
+    item = registry.remember("account", "Phone", token, now=100)
+    assert registry.restore_status(token, "other", now=101)[1] == "account_changed"
+    registry.revoke(item["id"], "account")
+    assert registry.restore_status(token, "account", now=102)[1] == "revoked"

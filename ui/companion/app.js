@@ -7,10 +7,10 @@ const content = document.getElementById("content");
 const tabs = document.getElementById("tabs");
 const connection = document.getElementById("connection");
 const messageBox = document.getElementById("message");
-const M = {data: null, storage: null, namespace: "", loadedNamespace: "", connected: false, refreshing: false, retry: 0, retryTimer: 0, flushing: null, message: "", error: false, drafts: {question: "", items: {}}, p: defaults()};
+const M = {data: null, revisions: {}, storage: null, namespace: "", loadedNamespace: "", connected: false, refreshing: false, retry: 0, retryTimer: 0, flushing: null, message: "", error: false, drafts: {question: "", items: {}}, p: defaults()};
 
 function defaults() {
-  return {view: "home", history: [], gameSlug: "", guideMode: "read", guideBlockId: "", atlasMode: "systems", atlasQuery: "", atlasSystemId: "", atlasNodeId: "", atlasEdgeId: "", itemFilter: "all", itemQuery: "", itemId: "", search: false, query: "", library: false, moreMode: "menu", assistant: false, source: null, conflict: null, recent: [], pending: []};
+  return {view: "home", history: [], gameSlug: "", guideMode: "read", guideBlockId: "", atlasMode: "systems", atlasQuery: "", atlasSystemId: "", atlasNodeId: "", atlasEdgeId: "", itemFilter: "all", itemQuery: "", itemId: "", search: false, query: "", library: false, moreMode: "menu", assistant: false, source: null, conflict: null, forget: null, recent: [], pending: []};
 }
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const num = (node, fallback = 0) => String(Number(node?.card_number || fallback || 0)).padStart(3, "0");
@@ -54,7 +54,7 @@ let saveTimer = 0;
 function persist() {
   if (!M.storage?.available || !M.namespace) return;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { const value = globalThis.structuredClone ? structuredClone(M.p) : JSON.parse(JSON.stringify(M.p)); delete value.pending; M.storage.setPresentation(M.namespace, value).catch(() => notify("Não foi possível guardar a navegação neste aparelho.", true)); }, 120);
+  saveTimer = setTimeout(() => { const value = globalThis.structuredClone ? structuredClone(M.p) : JSON.parse(JSON.stringify(M.p)); delete value.pending; delete value.forget; M.storage.setPresentation(M.namespace, value).catch(() => notify("Não foi possível guardar a navegação neste aparelho.", true)); }, 120);
 }
 async function restorePresentation() {
   if (!M.namespace || M.namespace === M.loadedNamespace) return;
@@ -72,30 +72,74 @@ function selections() {
   if (!(system?.edges || []).some((row) => row.id === M.p.atlasEdgeId)) M.p.atlasEdgeId = (system?.edges || []).find((row) => row.to === M.p.atlasNodeId || row.from === M.p.atlasNodeId)?.id || "";
   M.p.gameSlug = slug();
 }
+function retryAfterSeconds(response) {
+  const raw = response?.headers?.get?.("Retry-After");
+  if (!raw) return 0;
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric) && numeric >= 0) return Math.min(60, numeric);
+  const date = Date.parse(raw);
+  return Number.isFinite(date) ? Math.max(0, Math.min(60, (date - Date.now()) / 1000)) : 0;
+}
 async function api(path, body) {
-  const response = await fetch(path, {method: body === undefined ? "GET" : "POST", headers: body === undefined ? {} : {"Content-Type": "application/json"}, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin"});
+  const response = await fetch(path, {method: body === undefined ? "GET" : "POST", headers: body === undefined ? {} : {"Content-Type":"application/json"}, body: body === undefined ? undefined : JSON.stringify(body), credentials:"same-origin"});
   let value = {}; try { value = await response.json(); } catch (_) {}
-  if (!response.ok || value.ok === false) { const error = new Error(value.error || "Não foi possível falar com o DigiTracker."); error.status = response.status; error.value = value; throw error; }
+  if (!response.ok || value.ok === false) { const error = new Error(value.error || "Não foi possível falar com o DigiTracker."); error.status=response.status; error.value=value; error.retryAfter=retryAfterSeconds(response); throw error; }
   return value;
 }
-async function restoreSession() { try { await api("/session/restore", {}); return true; } catch (_) { return false; } }
-function retry() {
-  clearTimeout(M.retryTimer); const seconds = [1,2,4,8,15,30][Math.min(M.retry++, 5)];
-  M.retryTimer = setTimeout(() => refresh(false), seconds * 1000 + Math.floor(Math.random() * 250));
+async function restoreSession() {
+  try { await api("/session/restore", {}); return "restored"; }
+  catch (error) { return error.status === 401 && error.value?.needs_pairing ? "needs-pairing" : "temporary"; }
+}
+function retry(minimum = 0) {
+  clearTimeout(M.retryTimer); const backoff=[1,2,4,8,15,30][Math.min(M.retry++,5)];
+  const seconds=Math.max(Number(minimum)||0,backoff);
+  M.retryTimer=setTimeout(()=>M.data?poll(true):refresh(true),seconds*1000+Math.floor(Math.random()*250));
+}
+function query(path) { const mark=path.includes("?")?"&":"?"; return `${path}${mark}slug=${encodeURIComponent(slug())}`; }
+async function paged(path, key) {
+  const rows=[]; let offset=0, total=0;
+  do { const response=await api(query(`${path}?offset=${offset}&limit=100`)); const page=response[key]||[]; rows.push(...page); total=Number(response.total??rows.length); offset+=page.length; if(!page.length)break; } while(rows.length<total);
+  return rows;
+}
+function scrubPresentation() {
+  const visibleGuide=new Set(guideBlocks(M.data).filter(row=>!row.hidden).map(row=>row.id));
+  const visibleAtlas=new Set((M.data?.systems||[]).flatMap(system=>(system.nodes||[]).map(node=>node.id)));
+  const visibleItems=new Set((M.data?.items||[]).map(item=>item.id));
+  M.p.recent=(M.p.recent||[]).filter(row=>row.kind==="guide"?visibleGuide.has(row.id):row.kind==="atlas"?visibleAtlas.has(row.id):row.kind==="item"?visibleItems.has(row.id):false).slice(0,5);
 }
 async function refresh(draw = true) {
-  if (M.refreshing || document.hidden) return; M.refreshing = true;
+  if (M.refreshing || document.hidden) return; M.refreshing=true;
   try {
-    const response = await fetch(`/api/state${slug() ? `?slug=${encodeURIComponent(slug())}` : ""}`, {credentials: "same-origin"});
-    let value = {}; try { value = await response.json(); } catch (_) {}
-    if (response.status === 401 && await restoreSession()) { M.refreshing = false; return refresh(draw); }
-    if (!response.ok || !value.ok) throw new Error(value.error || "Conexão indisponível.");
-    const ns = namespaceFor(value, slug() || value.game?.slug); const changed = ns !== M.namespace;
-    M.data = value; M.namespace = ns; M.retry = 0; setConnected(true);
-    if (changed) await restorePresentation(); selections();
-    if (draw) render(); flush().catch(() => {});
-  } catch (error) { setConnected(false); if (draw && !M.data) disconnected(error.message); retry(); }
-  finally { M.refreshing = false; }
+    const response=await fetch(`/api/state${slug()?`?slug=${encodeURIComponent(slug())}`:""}`,{credentials:"same-origin"});
+    let value={}; try{value=await response.json();}catch(_){}
+    if(response.status===401){const restored=await restoreSession();if(restored==="restored"){M.refreshing=false;return refresh(draw);}if(restored==="needs-pairing"){setConnected(false);if(draw)disconnected("Este aparelho precisa ser pareado novamente.");return;} }
+    if(!response.ok||!value.ok){const error=new Error(value.error||"Conexão indisponível.");error.retryAfter=retryAfterSeconds(response);throw error;}
+    const ns=namespaceFor(value,slug()||value.game?.slug), changed=ns!==M.namespace;
+    M.data=value;M.revisions={...(value.revisions||{})};M.namespace=ns;M.retry=0;setConnected(true);
+    if(changed)await restorePresentation();selections();scrubPresentation();
+    if(draw)render();flush().catch(()=>{});
+  } catch(error){setConnected(false);if(draw&&!M.data)disconnected(error.message);retry(error.retryAfter);}
+  finally{M.refreshing=false;}
+}
+async function poll(draw = true) {
+  if(M.refreshing||document.hidden||!M.data)return;M.refreshing=true;
+  try {
+    let revisionState;
+    try { revisionState=await api(query("/api/revisions")); }
+    catch(error){if(error.status===401){const restored=await restoreSession();if(restored==="restored"){M.refreshing=false;return poll(draw);}if(restored==="needs-pairing"){setConnected(false);if(draw)disconnected("Este aparelho precisa ser pareado novamente.");return;}}throw error;}
+    const next=revisionState.revisions||{}, changed=Object.keys(next).filter(key=>next[key]!==M.revisions[key]);
+    if(changed.includes("guide")){const r=await api(query("/api/guide"));M.data.chapters=r.chapters||[];M.data.progress=r.progress||{};M.data.objective=r.objective||{};}
+    if(changed.includes("atlas")){const r=await api(query("/api/atlas/systems"));M.data.systems=r.systems||[];M.data.system_state=r.system_state||{};}
+    if(changed.includes("items"))M.data.items=await paged("/api/items","items");
+    if(changed.includes("media")){const r=await api(query("/api/media"));M.data.media=r.media||[];}
+    if(changed.includes("achievements"))M.data.achievements=await paged("/api/achievements","achievements");
+    if(changed.includes("assistant")){const r=await api(query("/api/assistant"));M.data.answer=r.answer||{};}
+    if(changed.includes("games")){const r=await api(query("/api/games"));M.data.games=r.games||[];M.data.active_pc_slug=r.active_slug||"";const selected=M.data.games.find(game=>game.slug===slug());if(selected)M.data.game=selected;}
+    M.revisions={...next};M.data.revisions={...next};M.retry=0;setConnected(true);selections();scrubPresentation();
+    if(draw&&changed.length)render();
+    flush().catch(()=>{});
+  }catch(error){setConnected(false);retry(error.retryAfter);}
+  finally{M.refreshing=false;}
 }
 function disconnected(detail) {
   tabs.hidden = true;
@@ -286,7 +330,7 @@ function render() {
   if (!M.data?.ok) return;
   tabs.hidden = false;
   tabs.querySelectorAll("button").forEach((button) => { const active = button.dataset.tab === M.p.view; button.classList.toggle("active", active); button.setAttribute("aria-current", active ? "page" : "false"); });
-  content.innerHTML = `<div class="mobile-screen">${body()}</div>${M.p.search ? search() : ""}${M.p.library ? library() : ""}${sourceModal()}${conflictModal()}`; setConnected(M.connected);
+  content.innerHTML = `<div class="mobile-screen">${body()}</div>${M.p.search ? search() : ""}${M.p.library ? library() : ""}${sourceModal()}${conflictModal()}${forgetModal()}`; setConnected(M.connected);
 }
 function nav(view) { if (M.p.view !== view) M.p.history = [...M.p.history, M.p.view].slice(-20); M.p.view = view; window.scrollTo({top:0,behavior:"instant"}); persist(); render(); }
 async function ask(form) {
@@ -296,11 +340,23 @@ async function ask(form) {
   M.drafts.question = question;
   try { await api("/api/action", {kind:"ask",slug:slug(),block_id:values.get("block"),question}); notify("Pergunta enviada ao PC."); render(); } catch (error) { notify(error.message,true); }
 }
-async function forget() {
-  const rows = await M.storage?.pending(M.namespace) || [];
-  if (rows.length && !confirm("Há alterações pendentes. Descartar as pendências e esquecer este aparelho?")) return;
-  for (const row of rows) await M.storage.remove(row.id);
-  try { await api("/api/device/forget", {}); M.connected = false; M.p.pending = []; notify("Aparelho esquecido. Leia um novo QR Code para reconectar."); disconnected("Este aparelho foi removido do DigiTracker."); } catch (error) { notify(error.message,true); }
+async function forget(mode = "ask") {
+  const rows=await M.storage?.pending(M.namespace)||[];
+  if(rows.length&&mode==="ask"){M.p.forget={count:rows.length};return render();}
+  if(mode==="cancel"){M.p.forget=null;return render();}
+  if(rows.length&&mode==="sync"){
+    if(!M.connected)return notify("Reconecte ao PC para sincronizar antes de esquecer este aparelho.",true);
+    await flush();const remaining=await M.storage?.pending(M.namespace)||[];
+    if(remaining.length){M.p.forget={count:remaining.length};notify("Ainda há pendências ou conflitos. Revise-os ou descarte antes de esquecer.",true);return render();}
+  }
+  if(mode==="discard")for(const row of rows)await M.storage.remove(row.id);
+  const remaining=await M.storage?.pending(M.namespace)||[];
+  if(remaining.length)return;
+  try{await api("/api/device/forget",{});M.connected=false;M.p.pending=[];M.p.forget=null;notify("Aparelho esquecido. Leia um novo QR Code para reconectar.");disconnected("Este aparelho foi removido do DigiTracker.");}catch(error){notify(error.message,true);}
+}
+function forgetModal(){
+  const row=M.p.forget;if(!row)return "";
+  return `<div class="modal-backdrop"><section class="mobile-modal" role="dialog" aria-modal="true"><span class="eyebrow">APARELHO</span><h2>Há ${Number(row.count)||0} alteração(ões) pendente(s)</h2><p>Escolha se quer sincronizar com o PC antes de remover a autorização deste aparelho ou descartar apenas estas pendências locais.</p><div class="modal-actions"><button class="outline" data-act="forget-cancel">Cancelar</button><button class="outline" data-act="forget-discard">Descartar e esquecer</button><button class="primary" data-act="forget-sync">Sincronizar antes</button></div></section></div>`;
 }
 async function click(event) {
   const button = event.target.closest("[data-act],[data-tab]"); if (!button) return;
@@ -326,7 +382,10 @@ async function click(event) {
   if (a === "item-filter") { M.p.itemFilter=button.dataset.filter;persist();return render(); }
   if (a === "item-save") { const field=Array.from(content.querySelectorAll("[data-item-input]")).find((row)=>row.dataset.itemInput===button.dataset.item); const raw=String(M.drafts.items[button.dataset.item] ?? field?.value ?? "").trim(), value=raw === "" ? null : Number(raw); if (value !== null && (!Number.isInteger(value)||value<0)) return notify("Informe uma quantidade inteira, zero ou deixe em branco.",true); const item=(M.data.items||[]).find((row)=>row.id===button.dataset.item);rememberRecent("item",button.dataset.item,item?.name || "Item","Inventário"); return submit({kind:"item",value,target:{item_id:button.dataset.item}}); }
   if (a === "more-mode") { M.p.moreMode=button.dataset.mode;persist();return render(); }
-  if (a === "forget") return forget();
+  if (a === "forget") return forget("ask");
+  if (a === "forget-sync") return forget("sync");
+  if (a === "forget-discard") return forget("discard");
+  if (a === "forget-cancel") return forget("cancel");
   if (a === "search-close") { M.p.search=false;persist();return render(); }
   if (a === "library-close") { M.p.library=false;return render(); }
   if (a === "select-game") { M.p={...defaults(),gameSlug:button.dataset.game}; M.loadedNamespace="";notify("Contexto de consulta alterado no telefone.");return refresh(true); }
@@ -385,4 +444,4 @@ async function boot() {
   if(params.get("demo")==="1"){M.demo=true;M.data=demoSnapshot();M.namespace=namespaceFor(M.data,"demo");M.p.gameSlug="demo";selections();setConnected(true);notify("Modo demo: as marcações não são enviadas ao PC.");return render();}
   if(pair){try{await api("/pair",{code:pair,name:/iPad|Tablet/i.test(navigator.userAgent)?"Tablet":"Celular",remember:true});notify("Confirme este aparelho no PC.");const wait=async()=>{try{const value=await api("/pair/status",{});if(value.pending)return setTimeout(wait,1500);refresh(true);}catch(error){notify(error.message,true);disconnected(error.message);}};wait();}catch(error){notify(error.message,true);disconnected(error.message);}}else await refresh(true);
 }
-window.addEventListener("online",()=>refresh(true));window.addEventListener("focus",()=>refresh(false));document.addEventListener("visibilitychange",()=>{if(!document.hidden)refresh(true);});setInterval(()=>{if(M.connected&&!document.hidden)refresh(false);},3000);boot();
+window.addEventListener("online",()=>M.data?poll(true):refresh(true));window.addEventListener("focus",()=>M.data?poll(true):refresh(true));document.addEventListener("visibilitychange",()=>{if(!document.hidden)(M.data?poll(true):refresh(true));});setInterval(()=>{if(M.connected&&!document.hidden)poll(true);},3000);boot();

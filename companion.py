@@ -115,23 +115,32 @@ class DeviceRegistry:
             """, (device_id, item["account_id"], _digest(token), item["name"], now, now, item["expires_at"]))
         return item
 
-    def restore(self, token, account_id, now=None):
+    def restore_status(self, token, account_id, now=None):
         now = time.time() if now is None else now
+        if not token:
+            return None, "missing_device"
         with self._connection() as conn:
             row = conn.execute("""
                 SELECT device_id, account_id, name, created_at, seen_at, expires_at, revoked_at
                 FROM companion_devices WHERE token_hash = ?
             """, (_digest(token),)).fetchone()
             if not row:
-                return None
+                return None, "unknown_device"
             item = dict(zip(("id", "account_id", "name", "created_at", "seen_at", "expires_at", "revoked_at"), row))
-            if item["account_id"] != str(account_id) or item["revoked_at"] is not None or item["expires_at"] < now:
-                return None
+            if item["account_id"] != str(account_id):
+                return None, "account_changed"
+            if item["revoked_at"] is not None:
+                return None, "revoked"
+            if item["expires_at"] < now:
+                return None, "expired"
             expires_at = now + 90 * 86400
             conn.execute("UPDATE companion_devices SET seen_at = ?, expires_at = ? WHERE device_id = ?",
                          (now, expires_at, item["id"]))
             item.update({"seen_at": now, "expires_at": expires_at})
-            return item
+            return item, "ok"
+
+    def restore(self, token, account_id, now=None):
+        return self.restore_status(token, account_id, now)[0]
 
     def devices(self, account_id, now=None):
         now = time.time() if now is None else now
@@ -260,7 +269,10 @@ class CompanionServer:
                 while queue and queue[0] < now - 60:
                     queue.popleft()
                 if len(queue) >= (90 if key[1] == "pair" else 300):
-                    return jsonify(ok=False, error="Aguarde antes de tentar novamente."), 429
+                    response = jsonify(ok=False, error="Aguarde antes de tentar novamente.")
+                    response.status_code = 429
+                    response.headers["Retry-After"] = "1"
+                    return response
                 queue.append(now)
             if request.path.startswith(("/api/", "/assets/")):
                 token = _digest(request.cookies.get("dt_session", ""))
@@ -342,9 +354,10 @@ class CompanionServer:
         @app.post("/session/restore")
         def restore_session():
             device_token = request.cookies.get("dt_device", "")
-            item = self.registry.restore(device_token, self._account()) if device_token else None
+            item, reason = self.registry.restore_status(device_token, self._account())
             if not item:
-                response = jsonify(ok=False, needs_pairing=True, error="Aparelho não autorizado. Leia um novo QR Code.")
+                response = jsonify(ok=False, needs_pairing=True, code=reason,
+                                   error="Aparelho não autorizado. Leia um novo QR Code.")
                 response.delete_cookie("dt_session")
                 response.delete_cookie("dt_device")
                 return response, 401
@@ -387,16 +400,42 @@ class CompanionServer:
             except (TypeError, ValueError):
                 return default
 
+        @app.get("/api/revisions")
+        def revisions():
+            value, error = public_state()
+            if error:
+                return error
+            return jsonify(ok=True, revisions=value.get("revisions") or {},
+                           active_pc_slug=value.get("active_pc_slug", ""),
+                           selected_slug=(value.get("game") or {}).get("slug", ""))
+
+        @app.get("/api/media")
+        def media_state():
+            value, error = public_state()
+            if error:
+                return error
+            return jsonify(ok=True, media=value.get("media") or [],
+                           revision=(value.get("revisions") or {}).get("media", ""))
+
+        @app.get("/api/assistant")
+        def assistant_state():
+            value, error = public_state()
+            if error:
+                return error
+            return jsonify(ok=True, answer=value.get("answer") or {},
+                           revision=(value.get("revisions") or {}).get("assistant", ""))
+
         @app.get("/api/games")
         def games():
             value, error = public_state()
             if error:
                 return error
-            # A companion session is scoped to the PC's active library.  A
-            # slug query may select another permitted game for consultation,
-            # but it never changes the compact game's active session.
-            return jsonify(ok=True, games=[value.get("game") or {}],
-                           active_slug=(value.get("game") or {}).get("slug", ""))
+            # Selecting a slug changes only this mobile projection. The PC's
+            # active compact game is reported separately and never mutated.
+            return jsonify(ok=True, games=value.get("games") or [],
+                           active_slug=value.get("active_pc_slug", ""),
+                           selected_slug=(value.get("game") or {}).get("slug", ""),
+                           revision=(value.get("revisions") or {}).get("games", ""))
 
         @app.get("/api/guide")
         def guide():
@@ -405,7 +444,8 @@ class CompanionServer:
                 return error
             chapters = value.get("chapters") or []
             return jsonify(ok=True, chapters=chapters,
-                           progress=value.get("progress") or {},
+                           progress=value.get("progress") or {}, objective=value.get("objective") or {},
+                           revision=(value.get("revisions") or {}).get("guide", ""),
                            content_revision=value.get("content_revision", ""),
                            progress_revision=value.get("progress_revision", ""))
 
@@ -442,6 +482,7 @@ class CompanionServer:
                 return error
             return jsonify(ok=True, systems=value.get("systems") or [],
                            system_state=value.get("system_state") or {},
+                           revision=(value.get("revisions") or {}).get("atlas", ""),
                            content_revision=value.get("content_revision", ""),
                            progress_revision=value.get("progress_revision", ""))
 
