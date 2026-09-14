@@ -102,6 +102,30 @@ Na primeira execução, informe seu **username** e a **Web API Key**
 `config/secrets.json`, na sua máquina. Há também um botão **Ver demonstração**
 para visualizar a interface com dados fictícios, sem credenciais.
 
+### Testar o Atlas C+D sem credenciais
+
+`tests/atlas-cd-test.html` é a fixture visual principal do Atlas. Ela usa os
+mesmos módulos `ui/atlas-view-model.js`, `ui/atlas-layout.js` e `ui/atlas.css`
+do aplicativo, mas mantém um cenário sintético local para testar rotas,
+alternativas, itens, ciclos, revisão do cartão composto `#104`, busca,
+preenchimento de imagens e o modo estreito.
+
+Em outro terminal, dentro de `digitracker`, inicie o servidor estático e abra:
+
+```text
+http://127.0.0.1:8765/tests/atlas-cd-test.html
+```
+
+O smoke automatizado que usa essa mesma fixture é:
+
+```bash
+NODE_PATH=<runtime node_modules> node tests/atlas_cd_fixture_smoke.cjs http://127.0.0.1:8765
+```
+
+`tests/atlas_ui_smoke.cjs` continua validando a integração do Atlas dentro do
+dashboard completo; a fixture é a referência canônica para o comportamento e
+a geometria C+D.
+
 ## A biblioteca espelha a sua conta
 
 Você **não precisa cadastrar jogo nenhum**. Assim que conecta a conta, o app

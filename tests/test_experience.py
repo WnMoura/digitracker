@@ -117,6 +117,23 @@ def test_pair_requires_pc_approval_and_revocation(server):
     assert request(client, "/api/state").status_code == 401
 
 
+def test_remembered_device_restores_after_service_restart_and_revocation(server):
+    client = client_for(server)
+    pair(server, client)
+    device_id = next(iter(server.sessions.values()))["device_id"]
+    assert device_id
+    # Stopping the LAN service intentionally discards short-lived sessions but
+    # keeps the hashed remembered-device record in SQLite.
+    server.stop()
+    assert request(client, "/api/state").status_code == 401
+    assert request(client, "/session/restore", {}).json["restored"]
+    assert request(client, "/api/state").status_code == 200
+    server.revoke(device_id)
+    server.stop()
+    restored = request(client, "/session/restore", {})
+    assert restored.status_code == 401 and restored.json["needs_pairing"]
+
+
 def test_pair_single_use_expired_and_invalid_body(server):
     client = client_for(server)
     pair(server, client)
@@ -139,12 +156,16 @@ def test_companion_blocks_host_csrf_arbitrary_paths(server):
 def test_companion_static_files_and_only_approved_assets(server, tmp_path):
     server.ui_root.mkdir()
     (server.ui_root / "index.html").write_text("Companion")
+    (server.ui_root / "app.js").write_text("export {}")
+    (server.ui_root / "state.js").write_text("export {}")
     server.assets.mkdir()
     (server.assets / "map.png").write_bytes(b"test")
     client = client_for(server)
     assert request(client, "/").status_code == 200
     assert request(client, "/assets/map.png").status_code == 401
     pair(server, client)
+    assert request(client, "/app.js").status_code == 200
+    assert request(client, "/state.js").status_code == 200
     assert request(client, "/assets/map.png").status_code == 200
     server.stop()
     assert request(client, "/api/state").status_code == 401

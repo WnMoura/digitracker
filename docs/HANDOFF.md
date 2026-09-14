@@ -1,5 +1,13 @@
 # DigiTracker — Handoff para a sessão do Windows
 
+## Addendum — proposta E (13/09/2026)
+
+O modo celular da proposta E foi concluído localmente. A implementação está
+documentada em [`COMPANION_MOBILE_E_HANDOFF.md`](COMPANION_MOBILE_E_HANDOFF.md),
+que contém os contratos atuais, a correção de requisitos por rota, os testes e
+o comando de build. A suíte atual tem 642 testes aprovados; os números abaixo
+permanecem como histórico das rodadas anteriores.
+
 ## Estado atual — Atlas, rodada 12/09/2026
 
 Base local: `main`, com a implementação do Atlas na linha `v0.11.8`. A tag

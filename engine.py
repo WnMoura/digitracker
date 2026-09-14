@@ -126,6 +126,9 @@ DEFAULT_SETTINGS = {
     "ai_base_url": "",     # endpoint próprio, para provedores compatíveis
     "smart_guide_auto": True,       # organizar novos guias após importar
     "smart_guide_consent": False,   # confirmação única de envio/custo da IA
+    "companion_auto_start": False,  # reabrir a conexão local escolhida pelo usuário
+    "companion_address": "",
+    "companion_port": 47831,
     "guide_density": "comfortable", # comfortable | compact
     "ui_scale": 100,
     "reduced_motion": False,
@@ -235,8 +238,14 @@ def load_settings() -> dict:
         settings["auto_import"] = bool(saved.get("auto_import", True))
         settings["auto_overlay"] = bool(saved.get("auto_overlay", True))
         for chave in ("overlay_exit_fullscreen", "overlay_second_screen", "smart_guide_auto",
-                      "smart_guide_consent", "reduced_motion"):
+                      "smart_guide_consent", "reduced_motion", "companion_auto_start"):
             settings[chave] = bool(saved.get(chave, settings[chave]))
+        address = saved.get("companion_address")
+        if isinstance(address, str):
+            settings["companion_address"] = address.strip()[:100]
+        port = saved.get("companion_port")
+        if isinstance(port, (int, float)) and not isinstance(port, bool):
+            settings["companion_port"] = max(1024, min(65535, int(port)))
         settings["overlay_fit_emulator"] = bool(saved.get("overlay_fit_emulator", True))
         settings["auto_check_updates"] = bool(saved.get("auto_check_updates", True))
         remind = saved.get("update_remind_until", 0)
@@ -2559,7 +2568,9 @@ class Api(ExperienceApi, DataToolsApi):
             available = {item.get("id") for item in review.get("tables") or []}
             requested = selection if isinstance(selection, dict) else {}
             table_ids = [item for item in requested.get("table_ids") or [] if item in available]
-            if isinstance(selection, dict) and "table_ids" in selection and not table_ids:
+            legacy_text_mode = not available and bool(source.get("sections") or source.get("text"))
+            if (isinstance(selection, dict) and "table_ids" in selection and not table_ids
+                    and not legacy_text_mode):
                 return {"ok": False, "error": "Selecione ao menos uma tabela para analisar."}
             if not table_ids:
                 table_ids = [item.get("id") for item in review.get("tables") or []]
@@ -2744,7 +2755,7 @@ class Api(ExperienceApi, DataToolsApi):
                     "title": element.get("title", ""),
                     "path": element.get("path") or [],
                     "headers": [item.get("text", "") for item in element.get("headers") or []],
-                    "header_rows": deepcopy(element.get("header_rows") or []),
+                    "header_rows": copy.deepcopy(element.get("header_rows") or []),
                     "columns": element.get("columns", 0),
                     "rows": len(element.get("rows") or []),
                     "sample": sample,
@@ -2774,6 +2785,8 @@ class Api(ExperienceApi, DataToolsApi):
             "source_id": source.get("id", ""),
             "title": source.get("title", ""),
             "kind": source.get("kind", ""),
+            "source_format": source.get("source_format") or (structured.get("format") if isinstance(structured, dict) else ""),
+            "legacy_text_mode": bool(not tables and (source.get("sections") or source.get("text"))),
             "url": source.get("url") or metadata.get("url", ""),
             "pages": len(pages),
             "page_numbers": [document.get("page") or document.get("number") or index + 1
@@ -2787,6 +2800,155 @@ class Api(ExperienceApi, DataToolsApi):
             "markdown": source.get("markdown", ""),
             "selection": {"table_ids": [t["id"] for t in tables if t.get("selected")]},
         }
+
+    @staticmethod
+    def _pdf_row_cells(value: object) -> list[str] | None:
+        """Reconhece uma linha tabular extraída por pypdf sem perder vazios.
+
+        PDFs não têm uma tabela semântica como HTML. Priorizamos separadores
+        explícitos (``|`` e tab) e só aceitamos colunas por espaços quando há
+        pelo menos três campos. Linhas que não passam nessa guarda permanecem
+        texto livre e seguem para a interpretação compatível do Atlas.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if "|" in text:
+            parts = [part.strip() for part in text.strip().strip("|").split("|")]
+            return parts if len(parts) >= 2 else None
+        if "\t" in text:
+            parts = [part.strip() for part in text.split("\t")]
+            return parts if len(parts) >= 2 else None
+        parts = [part.strip() for part in re.split(r"\s{2,}", text) if part.strip()]
+        return parts if len(parts) >= 3 else None
+
+    @classmethod
+    def _pdf_structured_capture(cls, raw: bytes, source_id: str, title: str,
+                                sections: list[dict]) -> tuple[dict | None, list[dict]]:
+        """Converte tabelas textuais de PDF para o contrato estruturado.
+
+        A captura binária permanece a fonte de verdade. Este adaptador apenas
+        cria uma projeção versionada; quando o PDF não possui separadores
+        confiáveis, retorna ``(None, sections)`` para manter a rota legada sem
+        fabricar colunas.
+        """
+        page_elements: dict[int, list[dict]] = {}
+        table_count = 0
+        for section_index, section in enumerate(sections or [], 1):
+            try:
+                page_number = max(1, int(section.get("page") or 1))
+            except (TypeError, ValueError):
+                page_number = 1
+            elements = page_elements.setdefault(page_number, [])
+            section_title = str(section.get("title") or f"Página {page_number}").strip()
+            run: list[tuple[dict, list[str]]] = []
+            run_delimiter = ""
+
+            def flush_run() -> None:
+                nonlocal run, table_count, run_delimiter
+                if not run:
+                    return
+                # A single separated line is still useful when it has a clear
+                # header/value pair; otherwise leave it as ordinary prose.
+                if len(run) < 2 and len(run[0][1]) < 3:
+                    run = []
+                    run_delimiter = ""
+                    return
+                table_count += 1
+                element_id = f"p{page_number:03d}-pdf-e{table_count:04d}"
+                first_cells = run[0][1]
+                header_words = {
+                    "evolution", "evolves into", "evolves from", "digivolves into",
+                    "digivolves from", "destination", "destino", "origin", "origem",
+                    "previous", "requirements", "requirement", "condition", "hp",
+                    "mp", "atk", "def", "spd", "brn", "wgt", "quo", "quota",
+                    "item", "items", "level", "stage", "estagio",
+                }
+                header = bool(first_cells and any(
+                    _normalize_text(cell) in header_words
+                    or any(token in _normalize_text(cell)
+                           for token in ("evolution", "digivolv", "requirement"))
+                    for cell in first_cells
+                ))
+                columns = max(len(cells) for _block, cells in run)
+                rows = []
+                for row_index, (block, cells) in enumerate(run):
+                    values = list(cells) + [""] * (columns - len(cells))
+                    tags = "th" if header and row_index == 0 else "td"
+                    rows.append({
+                        "id": f"{element_id}-r{row_index + 1:04d}",
+                        "index": row_index,
+                        "cells": [{
+                            "id": f"{element_id}-r{row_index + 1:04d}-c{column + 1:03d}",
+                            "tag": tags, "text": str(value), "raw_text": str(value),
+                            "row": row_index, "column": column,
+                            "rowspan": 1, "colspan": 1,
+                        } for column, value in enumerate(values)],
+                    })
+                headers = [{"text": value, "column": index, "colspan": 1,
+                            "source_cell": rows[0]["cells"][index]["id"]}
+                           for index, value in enumerate(first_cells)] if header else []
+                header_rows = [{"id": rows[0]["id"], "index": 0, "level": 1,
+                                "cells": [{"id": cell["id"], "text": cell["text"],
+                                           "column": cell["column"], "colspan": 1,
+                                           "rowspan": 1, "source_cell": cell["id"]}
+                                          for cell in rows[0]["cells"]]}] if header else []
+                elements.append({
+                    "id": element_id, "type": "table", "title": section_title,
+                    "path": [section_title], "headers": headers,
+                    "header_rows": header_rows, "has_header": bool(header),
+                    "columns": columns, "rows": rows,
+                    "caption": "", "links": [], "images": [],
+                })
+                run = []
+                run_delimiter = ""
+
+            for block_index, block in enumerate(section.get("blocks") or [], 1):
+                text = str(block.get("text") or "").strip()
+                lines = text.splitlines() or [text]
+                for line in lines:
+                    cells = cls._pdf_row_cells(line)
+                    if cells is not None:
+                        # Different delimiters usually indicate a new table;
+                        # do not merge a pipe table with a spaced paragraph.
+                        delimiter = "|" if "|" in line else "\t" if "\t" in line else "spaces"
+                        if run and run_delimiter != delimiter:
+                            flush_run()
+                        run_delimiter = delimiter
+                        run.append(({
+                            **block, "_source_section": section_index,
+                            "_source_block": block_index,
+                        }, cells))
+                        continue
+                    flush_run()
+                    if not text:
+                        continue
+                    kind = str(block.get("type") or "p")
+                    if kind in {"subhead", "heading"}:
+                        elements.append({"id": f"p{page_number:03d}-pdf-h{len(elements) + 1:04d}",
+                                         "type": "heading", "level": 3,
+                                         "title": text, "text": text,
+                                         "path": [section_title]})
+                    elif kind in {"note", "warning"}:
+                        elements.append({"id": f"p{page_number:03d}-pdf-n{len(elements) + 1:04d}",
+                                         "type": "note", "text": text,
+                                         "path": [section_title]})
+                    else:
+                        elements.append({"id": f"p{page_number:03d}-pdf-p{len(elements) + 1:04d}",
+                                         "type": "paragraph", "text": text,
+                                         "path": [section_title]})
+            flush_run()
+
+        if not table_count:
+            return None, sections
+        pages = [{"id": f"page-{page:04d}", "number": page,
+                  "elements": elements}
+                 for page, elements in sorted(page_elements.items()) if elements]
+        document = source_document.normalize_document({
+            "title": title or "Fonte PDF", "pages": pages,
+            "completeness": {"status": "complete"},
+        }, source_id=source_id)
+        return document, source_document.to_guide_sections(document, source_id=source_id)
 
     def create_guide_system_from_gamefaqs(self, slug: str, title: str,
                                           url: str) -> dict:
@@ -2872,6 +3034,86 @@ class Api(ExperienceApi, DataToolsApi):
         with self._smart_ai_lock:
             status = dict(self._atlas_ai_status.get(f"{slug}:{source_id}") or {})
         return {"ok": True, "source": source, "status": status}
+
+    def reprocess_guide_system(self, slug: str, system_id: str) -> dict:
+        """Reabre a captura do sistema publicado usando o extrator atual.
+
+        Sistemas antigos (inclusive PDFs que só tinham texto livre) não são
+        substituídos automaticamente. A captura é atualizada com uma projeção
+        estruturada quando o PDF permite identificar separadores de tabela e a
+        análise segue para a mesma revisão/aprovação usada por novas fontes.
+        """
+        game = load_game_file(GAMES_DIR / f"{slug}.json")
+        current = self._guides.current(slug)
+        system = next((item for item in current.get("systems") or []
+                       if item.get("id") == system_id), None)
+        if not game or not system:
+            return {"ok": False, "error": "Sistema visual não encontrado."}
+        source_id = str(system.get("source_id") or "")
+        if not source_id or source_id == "legacy-main":
+            return {"ok": False,
+                    "error": "Este sistema não possui uma captura exclusiva preservada. Importe o PDF novamente para reprocessar."}
+        try:
+            source = self._guides.system_source(slug, source_id, include_sections=True)
+            if not source:
+                return {"ok": False, "error": "A captura original deste sistema não foi encontrada."}
+            metadata = {
+                "reprocessed_at": int(time.time()),
+                "reprocessed_from_format": source.get("source_format") or source.get("kind") or "legacy",
+                "reprocess_extractor_version": guide_ai.ATLAS_EXTRACTION_VERSION,
+            }
+            # Structured GameFAQs/Web sources already contain a stable JSON
+            # document. Reusing it is intentional: only the interpretation is
+            # rerun, so links, empty cells and row references remain intact.
+            if source.get("kind") == "pdf":
+                raw = self._guides.read_system_source_raw(slug, source_id)
+                if not raw:
+                    return {"ok": False,
+                            "error": "A captura binária do PDF não está disponível. Selecione o arquivo novamente.",
+                            "error_code": "source_raw_missing", "error_kind": "source_import"}
+                ok, error, sections, text = self._read_pdf_sections_raw(raw)
+                if not ok:
+                    return {"ok": False, "error": error,
+                            "error_code": "pdf_read", "error_kind": "source_import"}
+                structured, structured_sections = self._pdf_structured_capture(
+                    raw, source_id, source.get("title") or system.get("title") or "Fonte PDF", sections)
+                if structured:
+                    sections = structured_sections
+                    markdown = source_document.to_markdown(structured)
+                    self._guides.update_system_source_content(
+                        slug, source_id, sections=sections, structured=structured,
+                        text=text, markdown=markdown,
+                        source_format="digitracker-source-v1", metadata=metadata)
+                else:
+                    # Keep the old projection, but make the new run explicit in
+                    # metadata. The legacy AI path now splits conservative
+                    # alternatives and blocks fusion/unknown combinations.
+                    self._guides.update_system_source_content(
+                        slug, source_id, sections=sections, structured={}, text=text,
+                        markdown="", source_format="", metadata=metadata)
+            else:
+                self._guides.update_system_source_content(
+                    slug, source_id, metadata=metadata)
+            latest = self._guides.system_source(slug, source_id)
+            self._guides.update_system_source(
+                slug, source_id, replace_system_id=system_id, status="cancelled",
+                error="", error_kind="", error_code="", error_details={}, job_id="")
+            latest = self._guides.system_source(slug, source_id)
+            result = self._queue_atlas_source(
+                slug, latest, latest.get("title") or system.get("title") or "Sistema visual",
+                system_id, start=False, selection=latest.get("selection") or {})
+            result["reprocessed"] = True
+            return result
+        except smart_guide.SmartGuideError as exc:
+            info = self._atlas_error_info(exc)
+            return {"ok": False, "error": info["message"],
+                    "error_kind": info["kind"], "error_code": info["code"],
+                    "error_details": info["details"]}
+        except Exception as exc:
+            info = self._atlas_error_info(exc)
+            return {"ok": False, "error": info["message"],
+                    "error_kind": info["kind"], "error_code": info["code"],
+                    "error_details": info["details"]}
 
     def replace_guide_system_source(self, slug: str, system_id: str,
                                     source: dict) -> dict:
@@ -2984,6 +3226,13 @@ class Api(ExperienceApi, DataToolsApi):
             settings = atlas_images.normalize_options(options if options is not None else saved.get("options"))
         except ValueError as exc:
             return {"ok": False, "error": str(exc), "results": []}
+        if settings.get("sites"):
+            direct = web_image_search.direct_site_search(node.get("label", ""), settings["sites"])
+            direct["results"] = atlas_images.rank_candidates(direct.get("results") or [], node.get("label", ""), settings)
+            direct["system_id"] = system_id
+            direct["node_id"] = node_id
+            direct["query"] = direct.get("open_url") or node.get("label", "")
+            return direct
         term = atlas_images.entity_query(node.get("label", ""), query, options=settings)
         result = self.search_web_images(slug, term, page, "moderate", "entity", "google")
         result["results"] = atlas_images.rank_candidates(result.get("results") or [], node.get("label", ""), settings)
@@ -3053,6 +3302,9 @@ class Api(ExperienceApi, DataToolsApi):
                 direct = atlas_images.source_candidates(captured_source, label, settings)
                 if direct:
                     return direct
+            if settings.get("sites"):
+                result = web_image_search.direct_site_search(label, settings["sites"])
+                return atlas_images.rank_candidates(result.get("results") or [], label, settings)
             variants = (label, f"{label} artwork", f"{label} transparent png")
             term = atlas_images.entity_query(label, variants[((attempt - 1) // 3) % 3], options=settings)
             provider = ("google", "yandex", "bing")[(attempt - 1) % 3]
@@ -3390,23 +3642,32 @@ class Api(ExperienceApi, DataToolsApi):
         webbrowser.open(f"https://www.google.com/search?tbm=isch&q={quote_plus(query)}")
         return {"ok": True, "requires_rights_confirmation": True}
 
+    @staticmethod
+    def _read_pdf_sections_raw(raw: bytes):
+        """(ok, erro, seções, texto) para uma captura PDF já decodificada."""
+        try:
+            text = extract_pdf_text(io.BytesIO(raw))
+        except Exception as exc:
+            return False, f"Não foi possível ler o PDF: {exc}", [], ""
+        if not _normalize_text(text):
+            return False, ("O PDF parece digitalizado. Instale Tesseract + "
+                           "PyMuPDF/pytesseract para habilitar OCR local."), [], text
+        parsed = guide_parser.parse_guide(text)
+        guide = [s for s in parsed["sections"] if not s.get("is_achievements")]
+        annotate_pdf_pages(guide, raw)
+        if not guide:
+            return False, "Não encontrei seções de dicas/tutoriais neste PDF.", [], text
+        return True, "", guide, text
+
     def _read_guide_sections(self, b64: str):
         """(ok, erro, seções) — extrai do PDF só as seções de dicas/tutoriais
         (remove a seção que lista as conquistas)."""
         try:
             raw = base64.b64decode((b64 or "").split(",", 1)[-1])
-            text = extract_pdf_text(io.BytesIO(raw))
-        except Exception as exc:
+        except (ValueError, TypeError) as exc:
             return False, f"Não foi possível ler o PDF: {exc}", []
-        if not _normalize_text(text):
-            return False, ("O PDF parece digitalizado. Instale Tesseract + "
-                           "PyMuPDF/pytesseract para habilitar OCR local."), []
-        parsed = guide_parser.parse_guide(text)
-        guide = [s for s in parsed["sections"] if not s.get("is_achievements")]
-        annotate_pdf_pages(guide, raw)
-        if not guide:
-            return False, "Não encontrei seções de dicas/tutoriais neste PDF.", []
-        return True, "", guide
+        ok, error, sections, _text = self._read_pdf_sections_raw(raw)
+        return ok, error, sections
 
     def extract_guide_pdf(self, b64: str, filename: str = "") -> dict:
         """Lê um PDF e devolve SÓ as dicas/tutoriais (não mexe em conquistas).

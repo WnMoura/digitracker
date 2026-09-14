@@ -45,10 +45,11 @@ class ItemCatalog:
         return value if isinstance(value, dict) else {"schema_version": 1, "revision": 0, "items": []}
 
     def possession(self, game: str) -> dict:
-        value = _read_json(self._possession(game), {"schema_version": 1, "revision": 0, "values": {}, "receipts": {}})
+        value = _read_json(self._possession(game), {"schema_version": 2, "revision": 0, "values": {}, "value_versions": {}, "receipts": {}})
         if not isinstance(value, dict):
-            return {"schema_version": 1, "revision": 0, "values": {}, "receipts": {}}
+            return {"schema_version": 2, "revision": 0, "values": {}, "value_versions": {}, "receipts": {}}
         value.setdefault("values", {})
+        value.setdefault("value_versions", {})
         value.setdefault("receipts", {})
         return value
 
@@ -86,8 +87,10 @@ class ItemCatalog:
             replay = copy.deepcopy(value)
             replay["idempotent"] = True
             return replay
-        if expected_revision is not None and int(expected_revision) != revision:
-            raise ItemCatalogError("A posse dos itens mudou. Atualize a lista e tente novamente.")
+        versions = dict(value.get("value_versions") or {})
+        item_version = int(versions.get(identifier) or 0)
+        if expected_revision is not None and int(expected_revision) != item_version:
+            raise ItemCatalogError("Este item mudou no PC ou em outro celular. Atualize o item e tente novamente.")
         if quantity is not None:
             try: quantity = max(0, int(quantity))
             except (TypeError, ValueError) as exc: raise ItemCatalogError("Quantidade inválida.") from exc
@@ -96,11 +99,13 @@ class ItemCatalog:
         # from zero (known not to possess) and from an absent legacy key.
         values[identifier] = quantity
         next_revision = revision + 1
-        value.update({"schema_version": 1, "revision": next_revision, "values": values,
+        item_version += 1
+        versions[identifier] = item_version
+        value.update({"schema_version": 2, "revision": next_revision, "values": values, "value_versions": versions,
                       "updated_at": int(time.time())})
         if request_id:
             receipts[request_id] = {"fingerprint": fingerprint, "item_id": identifier,
-                                    "quantity": quantity, "revision": next_revision}
+                                    "quantity": quantity, "revision": next_revision, "value_version": item_version}
             value["receipts"] = dict(list(receipts.items())[-256:])
         _atomic_json(self._possession(game), value)
         result = copy.deepcopy(value)
@@ -108,7 +113,10 @@ class ItemCatalog:
         return result
 
     def list(self, game: str, query: str = "", category: str = "", possessed: str = "all") -> list[dict]:
-        values = self.possession(game).get("values") or {}; hay = str(query or "").casefold()
+        possession = self.possession(game)
+        values = possession.get("values") or {}
+        versions = possession.get("value_versions") or {}
+        hay = str(query or "").casefold()
         result = []
         for entry in self.catalog(game).get("items") or []:
             if hay and hay not in " ".join([entry.get("name", ""), *(entry.get("aliases") or []), entry.get("id", "")]).casefold(): continue
@@ -116,7 +124,7 @@ class ItemCatalog:
             quantity = values.get(entry.get("id"))
             if possessed == "owned" and not quantity: continue
             if possessed == "missing" and quantity: continue
-            result.append({**copy.deepcopy(entry), "quantity": quantity})
+            result.append({**copy.deepcopy(entry), "quantity": quantity, "value_version": int(versions.get(entry.get("id")) or 0)})
         return result
 
     def get(self, game: str, identifier: str) -> dict | None:
@@ -124,10 +132,12 @@ class ItemCatalog:
         key = _slug(identifier)
         if not key:
             return None
-        values = self.possession(game).get("values") or {}
+        possession = self.possession(game)
+        values = possession.get("values") or {}
+        versions = possession.get("value_versions") or {}
         for entry in self.catalog(game).get("items") or []:
             if entry.get("id") == key:
-                return {**copy.deepcopy(entry), "quantity": values.get(key)}
+                return {**copy.deepcopy(entry), "quantity": values.get(key), "value_version": int(versions.get(key) or 0)}
         return None
 
 

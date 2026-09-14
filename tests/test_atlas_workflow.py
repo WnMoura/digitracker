@@ -1,7 +1,10 @@
 from copy import deepcopy
+import json
+import threading
 import pytest
 import smart_guide
 import guide_ai
+import engine
 
 SECTIONS = [{"title": "Sistema", "blocks": [{"type": "p", "text": "A leva a B quando a condição é cumprida."}]}]
 
@@ -107,6 +110,93 @@ def test_reimportacao_estruturada_bloqueia_card_combinado(store):
     assert draft["diagnostics"]["pending_items"][0]["kind"] == "combined_entity_card"
     with pytest.raises(smart_guide.SmartGuideError, match="pendentes"):
         store.approve_atlas_draft("game", source["id"])
+
+
+def test_legitimate_comma_name_is_not_flagged_as_composite(store):
+    structured = {"format": "gamefaqs-json-v1", "pages": []}
+    source = store.add_system_source(
+        "game", "FAQ nome editorial", "gamefaqs", SECTIONS,
+        {"source_format": "gamefaqs-json-v1"}, structured=structured,
+    )
+    store.update_system_source("game", source["id"], status="running", job_id="job1")
+    candidate = system()
+    candidate["nodes"][0]["label"] = "Knight, the Brave"
+    draft = store.save_atlas_draft("game", source["id"], candidate, "job1")
+    assert not draft["diagnostics"].get("pending_composite_cards")
+
+
+def test_reimport_preserves_card_numbers_and_does_not_reuse_removed_numbers():
+    previous = {
+        "id": "sys_previous",
+        "nodes": [
+            {"id": "a", "label": "Airdramon", "card_number": 4},
+            {"id": "composite", "label": "Airdramon, Growlmon", "card_number": 104},
+        ],
+        "edges": [],
+    }
+    candidate = {
+        "id": "sys_candidate",
+        "nodes": [
+            {"id": "new-a", "label": "Airdramon", "card_number": 1},
+            {"id": "new-g", "label": "Growlmon", "card_number": 2},
+        ],
+        "edges": [],
+    }
+    reconciled = smart_guide.reconcile_system_ids(candidate, previous)
+    assert reconciled["nodes"][0]["id"] == "a"
+    assert reconciled["nodes"][0]["card_number"] == 4
+    assert reconciled["nodes"][1]["card_number"] > 104
+
+
+def test_composite_card_104_reports_individual_paths_and_impact():
+    ref = [{"section": 1, "block": 229, "page": 1,
+            "table_id": "p001-e0229", "row_id": "p001-e0229-r0015"}]
+    labels = ["Airdramon", "Growlmon", "Kabuterimon", "Seadramon"]
+    nodes = [{"id": label.lower(), "label": label, "card_number": index + 1,
+              "source_refs": ref} for index, label in enumerate(labels)]
+    nodes += [{"id": "mega", "label": "MegaSeadramon", "card_number": 74,
+               "source_refs": ref},
+              {"id": "composite", "label": ", ".join(labels), "card_number": 104,
+               "source_refs": ref}]
+    edges = [{"id": f"edge-{index}", "from": label.lower(), "to": "mega",
+              "requirements": [], "source_refs": ref} for index, label in enumerate(labels)]
+    edges.append({"id": "edge-composite", "from": "composite", "to": "mega",
+                  "requirements": [], "source_refs": ref})
+    issues = smart_guide._structured_composite_card_issues(
+        {"nodes": nodes, "edges": edges},
+        {"id": "source", "source_format": "gamefaqs-json-v1"},
+    )
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue["card_numbers"] == [104]
+    assert issue["components"] == labels
+    assert {path["from"] for path in issue["reusable_paths"]} == set(labels)
+    assert issue["redundant_paths"] == [{"edge_id": "edge-composite",
+                                          "from": ", ".join(labels),
+                                          "to": "MegaSeadramon"}]
+    assert issue["source_ref"]["table_id"] == "p001-e0229"
+
+
+def test_reimport_blocks_removed_objective_until_explicit_replacement(store):
+    published = store.save_system("game", system())["system"]
+    store.set_system_goal("game", published["id"], published["nodes"][1]["id"])
+    source_id = pending(store)
+    store.update_system_source("game", source_id, replace_system_id=published["id"])
+    candidate = system()
+    candidate["nodes"][1]["label"] = "Novo destino"
+    draft = store.save_atlas_draft("game", source_id, candidate, "job1")
+    assert draft["approval_blocked"] is True
+    objective = next(item for item in draft["diagnostics"]["pending_items"]
+                     if item["kind"] == "objective_replacement")
+    assert objective["replacement_node_ids"]
+    with pytest.raises(smart_guide.SmartGuideError, match="objetivo"):
+        store.approve_atlas_draft("game", source_id)
+    replacement = next(node["id"] for node in draft["system"]["nodes"]
+                       if node["label"] == "Novo destino")
+    approved = store.approve_atlas_draft("game", source_id,
+                                         {**draft["system"], "_goal_replacement": replacement})
+    assert approved["system"]["id"] == published["id"]
+    assert store.system_state("game")["goals"][published["id"]] == replacement
 
 
 def test_delete_system_archives_its_source_but_keeps_capture(store):
@@ -250,6 +340,98 @@ def test_row_protocol_attaches_canonical_reference_locally():
         fragment["edges"][0]["source_refs"]
 
 
+def test_legacy_row_protocol_splits_alternative_pdf_endpoints_without_composite_card():
+    batch = guide_ai._atlas_batches([{"title": "Baby II", "blocks": [
+        {"text": "Gabumon | Koromon , Wanyamon | 15+", "page": 1}
+    ], "page": 1, "_source_id": "pdf-source", "_source_section": 1}])[0]
+    ref_id = guide_ai._atlas_input_rows(batch)[0]["ref_id"]
+    raw = {"rows": [{"ref_id": ref_id, "kind": "relation", "relations": [{
+        "from_label": "Koromon , Wanyamon", "to_label": "Gabumon",
+        "relation_semantics": "alternatives", "requirements": ["15+"]
+    }]}]}
+    fragment, quality = guide_ai._atlas_fragment_from_rows(raw, batch, "Evoluções")
+    assert quality["complete"]
+    assert {node["label"] for node in fragment["nodes"]} == {"Koromon", "Wanyamon", "Gabumon"}
+    assert len(fragment["edges"]) == 2
+    by_id = {node["id"]: node["label"] for node in fragment["nodes"]}
+    assert {(by_id[edge["from"]], by_id[edge["to"]]) for edge in fragment["edges"]} == {
+        ("Koromon", "Gabumon"), ("Wanyamon", "Gabumon")
+    }
+    assert not any("," in node["label"] for node in fragment["nodes"])
+
+
+def test_legacy_row_protocol_keeps_fusion_as_explicit_pending_issue():
+    batch = guide_ai._atlas_batches([{"title": "Especial", "blocks": [
+        {"text": "Knight + Dragon | Fusion", "page": 1}
+    ], "page": 1, "_source_id": "pdf-source", "_source_section": 1}])[0]
+    ref_id = guide_ai._atlas_input_rows(batch)[0]["ref_id"]
+    raw = {"rows": [{"ref_id": ref_id, "kind": "relation", "relations": [{
+        "from_label": "Knight + Dragon", "to_label": "Fusion",
+        "relation_semantics": "fusion", "requirements": []
+    }]}]}
+    fragment, quality = guide_ai._atlas_fragment_from_rows(raw, batch, "Evoluções")
+    assert not fragment["edges"]
+    assert quality["pending_items"][0]["kind"] == "ambiguous_entity_list"
+
+
+def test_system_source_reprocess_content_preserves_capture_and_raw(tmp_path):
+    local = smart_guide.SmartGuideStore(tmp_path)
+    local.ensure_source("game", "Game", SECTIONS)
+    original = local.add_system_source(
+        "game", "Guia PDF", "pdf", SECTIONS,
+        {"filename": "evolucoes.pdf"}, raw=b"captura-pdf",
+    )
+    raw_path = tmp_path / "game" / original["raw_file"]
+    assert local.read_system_source_raw("game", original["id"]) == b"captura-pdf"
+    structured = {"format": "digitracker-source-v1", "pages": [], "stats": {"tables": 0}}
+    local.update_system_source_content(
+        "game", original["id"], sections=SECTIONS, structured=structured,
+        source_format="digitracker-source-v1", metadata={"reprocessed_at": 1},
+    )
+    updated = local.system_source("game", original["id"], include_sections=True)
+    assert updated["hash"] == original["hash"]
+    assert updated["raw_file"] == original["raw_file"]
+    assert raw_path.read_bytes() == b"captura-pdf"
+    assert updated["structured"]["format"] == "digitracker-source-v1"
+    assert updated["metadata"]["reprocessed_at"] == 1
+
+
+def test_reprocess_existing_pdf_system_returns_source_review_without_publishing(tmp_path, monkeypatch):
+    games_dir = tmp_path / "games"
+    games_dir.mkdir()
+    (games_dir / "game.json").write_text(json.dumps({"slug": "game", "title": "Game"}), encoding="utf-8")
+    monkeypatch.setattr(engine, "GAMES_DIR", games_dir)
+    local = smart_guide.SmartGuideStore(tmp_path / "guides")
+    local.ensure_source("game", "Game", SECTIONS)
+    source = local.add_system_source("game", "Evoluções PDF", "pdf", SECTIONS,
+                                    {"filename": "evolucoes.pdf"}, raw=b"pdf")
+    candidate = system()
+    candidate.update(id="sys-published", source_id=source["id"], status="approved")
+    published = local.save_system("game", candidate)["system"]
+    local.update_system_source("game", source["id"], status="published",
+                               system_id=published["id"])
+    api = engine.Api.__new__(engine.Api)
+    api._guides = local
+    api._atlas_job_lock = threading.RLock()
+    api._smart_ai_lock = threading.RLock()
+    api._atlas_ai_status = {}
+    api._refresh_smart_bundle = lambda _slug: None
+    api._read_pdf_sections_raw = lambda _raw: (True, "", [{
+        "title": "Evolução", "page": 1, "blocks": [
+            {"type": "p", "text": "Evolution | Previous | HP"},
+            {"type": "p", "text": "Gabumon | Koromon , Wanyamon | 15+"},
+        ],
+    }], "Evolution | Previous | HP\nGabumon | Koromon , Wanyamon | 15+")
+    result = api.reprocess_guide_system("game", published["id"])
+    assert result["ok"] and result["phase"] == "awaiting_source_review", result.get("error_details") or result
+    assert result["reprocessed"] is True
+    full = local.system_source("game", source["id"], include_sections=True)
+    assert full["source_format"] == "digitracker-source-v1"
+    assert full["replace_system_id"] == published["id"]
+    assert full["status"] == "awaiting_source_review"
+    assert local.current("game")["systems"][0]["id"] == published["id"]
+
+
 def test_table_coverage_rejects_a_single_representative_path():
     batch = [{"title": "Tabela", "_source_section": 1, "blocks": [
         {"text": f"A{i} | B{i}", "_source_block": i} for i in range(1, 11)
@@ -270,6 +452,16 @@ def test_merge_preserves_alternative_conditions_for_same_endpoints():
     merged = guide_ai._merge_atlas_fragments([base, other], 'Paths')
     assert len(merged['nodes']) == 2
     assert len(merged['edges']) == 2
+
+
+def test_merge_does_not_collapse_fusion_and_single_semantics():
+    base = system()
+    base["edges"][0]["relation_semantics"] = "single"
+    fusion = deepcopy(base)
+    fusion["edges"][0]["relation_semantics"] = "fusion"
+    merged = guide_ai._merge_atlas_fragments([base, fusion], "Semantics")
+    assert len(merged["edges"]) == 2
+    assert {edge["relation_semantics"] for edge in merged["edges"]} == {"single", "fusion"}
 
 
 def test_alternative_paths_not_combined_as_required(store):

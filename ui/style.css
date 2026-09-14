@@ -1458,6 +1458,9 @@ button, input, select, summary { outline: none; }
 .experience-grid input[type="range"] { width: 100%; accent-color: var(--deck-cyan); }
 
 .media-panel { width: min(920px, 94vw); }
+.media-site-filter { display: grid; gap: 5px; margin: 8px 0 10px; color: var(--text-2); font-size: 11px; }
+.media-site-filter input { min-height: 34px; padding: 0 9px; color: var(--text); border: 1px solid var(--line); border-radius: 7px; background: #0d1c28; font-size: 11px; }
+.media-site-filter small { color: var(--text-3); font-size: 9px; }
 .media-local { margin: 10px 0; min-height: 40px; display: flex; align-items: center; justify-content: center; border: 1px dashed var(--line); border-radius: 10px; color: var(--text-2); font-size: 10.5px; cursor: pointer; }
 .media-local input { display: none; }
 .media-manual { margin-top: 8px; padding: 9px; display: grid; grid-template-columns: minmax(220px,1fr) auto; gap: 7px; border: 1px solid var(--console-line); border-radius: 10px; background: rgba(0,0,0,.13); }

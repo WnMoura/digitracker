@@ -7,6 +7,7 @@ def test_split_alternatives_and_footnotes_without_duplicate_creatures():
 
 
 def test_editorial_entity_name_preserves_commas_and_forms():
+    assert atlas_entities.split_entities("Knight, the Brave")[0] == ["Knight, the Brave"]
     assert atlas_entities.split_entities("Knight, the Brave", known_labels=["Knight, the Brave"])[0] == ["Knight, the Brave"]
     assert atlas_entities.split_entities("Dragon (Red, Blue), Knight")[0] == ["Dragon (Red, Blue)", "Knight"]
     assert atlas_entities.split_entities('"Knight, the Brave", Dragon')[0] == ["Knight, the Brave", "Dragon"]
@@ -37,3 +38,21 @@ def test_single_link_does_not_hide_an_unlinked_named_entity():
         known_labels=["Agumon", "Guilmon"],
     )
     assert not labels and reason
+
+
+def test_multiple_links_without_or_are_pending_instead_of_fusion_routes():
+    labels, reason = atlas_entities.split_entities(
+        "Knight + Dragon",
+        cell={"links": [{"text": "Knight"}, {"text": "Dragon"}]},
+        known_labels=["Knight", "Dragon"],
+    )
+    assert not labels and "combina" in reason
+
+
+def test_multiple_links_with_explicit_or_are_alternatives():
+    labels, reason = atlas_entities.split_entities(
+        "Knight or Dragon",
+        cell={"links": [{"text": "Knight"}, {"text": "Dragon"}]},
+        known_labels=["Knight", "Dragon"],
+    )
+    assert labels == ["Knight", "Dragon"] and not reason

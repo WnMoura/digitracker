@@ -9,6 +9,14 @@ def test_query_respects_game_and_wiki_without_forcing_either():
     assert atlas_images.entity_query("Agumon", options={"context": "Digimon World 3", "wiki": "https://wikimon.net/Agumon"}) == "Digimon World 3 Agumon site:wikimon.net"
 
 
+def test_query_and_candidates_support_multiple_specific_sites():
+    options = {"context": "Digimon World 3", "sites": "wikimon.net, digimon.fandom.com"}
+    assert atlas_images.entity_query("Agumon", options=options) == "Digimon World 3 Agumon site:wikimon.net site:digimon.fandom.com"
+    allowed = {"url": "https://cdn.example/Agumon.png", "source": "https://digimon.fandom.com/wiki/Agumon", "title": "Digimon World 3 Agumon"}
+    denied = {"url": "https://cdn.example/Agumon-2.png", "source": "https://example.com/Agumon", "title": "Digimon World 3 Agumon"}
+    assert atlas_images.rank_candidates([allowed, denied], "Agumon", options) == [allowed]
+
+
 def test_ranking_rejects_substring_vs_video_and_wrong_wiki():
     results = [
         {"url": "https://cdn.test/Agumon.png", "source": "https://wikimon.net/Agumon", "title": "Agumon artwork"},

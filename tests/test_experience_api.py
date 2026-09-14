@@ -95,6 +95,87 @@ def test_companion_v2_rejects_string_boolean(api):
     assert not result["ok"] and result["code"] == "validation_error"
 
 
+def test_companion_auto_start_preference_persists_without_starting_network(api):
+    result = api.set_companion_auto_start(True)
+    assert result == {"ok": True, "enabled": True}
+    assert engine.load_settings()["companion_auto_start"] is True
+
+
+def test_companion_v2_favorite_goal_and_item_use_independent_versions(api):
+    block = api.get_smart_guide("game")["current"]["chapters"][0]["blocks"][0]
+    snapshot = api._companion_snapshot("game")
+    favorite = api._companion_command({
+        "api_version": 2, "request_id": "favorite-1", "kind": "progress",
+        "slug": "game", "action": "favorite", "value": True,
+        "target": {"block_id": block["id"]},
+        "expected_definition_revision": snapshot["definition_revision"],
+        "expected_value_version": 0,
+    })
+    assert favorite["ok"] and block["id"] in api._guides.progress("game")["favorites"]
+
+    saved = api._guides.save_system("game", {
+        "title": "Evoluções", "origin": "manual", "status": "approved",
+        "nodes": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+        "edges": [{"id": "edge", "from": "a", "to": "b", "requirements": [{
+            "id": "item-rule", "text": "Use Sacred Wings on A", "mode": "item",
+            "condition": {"op": "item", "item_name": "Sacred Wings", "action": "use"},
+            "source_refs": [{"section": 1, "block": 1}],
+        }]}],
+    })["system"]
+    api._refresh_smart_bundle("game")
+    snapshot = api._companion_snapshot("game")
+    goal_node_id = saved["nodes"][1]["id"]
+    goal = api._companion_command({
+        "api_version": 2, "request_id": "goal-1", "kind": "goal", "slug": "game",
+        "value": goal_node_id, "target": {"system_id": saved["id"], "node_id": goal_node_id},
+        "expected_definition_revision": snapshot["definition_revision"],
+        "expected_value_version": 0,
+    })
+    assert goal["ok"], goal
+    assert api._guides.system_state("game")["goals"][saved["id"]] == goal_node_id
+
+    item = next(row for row in api._companion_snapshot("game")["items"] if row["name"] == "Sacred Wings")
+    updated = api._companion_command({
+        "api_version": 2, "request_id": "item-1", "kind": "item", "slug": "game",
+        "value": 2, "target": {"item_id": item["id"]},
+        "expected_value_version": item["value_version"],
+    })
+    assert updated["ok"] and updated["value_version"] == item["value_version"] + 1
+
+
+def test_companion_requirements_are_scoped_to_the_selected_route(api):
+    saved = api._guides.save_system("game", {
+        "title": "Rotas alternativas", "origin": "manual", "status": "approved",
+        "nodes": [{"id": "origin-a", "label": "Airdramon"},
+                  {"id": "origin-b", "label": "Growlmon"},
+                  {"id": "destination", "label": "MegaSeadramon"}],
+        "edges": [
+            {"id": "route-a", "from": "origin-a", "to": "destination",
+             "requirements": [{"id": "req-shared", "text": "Ataque 80"}]},
+            {"id": "route-b", "from": "origin-b", "to": "destination",
+             "requirements": [{"id": "req-shared", "text": "Ataque 80"}]},
+        ],
+    })["system"]
+    api._refresh_smart_bundle("game")
+    snapshot = api._companion_snapshot("game")
+    route_a_id = saved["edges"][0]["id"]
+    route_b_id = saved["edges"][1]["id"]
+    requirement_id = saved["edges"][0]["requirements"][0]["id"]
+    body = {
+        "api_version": 2, "request_id": "route-a-1", "kind": "requirement",
+        "slug": "game", "value": True,
+        "target": {"system_id": saved["id"], "edge_id": route_a_id, "requirement_id": requirement_id},
+        "expected_definition_revision": snapshot["definition_revision"],
+        "expected_value_version": 0,
+    }
+    result = api._companion_command(body)
+    assert result["ok"], result
+    state = api._guides.system_state("game")
+    assert smart_guide.requirement_completed(state, saved["id"], route_a_id, requirement_id)
+    assert not smart_guide.requirement_completed(state, saved["id"], route_b_id, requirement_id)
+    assert f"requirement:{saved['id']}:{route_a_id}:{requirement_id}" in state["completed_requirement_targets"]
+
+
 def test_documented_item_requirement_is_cataloged_without_new_atlas_node(api):
     saved = api._guides.save_system("game", {
         "title": "Evoluções", "origin": "manual", "status": "approved",

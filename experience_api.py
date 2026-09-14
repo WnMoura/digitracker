@@ -16,11 +16,22 @@ class ExperienceApi:
     def _init_experience(self, settings_path, data_dir, ui_dir):
         self._experience = experience.ExperienceStore(settings_path.parent / "experience.sqlite3")
         self._companion_service = companion.CompanionServer(
-            ui_dir / "companion", data_dir / "assets", self._companion_snapshot, self._companion_command)
+            ui_dir / "companion", data_dir / "assets", self._companion_snapshot, self._companion_command,
+            store_path=settings_path.parent / "companion.sqlite3",
+            account_provider=self._experience_account)
         self._experience_error = ""
         self._companion_ai = {}
         self._companion_ai_lock = threading.Lock()
         self._companion_generation = 0
+        if getattr(self, "settings", {}).get("companion_auto_start") and self.settings.get("companion_address"):
+            try:
+                self._companion_service.start(self.settings["companion_address"],
+                                              self.settings.get("companion_port", 47831))
+            except (ValueError, OSError):
+                # A saved LAN address may disappear after a Wi-Fi change.  Keep
+                # the preference and show a normal diagnostic instead of
+                # silently choosing another interface or port.
+                self._experience_error = "companion_auto_start_unavailable"
 
     def _experience_account(self):
         return experience.account_id(getattr(self._client, "username", "local"))
@@ -133,7 +144,9 @@ class ExperienceApi:
             return {"ok": False, "error": str(exc)}
 
     def get_companion_status(self):
-        return self._companion_service.status()
+        result = self._companion_service.status()
+        result["auto_start"] = bool(getattr(self, "settings", {}).get("companion_auto_start"))
+        return result
 
     def set_guide_system_path(self, slug, system_id, edge_id):
         try:
@@ -143,11 +156,26 @@ class ExperienceApi:
         except smart_guide.SmartGuideError as exc:
             return {"ok": False, "error": str(exc)}
 
-    def start_companion(self, address):
+    def start_companion(self, address, port=None):
         try:
-            return self._companion_service.start(str(address))
+            result = self._companion_service.start(str(address), port)
+            if result.get("ok") and hasattr(self, "settings"):
+                self.settings["companion_auto_start"] = True
+                self.settings["companion_address"] = str(address)
+                self.settings["companion_port"] = int(result.get("port") or port or 47831)
+                from engine import save_settings
+                save_settings(self.settings)
+            return result
         except (ValueError, OSError) as exc:
             return {"ok": False, "error": f"Não foi possível iniciar: {exc}. Verifique a rede privada e o firewall."}
+
+    def set_companion_auto_start(self, enabled):
+        if not hasattr(self, "settings"):
+            return {"ok": False, "error": "Configuração indisponível."}
+        self.settings["companion_auto_start"] = bool(enabled)
+        from engine import save_settings
+        save_settings(self.settings)
+        return {"ok": True, "enabled": self.settings["companion_auto_start"]}
 
     def stop_companion(self):
         return self._companion_service.stop()
@@ -158,14 +186,20 @@ class ExperienceApi:
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
-    def approve_companion(self, request_id, approved=True):
+    def approve_companion(self, request_id, approved=True, remember=True):
         try:
-            return self._companion_service.approve(str(request_id), bool(approved))
+            return self._companion_service.approve(str(request_id), bool(approved), bool(remember))
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
     def revoke_companion(self, device_id):
         return self._companion_service.revoke(str(device_id))
+
+    def rename_companion(self, device_id, name):
+        try:
+            return self._companion_service.rename(str(device_id), str(name or ""))
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
 
     def _companion_snapshot(self, slug=""):
         slug = slug or self._active_slug
@@ -191,10 +225,12 @@ class ExperienceApi:
         # definition revision plus independent value versions so a guide
         # toggle cannot conflict with an unrelated change elsewhere.
         progress_public = {key: progress.get(key) for key in
-                           ("completed", "checkpoint", "revealed_spoilers")}
+                           ("completed", "favorites", "checkpoint", "revealed_spoilers")}
         progress_public["value_versions"] = dict(progress.get("value_versions") or {})
         public_system_state = {key: copy.deepcopy(system_state.get(key)) for key in
-                               ("active_system", "goals", "completed_requirements", "node_media", "preferences", "value_versions")}
+                               ("active_system", "goals", "completed_requirements",
+                                "completed_requirement_targets", "requirements_scoped",
+                                "node_media", "preferences", "value_versions")}
         version = smart_guide._json_hash([definition_revision, progress_public, public_system_state])
         progress_revision = smart_guide._json_hash(progress_public)
         catalog = getattr(self, "_items", None)
@@ -321,8 +357,11 @@ class ExperienceApi:
                 quantity = body.get("value", body.get("quantity"))
                 if quantity is not None and (isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 0):
                     return {"ok": False, "code": "invalid_value", "error": "Quantidade de item inválida."}
-                item_revision = body.get("expected_item_revision",
-                                        expected.get("item_revision", snapshot.get("items_revision", 0)))
+                item_revision = body.get("expected_value_version",
+                                         expected.get("value_version", target.get("value_version")))
+                if item_revision is None:
+                    item = next((row for row in snapshot.get("items") or [] if row.get("id") == identifier), {})
+                    item_revision = item.get("value_version", 0)
                 try:
                     item_revision = int(item_revision)
                 except (TypeError, ValueError):
@@ -333,8 +372,11 @@ class ExperienceApi:
                     conflict = any(token in error.casefold() for token in ("mudou", "versão", "versao", "atualize"))
                     return {"ok": False, "conflict": conflict,
                             "code": "version_conflict" if conflict else "validation_error", "error": error}
+                updated_item = next((row for row in result.get("items") or []
+                                     if row.get("id") == identifier), {})
                 return {"ok": True, "kind": "item", "request_id": request_id,
-                        "item_id": identifier, "value": quantity,
+                        "target": f"item:{identifier}", "item_id": identifier, "value": quantity,
+                        "value_version": updated_item.get("value_version", 0),
                         "items_revision": result.get("revision"),
                         "idempotent": bool(result.get("idempotent"))}
             if body.get("kind") == "requirement":
@@ -350,6 +392,20 @@ class ExperienceApi:
                     expected_value_version=expected_version)
                 self._refresh_smart_bundle(body.get("slug") or "")
                 return {"ok": True, "kind": "requirement", "request_id": request_id,
+                        "target": result.get("target"), "value": result.get("value"),
+                        "value_version": result.get("value_version"),
+                        "definition_revision": result.get("definition_revision"),
+                        "progress_revision": smart_guide._json_hash(result.get("state") or {}),
+                        "idempotent": result.get("idempotent", False)}
+            if body.get("kind") == "goal":
+                system_id = str(target.get("system_id") or body.get("system_id") or "")
+                node_id = str(target.get("node_id") or body.get("node_id") or "")
+                result = self._guides.set_system_goal_versioned(
+                    body.get("slug") or "", system_id, node_id,
+                    request_id=request_id, expected_definition_revision=expected_definition,
+                    expected_value_version=expected_version)
+                self._refresh_smart_bundle(body.get("slug") or "")
+                return {"ok": True, "kind": "goal", "request_id": request_id,
                         "target": result.get("target"), "value": result.get("value"),
                         "value_version": result.get("value_version"),
                         "definition_revision": result.get("definition_revision"),
