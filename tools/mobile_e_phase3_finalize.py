@@ -28,6 +28,8 @@ new_items = '''    await page.locator("#tabs [data-tab='items']").click();
     await page.waitForSelector(".item-detail");
     await page.locator("[data-item-input]").fill("2");
     await page.locator("[data-act='item-save']").click();
+    await page.locator("[data-act='item-back']").click();
+    await page.waitForSelector("[data-act='item-open']");
     await page.locator("#tabs [data-tab='more']").click();
 '''
 if old_items in text:
