@@ -47,10 +47,19 @@ function missableWarning(game) {
 function shell(game, body) {
   const cfg = state?.config || {};
   const art = background(game, cfg.background_mode || "background");
+  // Em escalas altas a superfície mínima pode ficar menor que o corpo do
+  // cartão. O título da próxima ação precisa continuar no cabeçalho, que é a
+  // única região sempre visível, para o resumo nunca virar um retângulo sem
+  // contexto enquanto a janela é redimensionada.
+  const headerTitle = surface === "details"
+    ? game?.title
+    : surface === "summary" && game
+      ? objective(game).title
+      : "";
   return `<section class="hud ${state?.editing ? "editing" : ""}" style="--accent:${esc(color(game))}">
     ${art ? `<div class="hud-bg" style="background-image:url('${esc(art)}')"></div>` : ""}
     <div class="hud-shade"></div>
-    <header class="hud-head"><span class="hud-brand">DIGITRACKER</span>${surface === "details" ? `<span class="hud-title">${esc(game?.title || "")}</span>` : ""}<i class="hud-dot"></i>${state?.editing ? `<button class="hud-return" id="hud-return" title="Voltar ao aplicativo">×</button>` : ""}</header>
+    <header class="hud-head"><span class="hud-brand">DIGITRACKER</span>${headerTitle ? `<span class="hud-title">${esc(headerTitle)}</span>` : ""}<i class="hud-dot"></i>${state?.editing ? `<button class="hud-return" id="hud-return" title="Voltar ao aplicativo">×</button>` : ""}</header>
     ${body}
     ${state?.editing ? `<span class="edit-hint">ARRASTE PARA POSICIONAR</span><button class="resize-handle" id="resize-handle" aria-label="Redimensionar"></button>` : ""}
   </section>`;
@@ -195,15 +204,43 @@ function makeResizable(handle) {
 }
 
 async function refresh() {
+  // A janela filha pode existir alguns instantes antes da ponte JS do
+  // pywebview. Renderizar um estado mínimo nesse intervalo evita a aparência
+  // de uma caixa preta e, principalmente, torna falhas de bootstrap visíveis
+  // para o usuário em vez de engoli-las silenciosamente.
+  const bridge = api();
+  if (!bridge) {
+    if (!state) root.innerHTML = shell(null, `<p class="empty">Conectando ao DigiTracker…</p>`);
+    return;
+  }
   try {
-    state = await api()?.get_compact_surface_state(surface);
-    if (state?.ok) render();
-  } catch (_) { /* a janela pode estar sendo encerrada */ }
+    const next = await bridge.get_compact_surface_state(surface);
+    if (next?.ok) {
+      state = next;
+      render();
+    } else if (!state) {
+      root.innerHTML = shell(null, `<p class="empty">${esc(next?.error || "Overlay indisponível")}</p>`);
+    }
+  } catch (error) {
+    // A janela pode estar sendo encerrada; enquanto estiver visível, informe o
+    // estado para diferenciar encerramento de uma ponte que nunca carregou.
+    if (!state) root.innerHTML = shell(null, `<p class="empty">Não foi possível carregar o overlay.</p>`);
+  }
 }
 
 window.onCompactSurfaceChanged = refresh;
-window.addEventListener("pywebviewready", () => {
+
+// Algumas versões do WebView2 não reenviam `pywebviewready` para janelas
+// filhas criadas ocultas. Se dependermos só desse evento, o HUD fica com o
+// fundo escuro, mas nunca faz a primeira leitura do estado. Iniciar a mesma
+// rotina no DOMContentLoaded e tornar o início idempotente mantém a superfície
+// resiliente: chamadas anteriores ao bridge são ignoradas e o polling passa a
+// renderizar assim que a API estiver disponível.
+function startPolling() {
+  if (refreshTimer !== null) return;
   refresh();
   refreshTimer = setInterval(refresh, 2000);
-});
+}
+window.addEventListener("pywebviewready", startPolling);
+window.addEventListener("DOMContentLoaded", startPolling);
 window.addEventListener("beforeunload", () => clearInterval(refreshTimer));

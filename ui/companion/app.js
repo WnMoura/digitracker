@@ -8,6 +8,7 @@ const tabs = document.getElementById("tabs");
 const connection = document.getElementById("connection");
 const messageBox = document.getElementById("message");
 const M = {data: null, revisions: {}, storage: null, namespace: "", loadedNamespace: "", connected: false, refreshing: false, retry: 0, retryTimer: 0, flushing: null, message: "", error: false, drafts: {question: "", items: {}}, p: defaults()};
+let messageTimer = 0;
 
 function defaults() {
   return {view: "home", history: [], gameSlug: "", guideMode: "read", guideBlockId: "", atlasMode: "systems", atlasQuery: "", atlasSystemId: "", atlasNodeId: "", atlasEdgeId: "", itemFilter: "all", itemQuery: "", itemId: "", search: false, searchReturn: null, query: "", library: false, moreMode: "menu", assistant: false, source: null, conflict: null, forget: null, scroll: {}, recent: [], pending: []};
@@ -25,10 +26,19 @@ function queryMatches(query, ...values) {
   return normalized(values.map((value) => String(value ?? "")).join(" ")).includes(q);
 }
 
-function notify(text, error = false) {
+function notify(text, error = false, options = {}) {
+  clearTimeout(messageTimer);
   M.message = String(text || ""); M.error = Boolean(error);
   messageBox.textContent = M.message; messageBox.hidden = !M.message;
   messageBox.classList.toggle("error", M.error);
+  if (M.message && !options.sticky) {
+    const duration = Number(options.duration || (M.error ? 6500 : 3800));
+    messageTimer = setTimeout(() => {
+      M.message = ""; M.error = false;
+      messageBox.textContent = ""; messageBox.hidden = true;
+      messageBox.classList.remove("error");
+    }, Math.max(1200, duration));
+  }
 }
 function image(raw) {
   raw = String(raw || "").trim(); if (!raw) return "";
@@ -507,7 +517,7 @@ async function boot() {
   M.storage=await createStorage(); const params=new URLSearchParams(location.search), pair=new URLSearchParams(location.hash.slice(1)).get("pair");
   history.replaceState(null,"",location.pathname+(params.get("demo")==="1"?"?demo=1":""));
   if(params.get("demo")==="1"){M.demo=true;M.data=demoSnapshot();M.namespace=namespaceFor(M.data,"demo");M.p.gameSlug="demo";selections();setConnected(true);notify("Modo demo: as marcações não são enviadas ao PC.");return render();}
-  if(pair){try{await api("/pair",{code:pair,name:/iPad|Tablet/i.test(navigator.userAgent)?"Tablet":"Celular",remember:true});notify("Confirme este aparelho no PC.");const wait=async()=>{try{const value=await api("/pair/status",{});if(value.pending)return setTimeout(wait,1500);refresh(true);}catch(error){notify(error.message,true);disconnected(error.message);}};wait();}catch(error){notify(error.message,true);disconnected(error.message);}}else await refresh(true);
+  if(pair){try{await api("/pair",{code:pair,name:/iPad|Tablet/i.test(navigator.userAgent)?"Tablet":"Celular",remember:true});notify("Confirme este aparelho no PC.",false,{sticky:true});const wait=async()=>{try{const value=await api("/pair/status",{});if(value.pending)return setTimeout(wait,1500);notify("");refresh(true);}catch(error){notify(error.message,true);disconnected(error.message);}};wait();}catch(error){notify(error.message,true);disconnected(error.message);}}else await refresh(true);
 }
 function keyboardState(){const viewport=window.visualViewport;if(!viewport)return document.body.classList.remove("keyboard-open");document.body.classList.toggle("keyboard-open",window.innerHeight-viewport.height>120);}
 window.visualViewport?.addEventListener("resize",keyboardState);window.visualViewport?.addEventListener("scroll",keyboardState);document.addEventListener("focusin",event=>{if(event.target.matches("input,textarea,select"))setTimeout(()=>event.target.scrollIntoView({block:"center",behavior:"smooth"}),120);});keyboardState();

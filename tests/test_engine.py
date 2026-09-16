@@ -19,6 +19,50 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import engine  # noqa: E402
 
 
+def _guide_with_retro_block(title="Visite Kabuterimon depois de abrir a ponte"):
+    return {
+        "chapters": [{"title": "Floresta", "blocks": [{
+            "id": "kabuterimon", "type": "missable", "title": title,
+            "text": "Visite Kabuterimon na cachoeira.", "items": [], "rows": [],
+        }]}],
+    }
+
+
+def test_guia_exibe_estado_vivo_do_retroachievements_sem_regravar_documento():
+    document = _guide_with_retro_block()
+    original = json.loads(json.dumps(document))
+    decorated, summary = engine.decorate_guide_with_retroachievements(
+        document, [{"id": 77, "name": "Visite Kabuterimon", "achievement_type": "missable",
+                    "earned": False, "hardcore": False, "desc": "Faça depois da ponte."}],
+    )
+    block = decorated["chapters"][0]["blocks"][0]
+    assert document == original
+    assert block["achievement_statuses"][0]["pending"] is True
+    assert summary["pending_retro_missables"][0]["id"] == 77
+    assert summary["unlinked_missables"] == []
+
+
+def test_guia_remove_pendencia_quando_retroachievements_confirma_hardcore():
+    decorated, summary = engine.decorate_guide_with_retroachievements(
+        _guide_with_retro_block("Visite Kabuterimon"),
+        [{"id": 77, "name": "Visite Kabuterimon", "achievement_type": "missable",
+          "earned": True, "hardcore": True}],
+    )
+    status = decorated["chapters"][0]["blocks"][0]["achievement_statuses"][0]
+    assert status["hardcore"] is True
+    assert status["pending"] is False
+    assert summary["pending_retro_missables"] == []
+
+
+def test_guia_mantem_perdivel_oficial_sem_passo_associado_para_revisao():
+    _, summary = engine.decorate_guide_with_retroachievements(
+        _guide_with_retro_block("Outra tarefa"),
+        [{"id": 88, "name": "Recrute Ogremon", "achievement_type": "missable",
+          "earned": False, "hardcore": False}],
+    )
+    assert [row["id"] for row in summary["unlinked_missables"]] == [88]
+
+
 @pytest.fixture
 def handler():
     """`translate_path` não usa estado da conexão, então dá para exercitá-lo
@@ -1156,6 +1200,109 @@ class TestConfiguracoesPorSessao:
         assert api._compact_expected_size is None
         assert api._overlay_native_status == {"passive": False, "error": ""}
 
+    def test_nao_esconde_janela_principal_antes_de_um_hud_carregar(self, api):
+        class Window:
+            hidden = False
+
+            def hide(self):
+                self.hidden = True
+
+            def show(self):
+                self.hidden = False
+
+        api._window_op = lambda fn: fn()
+        api._window = Window()
+        api._overlay_windows = {"summary": Window(), "details": Window()}
+        api._overlay_loaded = set()
+
+        result = api.set_compact(True, from_user=False)
+
+        assert api._window.hidden is False
+        assert result["pending"] is True
+        assert "carregando" in result["error"].lower()
+
+    def test_hud_carregado_e_movido_nativamente_para_tv_antes_de_ocultar_principal(self, api):
+        class Window:
+            hidden = False
+            moves = []
+
+            def resize(self, width, height):
+                self.size = (width, height)
+
+            def move(self, x, y):
+                self.moves.append((x, y))
+
+            def hide(self):
+                self.hidden = True
+
+            def show(self):
+                self.hidden = False
+
+            def evaluate_js(self, _script):
+                pass
+
+        class Tracker:
+            @staticmethod
+            def status():
+                return {"process": "PPSSPPWindows64.exe", "rect": (1920, 0, 1920, 1080)}
+
+            @staticmethod
+            def own_window_handle(_window, title=""):
+                return 202 if "summary" in title else 303
+
+        class Input:
+            moves = []
+            docks = []
+            shown = []
+
+            @classmethod
+            def move_no_activate(cls, hwnd, x, y, width, height):
+                cls.moves.append((hwnd, x, y, width, height))
+                return True
+
+            @classmethod
+            def dock_no_activate(cls, hwnd, rect, width, height, **options):
+                cls.docks.append((hwnd, rect, width, height, options))
+                return True
+
+            @classmethod
+            def show_no_activate(cls, hwnd):
+                cls.shown.append(hwnd)
+                return True
+
+            @staticmethod
+            def hide_window(_hwnd):
+                return True
+
+            @staticmethod
+            def status():
+                return {"registered": False, "error": "teste sem hotkey"}
+
+            @staticmethod
+            def restore(_hwnd=None):
+                pass
+
+        main, summary = Window(), Window()
+        api._window_op = lambda fn: fn()
+        api._window = main
+        api._tracker = Tracker()
+        api._overlay_input = Input()
+        api._overlay_windows = {"summary": summary}
+
+        api.attach_overlay_window("summary", summary)
+        result = api.set_compact(True, from_user=False)
+
+        assert result["pending"] is False
+        assert main.hidden is True
+        assert Input.shown == [202]
+        assert Input.moves == []
+        hwnd, rect, width, height, options = Input.docks[-1]
+        assert hwnd == 202
+        assert rect == (1920, 0, 1920, 1080)
+        assert options["corner"] == "top-right"
+        assert options["anchor_hwnd"] is None
+        assert width >= 260 and height >= 90
+
 
 class TestCleanWalkthrough:
     def test_descarta_o_mode_legado(self):
@@ -1222,8 +1369,18 @@ class TestBootstrapWindow:
         assert notification["kwargs"]["js_api"] is not main["kwargs"]["js_api"]
         assert main["kwargs"].get("transparent", False) is False
         assert main["kwargs"]["background_color"] == "#050c18"
-        assert summary["kwargs"]["hidden"] is True
-        assert details["kwargs"]["hidden"] is True
+        assert main["kwargs"]["frameless"] is False
+        assert main["kwargs"]["on_top"] is False
+        assert main["kwargs"]["resizable"] is True
+        # As superfícies do WebView2 precisam inicializar visíveis para que o
+        # EdgeChromium componha o HTML. Elas nascem fora da área de trabalho e
+        # são escondidas pelo callback ``loaded`` até o compacto ser ativado.
+        assert summary["kwargs"]["hidden"] is False
+        assert details["kwargs"]["hidden"] is False
+        assert summary["kwargs"]["x"] == -10000
+        assert summary["kwargs"]["y"] == -10000
+        assert details["kwargs"]["x"] == -10000
+        assert details["kwargs"]["y"] == -10000
         assert summary["kwargs"]["frameless"] is True
         assert details["kwargs"]["frameless"] is True
 

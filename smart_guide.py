@@ -46,6 +46,104 @@ BLOCK_TYPES = {
     "spoiler", "resource", "checkpoint",
 }
 
+# Blocos que representam uma unidade de ação no walkthrough.  A classificação
+# é deliberadamente conservadora: texto narrativo só vira missão quando a
+# fonte/curadoria declarar ``mission.is_mission`` explicitamente.
+MISSION_CATEGORIES = {
+    "objective": "objetivo",
+    "checklist": "área",
+    "challenge": "desafio",
+    "missable": "perdível",
+    "checkpoint": "checkpoint",
+}
+
+
+def _mission_metadata(value: object, kind: str, block_id: str, title: str,
+                      items: list[dict], refs: list[dict]) -> dict | None:
+    """Retorna metadados estáveis para uma missão editorial.
+
+    Não tenta extrair missões de prosa livre.  A IA/importação pode marcar um
+    bloco narrativo com ``{\"is_mission\": true}``, mas a validação ainda
+    normaliza o título, a categoria e a contagem localmente.
+    """
+    raw = value if isinstance(value, dict) else {}
+    explicit = raw.get("is_mission") is True
+    if kind not in MISSION_CATEGORIES and not explicit:
+        return None
+    if raw.get("is_mission") is False and kind not in MISSION_CATEGORIES:
+        return None
+    category = _clean_text(raw.get("category"), 40).lower()
+    if category not in set(MISSION_CATEGORIES.values()):
+        category = MISSION_CATEGORIES.get(kind, "objetivo")
+    mission_title = _clean_text(raw.get("title") or title, 300) or "Missão"
+    requested_steps = _safe_int(raw.get("steps_total"), 0)
+    steps_total = requested_steps if requested_steps > 0 else max(1, len(items))
+    return {
+        "id": _stable_id("mission", block_id),
+        "is_mission": True,
+        "title": mission_title,
+        "category": category,
+        "steps_total": min(100, steps_total),
+        "source_backed": bool(_has_source(refs)),
+    }
+
+
+def annotate_missions(document: dict) -> dict:
+    """Anota missões sem reescrever ou normalizar o restante do documento.
+
+    Serve para revisões já publicadas: preserva IDs, progresso, mídia e todos
+    os metadados existentes, adicionando somente a classificação derivada.
+    """
+    result = deepcopy(document) if isinstance(document, dict) else {}
+    for chapter in result.get("chapters") or []:
+        if not isinstance(chapter, dict):
+            continue
+        for block in chapter.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            kind = str(block.get("type") or "text").strip().lower()
+            items = block.get("items") if isinstance(block.get("items"), list) else []
+            refs = _source_refs(block.get("source_refs"))
+            mission = _mission_metadata(
+                block.get("mission"), kind, _clean_text(block.get("id"), 80),
+                _clean_text(block.get("title"), 300), items, refs,
+            )
+            if mission:
+                block["mission"] = mission
+            elif isinstance(block.get("mission"), dict):
+                block.pop("mission", None)
+    return result
+
+
+def _clean_block_context(value: object) -> dict:
+    """Normaliza contexto operacional opcional de um bloco.
+
+    O texto original continua sendo a fonte de verdade.  Estes campos apenas
+    tornam explícitas as relações de ordem que a fonte já declarou (por
+    exemplo, uma visita que só pode acontecer depois de outra ação).  Valores
+    ausentes permanecem vazios; nenhum requisito é inferido localmente.
+    """
+    raw = value if isinstance(value, dict) else {}
+
+    def clean_list(item: object) -> list[str]:
+        values = item if isinstance(item, list) else []
+        result = []
+        for entry in values[:20]:
+            text = _clean_text(entry, 500)
+            if text:
+                result.append(text)
+        return result
+
+    return {
+        "before": clean_list(raw.get("before")),
+        "after": clean_list(raw.get("after")),
+        "when": _clean_text(raw.get("when"), 500),
+        "where": _clean_text(raw.get("where"), 500),
+        "why": _clean_text(raw.get("why"), 500),
+        "result": _clean_text(raw.get("result"), 500),
+        "verification": _clean_text(raw.get("verification"), 500),
+    }
+
 
 class SmartGuideError(ValueError):
     pass
@@ -524,18 +622,30 @@ def validate_document(document: dict) -> dict:
             for row in block.get("rows") or []:
                 if isinstance(row, list):
                     row_data.append([_clean_text(cell, 1_000) for cell in row[:12]])
-            clean_blocks.append({
+            clean_block = {
                 "id": block_id,
                 "type": kind,
                 "title": _clean_text(block.get("title"), 500),
                 "text": _clean_text(block.get("text"), 10_000),
                 "items": items[:100],
                 "rows": row_data[:100],
+                # Contexto é aditivo e editorial: só aparece quando a fonte
+                # (ou uma revisão humana/IA validada) declarou a ordem,
+                # localização ou resultado.  A validação mantém o documento
+                # antigo compatível, preenchendo um objeto vazio.
+                "context": _clean_block_context(block.get("context")),
                 "source_refs": refs[:20],
                 "visual_id": _clean_text(block.get("visual_id"), 100),
                 "estimated_minutes": max(0, min(24 * 60, int(block.get("estimated_minutes") or 0))),
                 "achievement_id": max(0, _safe_int(block.get("achievement_id"))),
-            })
+            }
+            mission = _mission_metadata(
+                block.get("mission"), kind, block_id, clean_block["title"],
+                items, refs,
+            )
+            if mission:
+                clean_block["mission"] = mission
+            clean_blocks.append(clean_block)
         if clean_blocks:
             clean["chapters"].append({
                 "id": _clean_text(chapter.get("id"), 80) or _stable_id("c", ci, title),

@@ -1,6 +1,6 @@
 """DigiTracker — engine principal.
 
-Abre uma janela pywebview always-on-top / sem moldura, serve a UI
+Abre uma janela pywebview nativa, serve a UI
 (HTML/CSS/JS) por um servidor estático interno e expõe a lógica de backend
 para o frontend via `js_api`. Um thread de sincronização consulta a
 RetroAchievements a cada 30s e mantém o estado de cada jogo em memória.
@@ -358,6 +358,125 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
+def _guide_block_text(block: dict) -> str:
+    """Texto pesquisável de um bloco, incluindo itens de checklist.
+
+    A associação com a RetroAchievements é deliberadamente conservadora: um
+    título de conquista só é ligado quando aparece explicitamente no bloco ou
+    quando o documento já trouxe ``achievement_id``. Não se usa posição do
+    capítulo como prova de relação.
+    """
+    values = [block.get("title", ""), block.get("text", "")]
+    for item in block.get("items") or []:
+        values.append(item.get("text", "") if isinstance(item, dict) else item)
+    return _normalize_text(" ".join(str(value or "") for value in values))
+
+
+def _retro_achievement_status(row: dict) -> dict:
+    """Representação pública, pequena e atualizada, de uma conquista do RA."""
+    achievement_type = str(row.get("achievement_type") or "").strip().lower()
+    earned = bool(row.get("earned"))
+    hardcore = bool(row.get("hardcore"))
+    return {
+        "id": int(row.get("id") or 0),
+        "name": str(row.get("name") or row.get("title") or ""),
+        "description": str(row.get("desc") or row.get("description") or ""),
+        "achievement_type": achievement_type,
+        "earned": earned,
+        "hardcore": hardcore,
+        "pending": achievement_type == "missable" and not hardcore,
+        "softcore_only": earned and not hardcore,
+        "step": row.get("step"),
+        "area": str(row.get("area") or ""),
+        "date": str(row.get("date") or ""),
+    }
+
+
+def decorate_guide_with_retroachievements(document: dict,
+                                          achievements: list[dict] | tuple[dict, ...] | None) -> tuple[dict, dict]:
+    """Liga avisos oficiais ao Guia sem alterar o documento persistido.
+
+    O Guia Inteligente é uma curadoria editorial e a lista do RA é o estado
+    vivo. Esta função mantém as duas coisas separadas: cada bloco recebe uma
+    lista ``achievement_statuses`` somente quando há id explícito ou nome
+    inequívoco no próprio texto; o resumo também expõe os perdíveis oficiais
+    que ainda não foram posicionados em nenhum bloco. Assim uma conquista
+    obtida em Hardcore deixa de aparecer como pendência no Guia na próxima
+    sincronização, enquanto um cartão sem correspondência continua visível
+    para revisão humana em vez de ser inventado.
+    """
+    clean_document = copy.deepcopy(document or {})
+    rows = []
+    for raw in achievements or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            aid = int(raw.get("id") or 0)
+        except (TypeError, ValueError):
+            aid = 0
+        if aid <= 0:
+            continue
+        row = dict(raw)
+        row["id"] = aid
+        rows.append(row)
+    by_id = {row["id"]: row for row in rows}
+    linked_ids = set()
+
+    for chapter in clean_document.get("chapters") or []:
+        if not isinstance(chapter, dict):
+            continue
+        for block in chapter.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            statuses = []
+            explicit_id = 0
+            try:
+                explicit_id = int(block.get("achievement_id") or 0)
+            except (TypeError, ValueError):
+                explicit_id = 0
+            if explicit_id in by_id:
+                statuses.append(by_id[explicit_id])
+            else:
+                haystack = _guide_block_text(block)
+                block_type = str(block.get("type") or "").lower()
+                # Um bloco de achievement pode relacionar qualquer conquista;
+                # os demais só relacionam perdíveis, evitando que um checklist
+                # de recrutamento vire uma lista de todos os troféus do jogo.
+                allowed = (lambda row: block_type == "achievement" or
+                           str(row.get("achievement_type") or "").lower() == "missable")
+                for row in rows:
+                    name = _normalize_text(row.get("name") or row.get("title") or "")
+                    if not name or len(name) < 4 or not allowed(row):
+                        continue
+                    if name in haystack:
+                        statuses.append(row)
+                    if len(statuses) >= 12:
+                        break
+            public_statuses = [_retro_achievement_status(row) for row in statuses]
+            if public_statuses:
+                block["achievement_statuses"] = public_statuses
+                # Keep a singular alias for lightweight clients created before
+                # the list was introduced.
+                block["achievement_status"] = public_statuses[0]
+                linked_ids.update(item["id"] for item in public_statuses)
+            else:
+                # Always expose a stable empty list so the UI need not guess
+                # whether the field came from an old or a new revision.
+                block["achievement_statuses"] = []
+
+    official = [_retro_achievement_status(row) for row in rows
+                if str(row.get("achievement_type") or "").lower() == "missable"]
+    unlinked = [item for item in official if item["id"] not in linked_ids]
+    pending = [item for item in official if item["pending"]]
+    clean_document["retro_missables"] = official
+    clean_document["unlinked_missables"] = unlinked
+    return clean_document, {
+        "retro_missables": official,
+        "pending_retro_missables": pending,
+        "unlinked_missables": unlinked,
+    }
+
+
 def _move_after_resize(win, pos, settle: float = 0.1, tries: int = 4) -> None:
     """Move a janela para `pos`, reconferindo até assentar.
 
@@ -479,6 +598,7 @@ class Api(ExperienceApi, DataToolsApi):
         self._compact_variant = self.settings.get("compact_view", "minimal")
         self._compact_edit_mode = False
         self._compact_edit_timer = None
+        self._compact_transition_pending = False
         self._compact_expected_size: tuple[int, int] | None = None
         self._pre_compact_pos: tuple[int, int] | None = None
         self._pre_compact_size: tuple[int, int] | None = None
@@ -1917,6 +2037,14 @@ class Api(ExperienceApi, DataToolsApi):
         else:
             bundle["effective_progress"] = bundle.get("progress") or {}
         bundle["external_completed"] = external_completed
+        # A conquista perdível é uma fonte viva (RetroAchievements), enquanto
+        # o texto do Guia é uma revisão editorial. Decore uma cópia do
+        # documento para que o Guia mostre o estado atualizado sem regravar nem
+        # alterar a revisão publicada.
+        decorated, retro = decorate_guide_with_retroachievements(
+            bundle.get("current") or {}, state.get("achievements") or [])
+        bundle["current"] = decorated
+        bundle.update(retro)
         bundle["walkthrough_sources"] = self._guides.walkthrough_sources(slug)
         bundle["merge_status"] = self.get_walkthrough_merge_status(slug)
         bundle["atlas_jobs"] = self._guides.system_sources(slug)
@@ -4354,8 +4482,16 @@ class Api(ExperienceApi, DataToolsApi):
                     self._overlay_hwnds[surface] = hwnd
             except Exception:
                 pass
-        self._layout_overlay_surfaces(self._current_overlay_rect(), resize=True)
+        shown = self._layout_overlay_surfaces(self._current_overlay_rect(), resize=True)
         self._configure_native_overlay()
+        # O watcher pode detectar o emulador antes de o WebView filho terminar
+        # de carregar. Nesse caso set_compact mantém a janela principal visível;
+        # somente este callback, depois de posicionar e exibir um HUD real,
+        # conclui a transição. Assim uma inicialização lenta nunca faz o
+        # DigiTracker simplesmente desaparecer.
+        if self._compact and shown and self._window:
+            self._compact_transition_pending = False
+            self._window_op(self._window.hide)
         self._notify_overlay_surfaces()
 
     @staticmethod
@@ -4495,26 +4631,33 @@ class Api(ExperienceApi, DataToolsApi):
         except Exception:
             return 0, 0, self._normal_size[0], self._normal_size[1]
 
-    def _set_surface_visible(self, surface: str, visible: bool) -> None:
+    def _set_surface_visible(self, surface: str, visible: bool) -> bool:
         # Os objetos Window existem antes do evento `loaded`, mas WinForms e
         # WebView2 ainda nao. Ignorar a superficie nesse curto intervalo evita
         # bloquear a thread de UI durante o bootstrap da build onefile.
         if surface not in self._overlay_loaded:
-            return
+            return False
         win = self._overlay_windows.get(surface)
         if not win:
-            return
+            return False
         hwnd = self._overlay_hwnds.get(surface)
         native = (self._overlay_input.show_no_activate(hwnd) if visible and hwnd else
                   self._overlay_input.hide_window(hwnd) if not visible and hwnd else False)
         if not native:
             self._window_op(win.show if visible else win.hide)
+            # No Windows, esconder a janela principal só é seguro depois que o
+            # HWND do HUD confirmou SW_SHOWNOACTIVATE. A chamada pywebview é
+            # assíncrona e foi justamente a origem do "DigiTracker sumiu".
+            if visible and sys.platform == "win32":
+                return False
+        return True
 
-    def _layout_overlay_surfaces(self, rect=None, resize: bool = True) -> None:
+    def _layout_overlay_surfaces(self, rect=None, resize: bool = True) -> set[str]:
         if not self._overlay_windows:
-            return
+            return set()
         rect = rect or self._fallback_overlay_rect()
         enabled = set(self._enabled_compact_surfaces()) if self._compact else set()
+        shown: set[str] = set()
         for surface, win in self._overlay_windows.items():
             if surface not in self._overlay_loaded:
                 continue
@@ -4524,14 +4667,49 @@ class Api(ExperienceApi, DataToolsApi):
             size = self._surface_size(surface, rect)
             pos = self._surface_dock(surface, rect, size)
             self._overlay_expected_sizes[surface] = size
+            hwnd = self._overlay_hwnds.get(surface)
+            moved_natively = False
+            dock_native = getattr(self._overlay_input, "dock_no_activate", None)
+            move_native = getattr(self._overlay_input, "move_no_activate", None)
+            if hwnd and dock_native:
+                try:
+                    stored = self._stored_compact_geometry(surface)
+                    offset = None
+                    if stored and "offset_x" in stored and "offset_y" in stored:
+                        offset = (int(stored["offset_x"]), int(stored["offset_y"]))
+                    config = self._compact_surfaces_config()[surface]
+                    corner = config.get("corner") or (
+                        "top-right" if surface == "summary" else "bottom-right"
+                    )
+                    if corner == "auto":
+                        corner = "top-right" if surface == "summary" else "bottom-right"
+                    tracker_status = self._tracker.status() if self._tracker else {}
+                    moved_natively = bool(dock_native(
+                        hwnd, rect, *size, corner=corner, margin=COMPACT_MARGIN,
+                        offset=offset, anchor_hwnd=tracker_status.get("hwnd"),
+                    ))
+                except Exception:
+                    moved_natively = False
+            elif hwnd and move_native:
+                try:
+                    # SetWindowPos trabalha no espaço global do desktop e
+                    # aceita coordenadas negativas. É mais confiável que duas
+                    # chamadas assíncronas resize/move quando o PPSSPP está em
+                    # uma TV ou monitor com escala diferente.
+                    moved_natively = bool(move_native(hwnd, *pos, *size))
+                except Exception:
+                    moved_natively = False
 
             def apply_layout(target=win, target_size=size, target_pos=pos):
                 if resize:
                     target.resize(*target_size)
                 _move_after_resize(target, target_pos)
 
-            self._window_op(apply_layout)
-            self._set_surface_visible(surface, True)
+            if not moved_natively:
+                self._window_op(apply_layout)
+            if self._set_surface_visible(surface, True):
+                shown.add(surface)
+        return shown
 
     def set_compact(self, value: bool, dock=None, from_user: bool = True, size=None) -> dict:
         """Alterna entre o dashboard completo e um mini-overlay (quadradinho)
@@ -4560,14 +4738,25 @@ class Api(ExperienceApi, DataToolsApi):
                 if self._compact_edit_timer:
                     self._compact_edit_timer.cancel()
                     self._compact_edit_timer = None
+                self._compact_transition_pending = False
             self._compact = value
             self._compact_variant = self._legacy_variant_from_surfaces()
             self._compact_state = self._compact_variant if value else "hidden"
-            self._layout_overlay_surfaces(self._current_overlay_rect(), resize=True)
+            shown = self._layout_overlay_surfaces(self._current_overlay_rect(), resize=True)
             if value:
                 self._configure_native_overlay()
-                if self._window:
+                if shown and self._window:
+                    self._compact_transition_pending = False
                     self._window_op(self._window.hide)
+                elif self._window:
+                    # Não esconda o único caminho de recuperação enquanto os
+                    # HUDs filhos ainda não possuem conteúdo/janela utilizável.
+                    self._window_op(self._window.show)
+                    self._overlay_native_status = {
+                        "passive": False,
+                        "error": "HUD ainda carregando; a janela principal foi mantida visível.",
+                    }
+                    self._compact_transition_pending = True
             elif self._window:
                 self._window_op(self._window.show)
             self._notify_ui_compact(value, self._compact_state)
@@ -4575,7 +4764,10 @@ class Api(ExperienceApi, DataToolsApi):
                 self._overlay.notify_manual_exit()
             return {"ok": True, "compact": value, "state": self._compact_state,
                     "editing": self._compact_edit_mode,
-                    "surfaces": list(self._enabled_compact_surfaces())}
+                    "surfaces": list(self._enabled_compact_surfaces()),
+                    "pending": bool(value and not shown),
+                    "error": ("HUD ainda carregando; a janela principal foi mantida visível."
+                              if value and not shown else "")}
         # Ao voltar para o aplicativo completo, recupere os cliques antes de
         # enfileirar resize/movimentação. Assim a janela nunca fica grande e
         # ainda marcada como passa-clique caso a operação visual demore.
@@ -5243,6 +5435,7 @@ class Api(ExperienceApi, DataToolsApi):
         # HWND da própria janela (Windows) para re-aplicar o always-on-top
         try:
             self._own_hwnd = self._tracker.own_window_handle(self._window)
+            emulator_tracker.apply_dark_window_chrome(self._own_hwnd)
         except Exception:
             self._own_hwnd = None
         for surface, win in self._overlay_windows.items():
@@ -5267,6 +5460,13 @@ class Api(ExperienceApi, DataToolsApi):
                         hwnd = self._tracker.own_window_handle(win, f"DigiTracker {surface}")
                         if hwnd:
                             self._overlay_hwnds[surface] = hwnd
+                if self._compact and self._compact_transition_pending:
+                    shown = self._layout_overlay_surfaces(
+                        self._current_overlay_rect(), resize=True
+                    )
+                    if shown and self._window:
+                        self._compact_transition_pending = False
+                        self._window_op(self._window.hide)
                 if self._own_hwnd and self._compact:
                     self._configure_native_overlay()
                 with self._lock:
@@ -5652,6 +5852,10 @@ class Api(ExperienceApi, DataToolsApi):
             smart_bundle["atlas_jobs"] = self._guides.system_sources(slug)
             smart_bundle["atlas_drafts"] = [self._guides.atlas_draft(slug, item["id"])
                                              for item in smart_bundle["atlas_jobs"] if item.get("status") == "suggested"]
+            decorated, retro = decorate_guide_with_retroachievements(
+                smart_bundle.get("current") or {}, ordered)
+            smart_bundle["current"] = decorated
+            smart_bundle.update(retro)
 
         detail = {
             "slug": slug,
@@ -5800,7 +6004,7 @@ def main():
     normal_size = adaptive_normal_size()
     api._normal_size = normal_size
     port = start_static_server()
-    url = f"http://127.0.0.1:{port}/ui/index.html"
+    url = f"http://127.0.0.1:{port}/ui/index.html?native_window=1"
     overlay_url = f"http://127.0.0.1:{port}/ui/overlay.html"
 
     window = webview.create_window(
@@ -5809,10 +6013,11 @@ def main():
         js_api=api,
         width=normal_size[0],
         height=normal_size[1],
-        min_size=COMPACT_MIN,    # permite encolher até o menor overlay ajustável
-        frameless=True,
-        easy_drag=False,      # arrasto via .pywebview-drag-region
-        on_top=True,
+        min_size=(min(900, normal_size[0]), min(600, normal_size[1])),
+        frameless=False,
+        easy_drag=False,
+        resizable=True,
+        on_top=False,
         background_color="#050c18",
     )
     api._window = window
@@ -5832,7 +6037,13 @@ def main():
         width=COMPACT_SIZE[0],
         height=COMPACT_SIZE[1],
         min_size=COMPACT_MINIMAL_MIN,
-        hidden=True,
+        # EdgeChromium pode manter uma janela criada como ``hidden`` sem
+        # compor o WebView2. Inicializamos fora da área visível e escondemos no
+        # callback ``loaded``; assim a superfície já nasce com conteúdo pronto
+        # quando o modo compacto for ativado.
+        hidden=False,
+        x=-10000,
+        y=-10000,
         frameless=True,
         easy_drag=False,
         shadow=False,
@@ -5847,7 +6058,9 @@ def main():
         width=COMPACT_EXPANDED_SIZE[0],
         height=COMPACT_EXPANDED_SIZE[1],
         min_size=COMPACT_EXPANDED_MIN,
-        hidden=True,
+        hidden=False,
+        x=-10000,
+        y=-10000,
         frameless=True,
         easy_drag=False,
         shadow=False,
@@ -5872,6 +6085,18 @@ def main():
         if services_started.is_set():
             return
         services_started.set()
+        # A janela principal usa a moldura normal do Windows para continuar
+        # arrastável/minimizável. Harmonize-a com a interface escura assim que
+        # o HWND existir, evitando a faixa branca do tema claro do sistema.
+        try:
+            if api._tracker:
+                api._own_hwnd = api._tracker.own_window_handle(api._window, "DigiTracker")
+            if not api._own_hwnd and sys.platform == "win32":
+                native_user32 = ctypes.windll.user32
+                api._own_hwnd = int(native_user32.FindWindowW(None, "DigiTracker") or 0)
+            emulator_tracker.apply_dark_window_chrome(api._own_hwnd)
+        except Exception:
+            pass
         threading.Thread(target=api.sync_loop, daemon=True).start()
         threading.Thread(target=api.overlay_loop, daemon=True).start()
 

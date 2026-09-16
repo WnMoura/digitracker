@@ -28,6 +28,81 @@ def test_fallback_generico_nao_altera_fonte():
     }
 
 
+def test_contexto_de_ordem_e_localizacao_e_preservado_no_schema():
+    doc = smart_guide.from_legacy_sections("Jogo", SECTIONS)
+    doc["chapters"][0]["blocks"][0]["context"] = {
+        "before": ["Abra a ponte."],
+        "after": ["Visite Kabuterimon na cachoeira."],
+        "when": "Depois de vencer o chefe da floresta.",
+        "where": "Cachoeira.",
+        "why": "Recrutar o aliado.",
+        "result": "Kabuterimon entra na cidade.",
+        "verification": "Fale com ele novamente na praça.",
+    }
+    clean = smart_guide.validate_document(doc)
+    context = clean["chapters"][0]["blocks"][0]["context"]
+    assert context["before"] == ["Abra a ponte."]
+    assert context["after"] == ["Visite Kabuterimon na cachoeira."]
+    assert context["when"] == "Depois de vencer o chefe da floresta."
+
+
+def test_contexto_invalido_e_limpo_sem_inventar_dependencias():
+    doc = smart_guide.from_legacy_sections("Jogo", SECTIONS)
+    doc["chapters"][0]["blocks"][0]["context"] = {
+        "before": [" "], "after": "não é lista", "when": None,
+        "unexpected": "descartar",
+    }
+    context = smart_guide.validate_document(doc)["chapters"][0]["blocks"][0]["context"]
+    assert context == {
+        "before": [], "after": [], "when": "", "where": "", "why": "",
+        "result": "", "verification": "",
+    }
+
+
+def test_blocos_acionaveis_sao_identificados_como_missoes_sem_classificar_prosa():
+    doc = smart_guide.from_legacy_sections("Jogo", [{
+        "title": "Floresta", "blocks": [
+            {"type": "li", "text": "Visite Kabuterimon depois de recrutar Greymon."},
+            {"type": "p", "text": "A floresta é uma área de passagem."},
+            {"type": "boss", "text": "Derrote o chefe da área."},
+        ],
+    }])
+    blocks = doc["chapters"][0]["blocks"]
+    checklist, narrative, challenge = blocks
+    assert checklist["mission"]["is_mission"] is True
+    assert checklist["mission"]["category"] == "área"
+    assert checklist["mission"]["steps_total"] == 1
+    assert narrative.get("mission") is None
+    assert challenge["mission"]["category"] == "desafio"
+
+
+def test_missao_explicita_em_bloco_texto_e_estavel_e_fonte_obrigatoria():
+    doc = smart_guide.from_legacy_sections("Jogo", SECTIONS)
+    block = doc["chapters"][0]["blocks"][0]
+    block["mission"] = {"is_mission": True, "category": "objetivo", "steps_total": 3}
+    clean = smart_guide.validate_document(doc)
+    mission = clean["chapters"][0]["blocks"][0]["mission"]
+    assert mission["is_mission"] is True
+    assert mission["category"] == "objetivo"
+    assert mission["steps_total"] == 3
+    assert mission["source_backed"] is True
+
+
+def test_annotate_missions_preserva_documento_publicado():
+    original = {
+        "revision_id": "r1", "chapters": [{"blocks": [{
+            "id": "block-a", "type": "checklist", "title": "A",
+            "items": [{"text": "Passo"}], "source_refs": [{"section": 1, "block": 1}],
+            "progress_marker": "preservar",
+        }]}],
+    }
+    annotated = smart_guide.annotate_missions(original)
+    assert original["chapters"][0]["blocks"][0].get("mission") is None
+    assert annotated["revision_id"] == "r1"
+    assert annotated["chapters"][0]["blocks"][0]["progress_marker"] == "preservar"
+    assert annotated["chapters"][0]["blocks"][0]["mission"]["source_backed"] is True
+
+
 def test_schema_recusa_tipo_especifico_de_franquia():
     doc = smart_guide.from_legacy_sections("Jogo", SECTIONS)
     doc["chapters"][0]["blocks"][0]["type"] = "digivolution"

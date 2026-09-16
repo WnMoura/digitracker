@@ -84,6 +84,7 @@ const {chromium, webkit} = require("playwright");
     assert.deepEqual(stateChecks.remainingScopedTargets, ["requirement:system-a:edge-b:shared-condition"]);
 
     assert.match(await page.evaluate(() => document.querySelector("#tabs button.active")?.textContent || ""), /Início/);
+    await page.locator("#message").waitFor({state: "hidden", timeout: 5000});
     await page.locator("#tabs [data-tab='guide']").click();
     await page.waitForSelector(".reading-card");
     await page.locator("[data-act='guide-mode'][data-mode='index']").click();

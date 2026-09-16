@@ -14,6 +14,12 @@ const MODE_ICON = { hardcore: "⚡", softcore: "○" };
 const EXTRA_MODE_COLORS = ["#F5C518", "#27AE60", "#A855F7", "#FF8A3D"];
 const C_LINE = "#23233a", C_LOCKED = "#2C2C42";
 
+// A build desktop usa a moldura nativa do Windows. Os controles de sistema
+// (arrastar, minimizar, maximizar e fechar) ficam a cargo do SO; a barra web
+// conserva apenas as ações próprias do DigiTracker.
+const NATIVE_WINDOW = new URLSearchParams(location.search).get("native_window") === "1";
+if (NATIVE_WINDOW) document.documentElement.classList.add("native-window");
+
 const modeColor = (key) => MODE_COLOR[key]
   || EXTRA_MODE_COLORS[Math.abs([...String(key)].reduce((h, c) => h + c.charCodeAt(0), 0)) % EXTRA_MODE_COLORS.length];
 const modeLabel = (key) => MODE_LABEL[key] || String(key).toUpperCase();
@@ -122,7 +128,7 @@ const S = {
   activeSlug: null,
   tab: "journey",        // jornada | achievements | atlas
   achievementFilter: "all",
-  onTop: true,
+  onTop: false,
   compact: false,        // modo mini-overlay (progresso de conquistas)
   compactState: "hidden", // hidden | minimal | expanded | both
   compactTab: "achievements", // achievements | guide (por jogo/HUD)
@@ -687,11 +693,11 @@ window.onOverlayChanged = async (compact, state, editing) => {
   S.compactEditing = !!editing;
   await refreshCompactNativeStatus();
   syncInputMode();
-  const btn = document.getElementById("btn-compact");
-  if (btn) {
-    btn.classList.toggle("active", S.compact);
-    btn.title = S.compact ? "Sair do modo compacto" : "Modo compacto (overlay de progresso)";
-  }
+  document.querySelectorAll('#btn-compact, [data-window-action="compact"]').forEach((control) => {
+    control.classList.toggle("active", S.compact);
+    control.setAttribute("aria-pressed", String(S.compact));
+    control.title = S.compact ? "Sair do modo compacto" : "Modo compacto (overlay de progresso)";
+  });
   if (S.view === "dashboard") await renderDashboard({ force: true });
 };
 
@@ -1248,11 +1254,11 @@ async function toggleCompact(value) {
   S.compact = value !== undefined ? !!value : !S.compact;
   S.compactState = S.compact ? (S.compactCfg?.view || S.compactCfg?.variant || "minimal") : "hidden";
   syncInputMode();
-  const btn = document.getElementById("btn-compact");
-  if (btn) {
-    btn.classList.toggle("active", S.compact);
-    btn.title = S.compact ? "Sair do modo compacto" : "Modo compacto (overlay de progresso)";
-  }
+  document.querySelectorAll('#btn-compact, [data-window-action="compact"]').forEach((control) => {
+    control.classList.toggle("active", S.compact);
+    control.setAttribute("aria-pressed", String(S.compact));
+    control.title = S.compact ? "Sair do modo compacto" : "Modo compacto (overlay de progresso)";
+  });
   if (hasBackend()) await backend.setCompact(S.compact);
   await refreshCompactNativeStatus();
   if (S.compact && S.view !== "dashboard") {
@@ -1371,6 +1377,32 @@ function renderHall() {
   });
 }
 
+function guideBlockRetroStatuses(block) {
+  if (!block || typeof block !== "object") return [];
+  if (Array.isArray(block.achievement_statuses)) return block.achievement_statuses;
+  return block.achievement_status && typeof block.achievement_status === "object"
+    ? [block.achievement_status] : [];
+}
+
+function guideMission(block) {
+  const mission = block?.mission;
+  return mission && mission.is_mission === true ? mission : null;
+}
+
+function guideMissionBadge(mission) {
+  if (!mission) return "";
+  const category = mission.category || "objetivo";
+  const steps = Number(mission.steps_total || 0);
+  const suffix = steps > 1 ? ` · ${steps} etapas` : "";
+  return `<span class="smart-mission-badge" title="Missão identificada a partir do bloco e de suas referências">MISSÃO · ${esc(category)}${suffix}</span>`;
+}
+
+function retroStatusLabel(status) {
+  if (status?.hardcore) return "Confirmado em Hardcore";
+  if (status?.earned) return "Obtido em Softcore · refazer em Hardcore";
+  return "Pendente em Hardcore";
+}
+
 function mainHTML(game) {
   if (!game) {
     return `<main class="main"><div class="empty-main">
@@ -1394,14 +1426,19 @@ function mainHTML(game) {
   const smartDone = completedSmart.size;
   const pendingBlocks = smartBlocks.filter((b) => !completedSmart.has(b.id));
   const nextSteps = pendingBlocks.filter((b) => ["objective", "checklist", "checkpoint", "challenge"].includes(b.type)).slice(0, 3);
+  // Perdíveis oficiais e avisos editoriais podem apontar para o mesmo passo.
+  // O vínculo produzido pelo backend permite contar e exibir cada risco uma
+  // única vez, sem esconder um troféu que ainda falta refazer em Hardcore.
   const pendingGuideMissables = pendingBlocks.filter((b) => b.type === "missable");
   const pendingRAMissables = game.pending_missables || [];
+  const guideOnlyMissables = pendingGuideMissables.filter((block) =>
+    !guideBlockRetroStatuses(block).some((status) => status.achievement_type === "missable" && status.pending));
   const journeySteps = [
     ...pendingRAMissables.slice(0, 1).map((row) => ({ title: `Perdível: ${row.name}${row.earned && !row.hardcore ? " · refazer em Hardcore" : ""}`, urgent: true })),
     ...nextSteps,
   ].slice(0, 3);
-  const missables = pendingRAMissables.length + pendingGuideMissables.length;
-  const firstMissable = pendingRAMissables[0] || pendingGuideMissables[0] || {};
+  const missables = pendingRAMissables.length + guideOnlyMissables.length;
+  const firstMissable = pendingRAMissables[0] || guideOnlyMissables[0] || {};
   const personalNotes = Object.keys(smartProgress.notes || {}).length;
   const sessionMinutes = smartProgress.session_minutes || 30;
 
@@ -1453,7 +1490,7 @@ function mainHTML(game) {
       <button class="ptab ${S.tab === "atlas" ? "active" : ""}" data-tab="atlas"><b>◇</b> Atlas${(smartDoc.systems || []).filter((item) => item.status !== "rejected").length ? `<span class="count">${(smartDoc.systems || []).filter((item) => item.status !== "rejected").length}</span>` : ""}</button>
       <span class="tab-bumper">RB</span>
     </div>
-    ${S.tab === "journey" && S.guideReader ? `<div class="guide-commandbar dashboard-commandbar journey-reader-bar"><button class="btn-ghost" id="guide-reader-close">← Jornada</button><label class="guide-search"><span>⌕</span><input id="guide-search" value="${esc(S.guideQuery)}" placeholder="Buscar neste capítulo"></label><select id="guide-filter" aria-label="Filtrar guia"><option value="all">Tudo</option><option value="pending">Pendentes</option><option value="missable">Perdíveis</option><option value="warning">Avisos</option><option value="favorites">Favoritos</option><option value="achievement">Conquistas</option></select></div>` : ""}
+    ${S.tab === "journey" && S.guideReader ? `<div class="guide-commandbar dashboard-commandbar journey-reader-bar"><button class="btn-ghost" id="guide-reader-close">← Jornada</button><label class="guide-search"><span>⌕</span><input id="guide-search" value="${esc(S.guideQuery)}" placeholder="Buscar neste capítulo"></label><select id="guide-filter" aria-label="Filtrar guia"><option value="all">Tudo</option><option value="mission">Missões</option><option value="pending">Pendentes</option><option value="missable">Perdíveis</option><option value="warning">Avisos</option><option value="favorites">Favoritos</option><option value="achievement">Conquistas</option></select></div>` : ""}
     ${S.tab === "journey" && !S.guideReader ? `<section class="activity-deck hybrid-dashboard" aria-label="Continuar jogando">
       <div class="activity-main-grid">
         <button class="activity-card primary" data-jump-guide="${esc(next.block_id || "")}">
@@ -1952,6 +1989,27 @@ function guideSystemsHTML(game) {
 
 /* Leitor focado da Jornada. As fontes permanecem preservadas, mas sua gestão
    vive apenas em Configurações > Biblioteca para manter a navegação limpa. */
+function guideContextHTML(block) {
+  const context = block?.context && typeof block.context === "object" ? block.context : {};
+  const list = (values) => (Array.isArray(values) ? values : []).filter(Boolean)
+    .map((value) => `<li>${esc(value)}</li>`).join("");
+  const groups = [];
+  if ((context.before || []).length) groups.push(`<div><b>Antes deste passo</b><ul>${list(context.before)}</ul></div>`);
+  if ((context.after || []).length) groups.push(`<div><b>Depois deste passo</b><ul>${list(context.after)}</ul></div>`);
+  if (context.when) groups.push(`<div><b>Quando</b><p>${esc(context.when)}</p></div>`);
+  if (context.where) groups.push(`<div><b>Onde</b><p>${esc(context.where)}</p></div>`);
+  if (context.why) groups.push(`<div><b>Por que fazer</b><p>${esc(context.why)}</p></div>`);
+  if (context.result) groups.push(`<div><b>Resultado esperado</b><p>${esc(context.result)}</p></div>`);
+  if (context.verification) groups.push(`<div><b>Como confirmar</b><p>${esc(context.verification)}</p></div>`);
+  return groups.length ? `<aside class="smart-context" aria-label="Ordem e contexto da fonte"><span>ORDEM E CONTEXTO DA FONTE</span>${groups.join("")}</aside>` : "";
+}
+
+function guideAchievementStatusHTML(block) {
+  const statuses = guideBlockRetroStatuses(block);
+  if (!statuses.length) return "";
+  return `<aside class="guide-ra-status" aria-label="Estado sincronizado com RetroAchievements"><span>RETROACHIEVEMENTS</span>${statuses.map((status) => `<div class="${status.pending ? "pending" : status.hardcore ? "confirmed" : "softcore"}"><b>${esc(status.name || `#${status.id}`)}</b><small>${esc(retroStatusLabel(status))}</small>${status.description ? `<p>${esc(status.description)}</p>` : ""}</div>`).join("")}</aside>`;
+}
+
 function guideHTML(game) {
   const bundle = game.smart_guide || {};
   const doc = bundle.current || {};
@@ -1969,38 +2027,56 @@ function guideHTML(game) {
   const revealed = new Set(progress.revealed_spoilers || []);
   const notes = progress.notes || {};
   const mediaById = new Map((bundle.media || []).map((item) => [item.id, item]));
+  const pendingRetro = (bundle.pending_retro_missables || bundle.retro_missables || [])
+    .filter((status) => status.pending);
+  const unlinkedRetro = (bundle.unlinked_missables || []).filter((status) => status.pending);
   const query = S.guideQuery.trim().toLocaleLowerCase("pt-BR");
   const filter = S.guideFilter || "all";
   const icons = { objective: "→", checklist: "✓", warning: "!", missable: "◆", achievement: "♜", challenge: "⚔", table: "▦", comparison: "⇄", image: "▧", route: "↝", graph: "◇", note: "i", spoiler: "◉", resource: "＋", checkpoint: "◷", text: "·" };
   const visible = (block) => {
-    const hay = `${block.title || ""} ${block.text || ""} ${(block.items || []).map((item) => item.text).join(" ")}`.toLocaleLowerCase("pt-BR");
+    const context = block.context && typeof block.context === "object" ? block.context : {};
+    const contextText = [context.when, context.where, context.why, context.result, context.verification,
+      ...(Array.isArray(context.before) ? context.before : []), ...(Array.isArray(context.after) ? context.after : [])]
+      .filter(Boolean).join(" ");
+    const hay = `${block.title || ""} ${block.text || ""} ${(block.items || []).map((item) => typeof item === "string" ? item : item.text || "").join(" ")} ${contextText}`.toLocaleLowerCase("pt-BR");
     if (query && !hay.includes(query)) return false;
     if (filter === "pending" && completed.has(block.id)) return false;
     if (filter === "favorites" && !favorites.has(block.id)) return false;
-    if (!["all", "pending", "favorites"].includes(filter) && block.type !== filter) return false;
+    if (filter === "mission" && !guideMission(block)) return false;
+    if (filter === "missable") {
+      const linkedMissable = guideBlockRetroStatuses(block).some((status) => status.achievement_type === "missable");
+      if (block.type !== "missable" && !linkedMissable) return false;
+    } else if (!["all", "pending", "favorites", "mission"].includes(filter) && block.type !== filter) return false;
     return true;
   };
   const blocks = (chapter.blocks || []).filter(visible);
   const renderBlock = (block, index) => {
     const done = completed.has(block.id), favorite = favorites.has(block.id);
+    const mission = guideMission(block);
     const hiddenSpoiler = block.type === "spoiler" && !revealed.has(block.id);
     const visual = mediaById.get(block.visual_id);
-    const items = (block.items || []).length ? `<ul>${block.items.map((item) => `<li>${esc(item.text)}</li>`).join("")}</ul>` : "";
+    const items = (block.items || []).length ? `<ul>${block.items.map((item) => `<li>${esc(typeof item === "string" ? item : item.text || "")}</li>`).join("")}</ul>` : "";
     const table = (block.rows || []).length ? `<div class="smart-table">${block.rows.map((row) => `<div>${row.map((cell) => `<span>${esc(cell)}</span>`).join("")}</div>`).join("")}</div>` : "";
-    return `<article class="smart-block type-${esc(block.type)} ${done ? "done" : ""}" id="guide-${esc(block.id)}" data-guide-block="${esc(block.id)}" data-card-number="${String(index + 1)}">
+    return `<article class="smart-block type-${esc(block.type)} ${mission ? "mission-block" : ""} ${done ? "done" : ""}" id="guide-${esc(block.id)}" data-guide-block="${esc(block.id)}" data-card-number="${String(index + 1)}"${mission ? ` data-guide-mission="${esc(mission.id)}"` : ""}>
       <button class="smart-check" data-testid="guide-complete" data-block-id="${esc(block.id)}" data-guide-action="complete" data-value="${!done}" aria-label="${done ? "Marcar pendente" : "Concluir"}">${done ? "✓" : icons[block.type] || "·"}</button>
-      <div class="smart-content"><div class="smart-block-head"><span class="smart-type">${esc(block.type)}</span>${block.estimated_minutes ? `<span>◷ ${block.estimated_minutes} min</span>` : ""}</div>
+      <div class="smart-content"><div class="smart-block-head"><span class="smart-type">${esc(block.type)}</span>${guideMissionBadge(mission)}${block.estimated_minutes ? `<span>◷ ${block.estimated_minutes} min</span>` : ""}</div>
         ${block.title ? `<h4>${esc(block.title)}</h4>` : ""}
-        ${hiddenSpoiler ? `<button class="spoiler-cover" data-guide-action="reveal" data-value="true">Revelar spoiler</button>` : `<p>${esc(block.text)}</p>${items}${table}${visual ? `<figure><img src="${esc(visual.url)}" alt="${esc(visual.title || "Imagem do guia")}"><figcaption>${esc(visual.attribution || visual.source_name || "")}</figcaption></figure>` : ""}`}
+        ${hiddenSpoiler ? `<button class="spoiler-cover" data-guide-action="reveal" data-value="true">Revelar spoiler</button>` : `<p>${esc(block.text)}</p>${items}${table}${guideContextHTML(block)}${guideAchievementStatusHTML(block)}${visual ? `<figure><img src="${esc(visual.url)}" alt="${esc(visual.title || "Imagem do guia")}"><figcaption>${esc(visual.attribution || visual.source_name || "")}</figcaption></figure>` : ""}`}
         ${notes[block.id] ? `<div class="smart-note">Sua nota: ${esc(notes[block.id])}</div>` : ""}</div>
       <div class="smart-actions"><button data-guide-action="favorite" data-value="${!favorite}" title="Favoritar">${favorite ? "★" : "☆"}</button><button data-guide-note="${esc(block.id)}" title="Nota">＋</button></div>
     </article>`;
   };
   const done = (chapter.blocks || []).filter((block) => completed.has(block.id)).length;
   const pct = (chapter.blocks || []).length ? Math.round(done / chapter.blocks.length * 100) : 0;
+  const missionCount = (chapter.blocks || []).filter((block) => guideMission(block)).length;
+  const syncAlert = unlinkedRetro.length
+    ? `<aside class="guide-sync-alert" role="status"><div><span>RETROACHIEVEMENTS → GUIA</span><b>${unlinkedRetro.length} perdível(is) ainda não aparece(m) em um passo do Guia</b><p>O estado oficial foi atualizado, mas a fonte editorial não informa em qual etapa posicionar ${unlinkedRetro.length === 1 ? "este alerta" : "estes alertas"}. Revise a fonte antes de alterar a ordem.</p><ul>${unlinkedRetro.slice(0, 5).map((status) => `<li><b>${esc(status.name || `#${status.id}`)}</b>${status.description ? ` · ${esc(status.description)}` : ""}</li>`).join("")}</ul></div><button data-open-missables>Ver perdíveis</button></aside>`
+    : pendingRetro.length && !blocks.some((block) => guideBlockRetroStatuses(block).some((status) => status.pending))
+      ? `<aside class="guide-sync-alert compact" role="status"><span>RETROACHIEVEMENTS → GUIA</span><p>${pendingRetro.length} perdível(is) pendente(s) no estado oficial. Abra Conquistas para ver a lista.</p><button data-open-missables>Ver perdíveis</button></aside>`
+      : "";
   return `<div class="list-wrap guide-wrap journey-reader ${S.guideDensity === "compact" ? "density-compact" : ""}">
-    <header class="journey-reader-head"><div><span>CAPÍTULO ${S.guideChapter + 1} DE ${chapters.length}</span><h2>${esc(chapter.title)}</h2><p>${esc(chapter.objective || doc.summary || "")}</p></div><div class="journey-reader-progress"><b>${pct}%</b><span><i style="width:${pct}%"></i></span><small>${done}/${(chapter.blocks || []).length} passos</small></div></header>
-    <section class="smart-chapter focused">${blocks.map(renderBlock).join("") || `<div class="guide-no-results">Nenhum passo corresponde aos filtros.</div>`}</section>
+    <header class="journey-reader-head"><div><span>CAPÍTULO ${S.guideChapter + 1} DE ${chapters.length}</span><h2>${esc(chapter.title)}</h2><p>${esc(chapter.objective || doc.summary || "")}</p></div><div class="journey-reader-progress"><b>${pct}%</b><span><i style="width:${pct}%"></i></span><small>${done}/${(chapter.blocks || []).length} passos${missionCount ? ` · ${missionCount} missão${missionCount === 1 ? "" : "ões"}` : ""}</small></div></header>
+    ${syncAlert}<section class="smart-chapter focused">${blocks.map(renderBlock).join("") || `<div class="guide-no-results">Nenhum passo corresponde aos filtros.</div>`}</section>
     <footer class="journey-reader-nav"><button id="guide-chapter-prev" ${S.guideChapter <= 0 ? "disabled" : ""}>← Capítulo anterior</button><button id="journey-reader-sources">Gerenciar fontes</button><button id="guide-chapter-next" ${S.guideChapter >= chapters.length - 1 ? "disabled" : ""}>Próximo capítulo →</button></footer>
   </div>`;
 }
@@ -4889,14 +4965,44 @@ async function saveWizard() {
 
 /* ============================ JANELA / BOOT ============================ */
 function bindWindowControls() {
+  const syncWindowActions = () => {
+    document.querySelectorAll('#btn-pin, [data-window-action="pin"]').forEach((el) => {
+      el.classList.toggle("active", !!S.onTop);
+      el.setAttribute("aria-pressed", String(!!S.onTop));
+    });
+    document.querySelectorAll('#btn-compact, [data-window-action="compact"]').forEach((el) => {
+      el.classList.toggle("active", !!S.compact);
+      el.setAttribute("aria-pressed", String(!!S.compact));
+    });
+  };
+  const runWindowAction = async (action) => {
+    if (action === "compact") return toggleCompacto();
+    if (action === "pin") {
+      S.onTop = !S.onTop;
+      syncWindowActions();
+      if (hasBackend()) await window.pywebview.api.toggle_on_top(S.onTop);
+      return;
+    }
+    if (action === "settings") {
+      if (S.view === "settings") return enterDashboard();
+      return enterSettings();
+    }
+  };
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-window-action]");
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    runWindowAction(button.dataset.windowAction);
+  });
   $("#btn-min")?.addEventListener("click", () => hasBackend() && window.pywebview.api.minimize());
   $("#btn-close")?.addEventListener("click", () => hasBackend() && window.pywebview.api.close());
   $("#btn-pin")?.addEventListener("click", (e) => {
     S.onTop = !S.onTop;
-    e.currentTarget.classList.toggle("active", S.onTop);
+    syncWindowActions();
     if (hasBackend()) window.pywebview.api.toggle_on_top(S.onTop);
   });
-  $("#btn-pin")?.classList.add("active");
+  syncWindowActions();
   $("#btn-compact")?.addEventListener("click", () => toggleCompact());
   $("#btn-library")?.addEventListener("click", () => {
     const app = document.getElementById("app");
@@ -5061,11 +5167,17 @@ async function trocarJogo(dir) {
 }
 
 async function toggleCompacto() {
-  const btn = $("#btn-compact");
   S.compact = !S.compact;
   S.compactState = S.compact ? (S.compactCfg?.view || S.compactCfg?.variant || "minimal") : "hidden";
   syncInputMode();
-  btn?.classList.toggle("active", S.compact);
+  // O comando pode ser acionado pelo atalho/controle do overlay ou pela barra
+  // de comandos. Mantenha todos os espelhos visuais sincronizados para que a
+  // ação nunca pareça voltar ao estado anterior depois de uma atualização.
+  document.querySelectorAll('#btn-compact, [data-window-action="compact"]').forEach((el) => {
+    el.classList.toggle("active", S.compact);
+    el.setAttribute("aria-pressed", String(!!S.compact));
+    el.title = S.compact ? "Sair do modo compacto" : "Modo compacto";
+  });
   if (hasBackend()) await backend.setCompact(S.compact);
   await refreshCompactNativeStatus();
   if (S.compact && S.view !== "dashboard") {

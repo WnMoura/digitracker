@@ -166,6 +166,52 @@ def enable_dpi_awareness() -> bool:
         return False
 
 
+def apply_dark_window_chrome(hwnd) -> bool:
+    """Harmoniza a moldura nativa com a paleta escura do DigiTracker.
+
+    A janela principal continua usando a moldura normal do Windows (portanto
+    permanece arrastável, minimizável e redimensionável), mas o tema claro do
+    sistema não deve introduzir uma faixa branca acima da interface escura.
+    Atributos de cor mais novos são opcionais para manter compatibilidade com
+    versões anteriores do Windows.
+    """
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        dwm = ctypes.windll.dwmapi
+        set_attribute = dwm.DwmSetWindowAttribute
+        set_attribute.argtypes = [wintypes.HWND, ctypes.c_int,
+                                  ctypes.c_void_p, ctypes.c_uint]
+        set_attribute.restype = ctypes.c_long
+
+        dark = ctypes.c_int(1)
+        # DWMWA_USE_IMMERSIVE_DARK_MODE: 20 no Windows 11 e 19 em builds
+        # antigas do Windows 10.
+        dark_ok = False
+        for attribute in (20, 19):
+            if set_attribute(hwnd, attribute, ctypes.byref(dark), ctypes.sizeof(dark)) == 0:
+                dark_ok = True
+                break
+
+        def color(value: int) -> ctypes.c_uint:
+            return ctypes.c_uint(value)
+
+        # COLORREF usa a ordem 0x00BBGGRR.
+        caption = color(0x00261306)   # #061326
+        text = color(0x00FFF7F1)      # #F1F7FF
+        border = color(0x00543718)    # #183754
+        for attribute, value in ((35, caption), (36, text), (34, border)):
+            # Nem todas as versões expõem as cores individuais; o modo escuro
+            # continua válido mesmo quando uma dessas chamadas é recusada.
+            set_attribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value))
+        return dark_ok
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------- #
 # Onde grudar o overlay
 # ---------------------------------------------------------------------------- #
@@ -183,6 +229,32 @@ def dock_position(rect, size, margin: int = 16, corner: str = "top-right"):
     x = right if corner.endswith("right") else ex + margin
     y = bottom if corner.startswith("bottom") else ey + margin
     return max(ex, min(x, ex + max(0, ew - ow))), max(ey, min(y, ey + max(0, eh - oh)))
+
+
+def physical_dock_position(rect, window_size, dpi: int = 96, margin: int = 16,
+                           corner: str = "top-right", offset=None):
+    """Posiciona um HWND medido em pixels físicos dentro da área do jogo.
+
+    As preferências do HUD são expressas em DIPs (96 dpi), enquanto uma TV
+    com escala de 300% usa pixels físicos. Misturar os dois espaços fazia um
+    destino como ``x=3404`` ser virtualizado novamente para ``x=10212`` e o
+    HUD ficava totalmente fora da tela. O tamanho passado aqui já é o tamanho
+    físico confirmado por ``GetWindowRect``.
+    """
+    scale = max(1.0, int(dpi or 96) / 96.0)
+    if offset is not None:
+        ex, ey, ew, eh = (int(value) for value in rect)
+        ow, oh = (int(value) for value in window_size)
+        x = ex + round(int(offset[0]) * scale)
+        y = ey + round(int(offset[1]) * scale)
+        return (max(ex, min(x, ex + max(0, ew - ow))),
+                max(ey, min(y, ey + max(0, eh - oh))))
+    return dock_position(
+        tuple(int(value) for value in rect),
+        tuple(int(value) for value in window_size),
+        margin=round(int(margin) * scale),
+        corner=corner,
+    )
 
 
 def dock_candidates(rect, size, margin: int = 16):
@@ -535,10 +607,13 @@ class WindowsOverlayInput:
 
     O modo passivo usa somente estilos nativos. Subclassificar o WndProc do
     WinForms com um callback Python parece simples, mas pode bloquear a thread
-    da interface quando o WebView2 e o Python disputam o GIL. ``LAYERED`` mais
-    ``TRANSPARENT`` mantém o click-through sem executar Python a cada mensagem.
-    A hotkey usa uma thread com fila própria e confirma o registro antes de o
-    aplicativo tornar a janela não interativa.
+    da interface quando o WebView2 e o Python disputam o GIL. ``TRANSPARENT``
+    mais ``NOACTIVATE`` mantém o click-through sem executar Python a cada
+    mensagem. Não usar ``WS_EX_LAYERED`` aqui: em janelas WinForms que hospedam
+    WebView2 ele pode deixar o compositor exibindo apenas o fundo nativo, com
+    o HUD inteiro parecendo uma caixa preta. A hotkey usa uma thread com fila
+    própria e confirma o registro antes de o aplicativo tornar a janela não
+    interativa.
     """
 
     WM_HOTKEY = 0x0312
@@ -566,6 +641,11 @@ class WindowsOverlayInput:
         self.user32.GetAncestor.restype = wintypes.HWND
         self.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
         self.user32.GetWindowRect.restype = wintypes.BOOL
+        self.user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        ]
+        self.user32.SetWindowPos.restype = wintypes.BOOL
         self.user32.SetLayeredWindowAttributes.argtypes = [
             wintypes.HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD,
         ]
@@ -645,7 +725,11 @@ class WindowsOverlayInput:
                     "click_through": False,
                 }
                 self._windows[hwnd] = current
-            style = (current["original_exstyle"] | self.WS_EX_LAYERED |
+            # WebView2 não pinta corretamente quando o HWND raiz recebe
+            # WS_EX_LAYERED + SetLayeredWindowAttributes. O overlay continua
+            # passa-clique apenas com TRANSPARENT/NOACTIVATE e preserva a
+            # composição normal do conteúdo HTML.
+            style = (current["original_exstyle"] |
                      self.WS_EX_TOOLWINDOW | self.WS_EX_NOACTIVATE)
             if click_through:
                 style |= self.WS_EX_TRANSPARENT
@@ -661,11 +745,9 @@ class WindowsOverlayInput:
             self.user32.SetWindowPos(
                 hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
                 self.SWP_NOSIZE | self.SWP_NOMOVE | self.SWP_NOACTIVATE | self.SWP_SHOWWINDOW)
-            # A janela permanece 100% opaca. O fundo escolhido é composto pela
-            # própria UI; reduzir o alpha da janela inteira fazia o jogo vazar
-            # através do texto e prejudicava a leitura do HUD.
-            if not self.user32.SetLayeredWindowAttributes(hwnd, 0, 255, self.LWA_ALPHA):
-                raise self._ctypes.WinError()
+            # A janela permanece 100% opaca pelo próprio WebView2. A API de
+            # alpha só se aplica a janelas layered e, além de ser desnecessária
+            # aqui, era a causa da superfície preta sem conteúdo.
             current["passive"] = True
             current["click_through"] = click_through
             return {"ok": True, "passive": True, "click_through": click_through}
@@ -716,6 +798,60 @@ class WindowsOverlayInput:
             return False
         return bool(self.user32.SetWindowPos(hwnd, self.HWND_TOPMOST, int(x), int(y),
                                             int(width), int(height), self.SWP_NOACTIVATE))
+
+    def dock_no_activate(self, hwnd, anchor_rect, width, height,
+                         corner="top-right", margin=16, offset=None,
+                         anchor_hwnd=None):
+        """Redimensiona em DIPs e ancora em coordenadas físicas sem ativar.
+
+        O pywebview/WinForms mantém o tamanho configurado em DIPs. Já a área
+        detectada do jogo é física. A thread auxiliar usada pelo bridge pode
+        herdar um contexto DPI diferente da janela; por isso o resize ocorre
+        primeiro no contexto atual e somente o posicionamento final é feito
+        explicitamente como Per-Monitor v2.
+        """
+        if not hwnd or not anchor_rect:
+            return False
+        try:
+            hwnd = int(self.user32.GetAncestor(hwnd, 2) or hwnd)
+            # Preserve a semântica de tamanho do WinForms, mas não deixe essa
+            # chamada também mover a janela com coordenadas virtualizadas.
+            if not self.user32.SetWindowPos(
+                    hwnd, self.HWND_TOPMOST, 0, 0, int(width), int(height),
+                    self.SWP_NOMOVE | self.SWP_NOACTIVATE):
+                raise self._ctypes.WinError()
+
+            set_context = getattr(self.user32, "SetThreadDpiAwarenessContext", None)
+            previous = None
+            if set_context:
+                set_context.argtypes = [self._ctypes.c_void_p]
+                set_context.restype = self._ctypes.c_void_p
+                previous = set_context(self._ctypes.c_void_p(-4))
+            try:
+                current = self._wintypes.RECT()
+                if not self.user32.GetWindowRect(hwnd, self._ctypes.byref(current)):
+                    raise self._ctypes.WinError()
+                actual_size = (
+                    max(1, int(current.right - current.left)),
+                    max(1, int(current.bottom - current.top)),
+                )
+                dpi_target = int(anchor_hwnd or hwnd)
+                get_dpi = getattr(self.user32, "GetDpiForWindow", None)
+                dpi = int(get_dpi(dpi_target)) if get_dpi else 96
+                x, y = physical_dock_position(
+                    anchor_rect, actual_size, dpi=dpi, margin=margin,
+                    corner=corner, offset=offset,
+                )
+                if not self.user32.SetWindowPos(
+                        hwnd, self.HWND_TOPMOST, int(x), int(y), 0, 0,
+                        self.SWP_NOSIZE | self.SWP_NOACTIVATE | self.SWP_SHOWWINDOW):
+                    raise self._ctypes.WinError()
+            finally:
+                if set_context and previous:
+                    set_context(previous)
+            return True
+        except Exception:
+            return False
 
     def hide_window(self, hwnd):
         if not hwnd:
@@ -859,6 +995,12 @@ class NullOverlayInput:
         pass
 
     def show_no_activate(self, _hwnd):
+        return False
+
+    def move_no_activate(self, _hwnd, _x, _y, _width, _height):
+        return False
+
+    def dock_no_activate(self, _hwnd, _rect, _width, _height, **_kwargs):
         return False
 
     def hide_window(self, _hwnd):

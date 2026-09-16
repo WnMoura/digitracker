@@ -845,7 +845,10 @@ _TIPS_SYSTEM = (
     "(índice, changelog, direitos autorais, e-mails, arte ASCII), junte fragmentos "
     "quebrados em frases inteiras e corrija a formatação. NÃO invente conteúdo novo "
     "nem traduza — mantenha o idioma original. Preserve estratégias de chefe, "
-    "localizações e requisitos." + _SECTIONS_JSON_HINT
+    "localizações e requisitos. Quando o texto trouxer uma ordem ou condição "
+    "temporal explícita (por exemplo, visitar um personagem somente depois de "
+    "uma ação), reescreva a frase para deixar antes/depois, momento e local "
+    "inequívocos; não deduza pré-requisitos que não estejam no trecho." + _SECTIONS_JSON_HINT
 )
 
 
@@ -982,6 +985,27 @@ SMART_BLOCK_SCHEMA = {
         "title": {"type": "string"}, "text": {"type": "string"},
         "items": {"type": "array", "items": {"type": "string"}},
         "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+        # Metadados opcionais para explicar a ordem real sem inventar
+        # requisitos. A IA só deve preencher um campo quando o trecho da
+        # fonte o declarar explicitamente; a validação local normaliza o resto.
+        "context": {"type": "object", "properties": {
+            "before": {"type": "array", "items": {"type": "string"}},
+            "after": {"type": "array", "items": {"type": "string"}},
+            "when": {"type": "string"}, "where": {"type": "string"},
+            "why": {"type": "string"}, "result": {"type": "string"},
+            "verification": {"type": "string"},
+        }, "additionalProperties": False},
+        # Permite à IA sinalizar uma unidade de ação em um bloco de prosa
+        # quando a própria fonte a apresentar como missão. O id, categoria
+        # final e a contagem são normalizados localmente pelo validador.
+        "mission": {"type": "object", "properties": {
+            "is_mission": {"type": "boolean"},
+            "title": {"type": "string"},
+            "category": {"type": "string", "enum": [
+                "objetivo", "área", "desafio", "perdível", "checkpoint",
+            ]},
+            "steps_total": {"type": "integer", "minimum": 1},
+        }, "additionalProperties": False},
         "source_refs": {"type": "array", "items": {
             "type": "object",
             "properties": {
@@ -1263,10 +1287,22 @@ resource, checkpoint, spoiler e text. Nunca crie um tipo ou regra específica de
 uma franquia. Mecânicas próprias do jogo devem virar texto, tabela ou grafo
 genérico de condições.
 
+Blocos objective, checklist, challenge e missable serão destacados localmente
+como missões. Não transforme prosa narrativa em missão por conveniência: só
+faça isso quando o trecho representar uma unidade de ação comprovada pela
+fonte. A classificação e a contagem de etapas são derivadas pelo validador,
+não invente um rótulo ou uma missão que a fonte não sustente.
+
 Cada bloco deve citar source_refs com os números de seção e bloco recebidos.
 Quando a entrada informar source_id, copie esse identificador em cada referência.
 Para blocos achievement, copie o id numérico de real_achievements em
-achievement_id; para qualquer outro bloco use achievement_id=0.
+achievement_id; para qualquer outro bloco use achievement_id=0. Quando um
+trecho declarar ordem, pré-condição, momento, local, motivo, resultado ou sinal
+de conclusão, preencha `context` com frases fiéis ao trecho: `before` e `after`
+são listas de ações explícitas, `when`/`where` registram o momento/local,
+`why`/`result` explicam propósito/efeito e `verification` registra como
+confirmar o passo. Deixe cada campo vazio quando a fonte não informar; nunca
+deduza uma sequência só porque os blocos aparecem próximos.
 Sugira um visual somente quando ele reduzir ambiguidade; não anexe imagens nem
 invente mapas. Para route/graph, preencha nodes/edges apenas com relações que a
 fonte declara; para imagens use arrays vazios. O campo query será revisado pelo
@@ -1300,6 +1336,7 @@ def _smart_payload(sections: list, game: dict) -> str:
     achievements = [{
         "id": int(aid), "title": meta.get("title", ""),
         "description": meta.get("desc", ""),
+        "achievement_type": meta.get("achievement_type", ""),
     } for aid, meta in (game.get("achievements_meta") or {}).items()
         if str(aid).isdigit()]
     return json.dumps({
@@ -1425,6 +1462,11 @@ completa. Una passos equivalentes por significado, combine detalhes
 complementares, elimine repetição, índices, créditos e changelogs, mas preserve
 qualquer detalhe exclusivo útil para concluir um objetivo. Nunca invente fatos,
 rotas, requisitos, itens, ordem ou conquistas.
+
+Quando uma fonte declarar que uma ação depende de outra, preserve a ordem e o
+momento explicitamente no campo context do bloco (before, after, when, where,
+why, result ou verification). Deixe o campo vazio quando a fonte não declarar a
+relação; nunca use a posição dos blocos para inferir uma dependência.
 
 Cada bloco deve conservar todas as source_refs que sustentam seu conteúdo,
 incluindo source_id. Use somente os tipos genéricos permitidos pelo schema.

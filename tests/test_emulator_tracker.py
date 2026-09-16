@@ -127,6 +127,21 @@ class TestDockPosition:
         assert et.dock_position(rect, (220, 64), corner="bottom-right") == (1144, 690)
         assert et.dock_position(rect, (220, 64), corner="top-left") == (116, 66)
 
+    def test_ancora_hwnd_fisico_em_tv_com_escala_de_300_porcento(self):
+        # Caso real reproduzido em PPSSPP: sem separar DIPs de pixels físicos,
+        # o x=3404 era virtualizado para x=10212 e o HUD sumia da TV.
+        rect = (0, 0, 3840, 2160)
+        size = (948, 454)
+        assert et.physical_dock_position(
+            rect, size, dpi=288, margin=16, corner="bottom-right"
+        ) == (2844, 1658)
+
+    def test_offset_salvo_em_dips_e_escalado_no_monitor_de_destino(self):
+        assert et.physical_dock_position(
+            (1920, 0, 3840, 2160), (900, 450), dpi=288,
+            offset=(20, 30),
+        ) == (1980, 90)
+
 
 class TestHotkey:
     def test_parseia_hotkey_com_modificadores(self):
@@ -136,6 +151,11 @@ class TestHotkey:
     def test_rejeita_tecla_sem_modificador(self):
         with pytest.raises(ValueError):
             et.parse_hotkey("f2")
+
+
+class TestWindowChrome:
+    def test_sem_hwnd_nao_tenta_alterar_a_moldura(self):
+        assert et.apply_dark_window_chrome(None) is False
 
 
 class TestOwnWindowHandle:
